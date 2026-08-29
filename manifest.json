@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "leecher.media",
+  "name": "Leecher Music",
+  "version": "1.0.0",
+  "author": "Sigma Uno",
+  "description": "Now playing and transport controls for leecher-music-player",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Leecher Music",
+    "description": "Song, artist, album, a progress slider, skip/play controls, and a library picker for leecher-music-player",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}

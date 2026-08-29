@@ -1,0 +1,10 @@
+# QML/Qt editor and compilation artifacts
+*.qmlc
+*.jsc
+*.swp
+*~
+.DS_Store
+
+# Locally built Leecher backend
+backend/app
+backend/library-handler
