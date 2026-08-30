@@ -3,8 +3,8 @@
 An [Omarchy](https://omarchy.org/) bar widget for
 [Leecher Music Player](https://github.com/SigmaUno/music-leecher). It displays
 the current song, artist, album art, and playback progress, with controls for
-play/pause, seeking, previous/next, autoplay, library selection, metadata
-editing, and track removal.
+play/pause, seeking, previous/next, autoplay, library selection, local-song
+adding, metadata editing, and track removal.
 
 ## Requirements
 
@@ -43,7 +43,9 @@ require `sudo`.
 
 - Click the bar widget to open the player panel.
 - Click the play icon in the bar to toggle playback.
-- Use the library button in the panel to select, edit, or remove tracks.
+- Use the library button in the panel to select, add, edit, or remove tracks.
+  Choose **Add local song** and enter the full path to an audio file; its tags
+  are imported automatically, with the filename used when tags are absent.
 - Right-click the widget to hide it or collapse it to a restorable handle.
 
 ## Remove

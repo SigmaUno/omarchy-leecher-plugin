@@ -823,28 +823,44 @@ static int has_real_text(const char *s) {
     return 0;
 }
 
-/* Builds a LibrarySongQuery for `file_path`, extracting metadata from the file
- * (or remotely over SSH when `remote` is set) and filling any missing field
- * with a fallback so that library_handler_add_source (which requires a non-empty
- * title, artist, and album) can accept the entry. All string buffers must be
- * caller-owned. Returns a query pointing at those buffers. */
+/* Builds a LibrarySongQuery for a source, extracting metadata from `file_path`
+ * (locally), from `file_path` over SSH with `username`@`ip`, or directly from an
+ * HTTP(S) `url`.  Exactly one remote mechanism is used: `url` wins, then the
+ * SSH pair, otherwise the local file.  Missing fields fall back so that
+ * library_handler_add_source (which requires a non-empty title, artist, album)
+ * can accept the entry.  All string buffers must be caller-owned.  Returns a
+ * query pointing at those buffers. */
+static LibrarySongQuery build_song_query_for(AppState *state, const char *file_path,
+                                             const char *username, const char *ip, const char *url,
+                                             char *title, size_t title_size,
+                                             char *artist, size_t artist_size,
+                                             char *album, size_t album_size) {
+    AudioMetadata metadata = {0};
+    char error[256] = {0};
+    char file_title[256];
+    int got;
+    const char *label = url ? url : file_path;
+    if (url) got = metadata_extract_from_url(url, &metadata, error, sizeof(error));
+    else if (username && ip) got = metadata_extract_from_ssh(username, ip, file_path, &metadata, error, sizeof(error));
+    else got = metadata_extract_from_file(file_path, &metadata, error, sizeof(error));
+    basename_no_ext(label, file_title, sizeof(file_title));
+    snprintf(title, title_size, "%s", has_real_text(metadata.title) ? metadata.title : file_title);
+    snprintf(artist, artist_size, "%s", has_real_text(metadata.artist) ? metadata.artist : "Unknown artist");
+    snprintf(album, album_size, "%s", has_real_text(metadata.album) ? metadata.album : "Unknown album");
+    if (got != 1) snprintf(state->status, sizeof(state->status), "No tags for %.160s, imported by file name.", label);
+    metadata_destroy(&metadata);
+    return (LibrarySongQuery){ .title = title, .artist = artist, .album = album };
+}
+
+/* Wrapper matching the original signature: `remote` extracts via state->username
+ * / state->ip, otherwise the file is read locally. */
 static LibrarySongQuery build_song_query(AppState *state, const char *file_path,
                                          int remote, char *title, size_t title_size,
                                          char *artist, size_t artist_size,
                                          char *album, size_t album_size) {
-    AudioMetadata metadata = {0};
-    char error[256] = {0};
-    char file_title[256];
-    int got = remote
-        ? metadata_extract_from_ssh(state->username, state->ip, file_path, &metadata, error, sizeof(error))
-        : metadata_extract_from_file(file_path, &metadata, error, sizeof(error));
-    basename_no_ext(file_path, file_title, sizeof(file_title));
-    snprintf(title, title_size, "%s", has_real_text(metadata.title) ? metadata.title : file_title);
-    snprintf(artist, artist_size, "%s", has_real_text(metadata.artist) ? metadata.artist : "Unknown artist");
-    snprintf(album, album_size, "%s", has_real_text(metadata.album) ? metadata.album : "Unknown album");
-    if (got != 1) snprintf(state->status, sizeof(state->status), "No tags for %.160s, imported by file name.", file_path);
-    metadata_destroy(&metadata);
-    return (LibrarySongQuery){ .title = title, .artist = artist, .album = album };
+    return build_song_query_for(state, file_path, remote ? state->username : NULL,
+                                remote ? state->ip : NULL, NULL,
+                                title, title_size, artist, artist_size, album, album_size);
 }
 
 /* Adds a source for a single audio file to the library and reloads the in-memory
@@ -1503,6 +1519,21 @@ static void handle_remove_track(LibraryHandler **library, MusicRipper *ripper, c
     write_status(state);
 }
 
+/* Imports one local audio file requested by the bar widget.  Reuse the same
+ * validation and metadata extraction path as drag-and-drop, so a control
+ * command cannot add a directory or an unsupported source to the library. */
+static void handle_add_local_track(LibraryHandler **library, MusicRipper *ripper,
+                                   const char *library_path, AppState *state,
+                                   const char *command) {
+    const char *path = command + strlen("add_local ");
+    while (*path == ' ' || *path == '\t') path++;
+    if (!*path) {
+        snprintf(state->status, sizeof(state->status), "Add failed: a local audio-file path is required.");
+        return;
+    }
+    handle_dropped_file(library_path, state, path, library, ripper);
+}
+
 /* Control lines are percent-encoded by the widget so that command values
  * (titles/artists/albums) may contain newlines or other control characters
  * without corrupting the single-line channel.  Decode %XX back to bytes. */
@@ -1567,10 +1598,95 @@ static void handle_set_fields(LibraryHandler **library, MusicRipper *ripper,
     write_status(state);
 }
 
+/* `add_ssh` / `add_network` / `add_https` carry encoded fields, one per space,
+ * exactly like `set_fields`, so they are routed before the whole-line decode in
+ * poll_control.  Copy the next token (up to a literal space) and decode it in
+ * place.  Advances *pp past the trailing space, if any.  Returns `out`. */
+static const char *next_encoded_token(const char **pp, char *out, size_t size) {
+    const char *p = *pp;
+    const char *sp;
+    size_t len;
+    while (*p == ' ') p++;
+    if (!*p) { out[0] = '\0'; *pp = p; return out; }
+    sp = p;
+    while (*sp && *sp != ' ') sp++;
+    len = (size_t)(sp - p);
+    if (len >= size) len = size - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    control_decode(out, size, out);
+    *pp = (*sp == ' ') ? sp + 1 : sp;
+    return out;
+}
+
+/* Imports one source requested by the bar widget over SSH or the local network.
+ * `kind` is LIBRARY_SOURCE_SSH or LIBRARY_SOURCE_NETWORK; both use
+ * username/host/path with the SSH transport and identical field layouts. */
+static void handle_add_ssh_network_track(LibraryHandler **library, MusicRipper *ripper,
+                                         const char *library_path, AppState *state,
+                                         const char *command, LibrarySourceKind kind) {
+    const char *p = command + (kind == LIBRARY_SOURCE_SSH ? 8 : 12);
+    char username[128], host[128], remote_path[512];
+    char title[256], artist[256], album[256];
+    LibrarySongQuery song;
+    LibrarySource source;
+
+    next_encoded_token(&p, username, sizeof(username));
+    next_encoded_token(&p, host, sizeof(host));
+    next_encoded_token(&p, remote_path, sizeof(remote_path));
+
+    if (!*username || !*host || !*remote_path) {
+        snprintf(state->status, sizeof(state->status), "Add failed: username, host, and remote path are required.");
+        return;
+    }
+    if (!valid_ssh_name(username, 0) || !valid_ssh_name(host, 1)) {
+        snprintf(state->status, sizeof(state->status), "Add failed: invalid username or host.");
+        return;
+    }
+    if (!is_audio_name(remote_path)) {
+        snprintf(state->status, sizeof(state->status), "Add failed: not an audio file: %.160s", remote_path);
+        return;
+    }
+    song = build_song_query_for(state, remote_path, username, host, NULL,
+                                title, sizeof(title), artist, sizeof(artist), album, sizeof(album));
+    source = (LibrarySource){ .kind = kind, .path = remote_path, .username = username, .ip = host };
+    if (import_single_source(library_path, state, &song, &source, library, ripper))
+        snprintf(state->status, sizeof(state->status), "Imported %s source %.160s (%.60s).",
+                 kind == LIBRARY_SOURCE_SSH ? "SSH" : "network", remote_path, host);
+}
+
+/* Imports one https:// stream requested by the bar widget.  HTTPS URLs are
+ * accepted as-is (no audio-extension check: a stream may not end in .mp3). */
+static void handle_add_https_track(LibraryHandler **library, MusicRipper *ripper,
+                                   const char *library_path, AppState *state,
+                                   const char *command) {
+    const char *p = command + 10;
+    char url[512];
+    char title[256], artist[256], album[256];
+    LibrarySongQuery song;
+    LibrarySource source;
+
+    next_encoded_token(&p, url, sizeof(url));
+    if (!*url) {
+        snprintf(state->status, sizeof(state->status), "Add failed: an https:// URL is required.");
+        return;
+    }
+    if (strncmp(url, "https://", 8) != 0) {
+        snprintf(state->status, sizeof(state->status), "Add failed: only https:// URLs are supported.");
+        return;
+    }
+    song = build_song_query_for(state, url, NULL, NULL, url,
+                                title, sizeof(title), artist, sizeof(artist), album, sizeof(album));
+    source = (LibrarySource){ .kind = LIBRARY_SOURCE_HTTPS, .url = url };
+    if (import_single_source(library_path, state, &song, &source, library, ripper))
+        snprintf(state->status, sizeof(state->status), "Imported https source %.120s", url);
+}
+
 static void handle_control(const char *command, LibraryHandler **library, MusicRipper *ripper,
                            Assembler *assembler, AppState *state, const char *library_path) {
     /* Commands arrive as one line, e.g.: "play_pause", "next", "previous",
      * "seek 45000", "play 16", "set_fields 3 ...", "remove 4",
+     * "add_local /path/to/song.flac",
      * "autoplay on". Called from the main loop once per frame. */
     while (command && *command && (*command == ' ' || *command == '\t' || *command == '\n' || *command == '\r')) command++;
     if (!command || !*command) return;
@@ -1589,6 +1705,7 @@ static void handle_control(const char *command, LibraryHandler **library, MusicR
     else if (!strncmp(command, "set_artist ", 11)) handle_set_field(library, ripper, library_path, state, "set_artist ", "artist", command);
     else if (!strncmp(command, "set_album ", 10)) handle_set_field(library, ripper, library_path, state, "set_album ", "album", command);
     else if (!strncmp(command, "remove ", 7)) handle_remove_track(library, ripper, library_path, state, command);
+    else if (!strncmp(command, "add_local ", 10)) handle_add_local_track(library, ripper, library_path, state, command);
     else snprintf(state->status, sizeof(state->status), "Unknown control command: %.220s", command);
 }
 
@@ -1624,11 +1741,18 @@ static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
                 else id = 0;
             }
             if (id != 0) state->last_cmd_id = id;
-            /* set_fields carries three encoded fields that must be split on the
-             * still-encoded line (values may contain literal spaces after decode),
-             * so route it before the whole-line decode. */
+            /* set_fields, add_ssh, add_network, and add_https carry encoded
+             * fields that must be split on the still-encoded line (values may
+             * contain literal spaces after decode), so route them before the
+             * whole-line decode. */
             if (strncmp(cmd, "set_fields ", 11) == 0) {
                 handle_set_fields(library, (MusicRipper *)ripper, library_path, state, cmd);
+            } else if (strncmp(cmd, "add_ssh ", 8) == 0) {
+                handle_add_ssh_network_track(library, (MusicRipper *)ripper, library_path, state, cmd, LIBRARY_SOURCE_SSH);
+            } else if (strncmp(cmd, "add_network ", 12) == 0) {
+                handle_add_ssh_network_track(library, (MusicRipper *)ripper, library_path, state, cmd, LIBRARY_SOURCE_NETWORK);
+            } else if (strncmp(cmd, "add_https ", 10) == 0) {
+                handle_add_https_track(library, (MusicRipper *)ripper, library_path, state, cmd);
             } else {
                 control_decode(decoded, sizeof(decoded), cmd);
                 handle_control(decoded, library, (MusicRipper *)ripper, assembler, state, library_path);
@@ -1944,6 +2068,7 @@ int main(int argc, char **argv) {
     ripper.library = library;
     ripper.transports.ssh = stream_ssh;
     ripper.transports.https = stream_https;
+    ripper.transports.network = stream_ssh;
     state.transports = ripper.transports;
     assembler = assembler_create(NULL);
     if (!assembler) { fprintf(stderr, "Cannot create assembler queue\n"); library_handler_close(library); return 1; }

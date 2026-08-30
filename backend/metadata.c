@@ -343,6 +343,47 @@ int metadata_extract_from_ssh(const char *username, const char *ip, const char *
     return -1;
 }
 
+int metadata_extract_from_url(const char *url, AudioMetadata *metadata, char *error, size_t error_size) {
+    FILE *pipe;
+    char *command;
+    char line[512];
+
+    if (!url || !metadata) {
+        set_error(error, error_size, "Invalid parameters");
+        return -1;
+    }
+
+    /* Only HTTP(S) URLs can be probed directly. */
+    if (strncmp(url, "https://", 8) != 0 && strncmp(url, "http://", 7) != 0) {
+        set_error(error, error_size, "Only http:// or https:// URLs are supported");
+        return -1;
+    }
+
+    memset(metadata, 0, sizeof(*metadata));
+
+    command = local_command_with_path(
+        "ffprobe -v error -rw_timeout 10000000 -timeout 10000000 -show_entries format_tags -of default=noprint_wrappers=1 ",
+        url, " 2>/dev/null");
+    if (!command) {
+        set_error(error, error_size, "Command path too long");
+        return -1;
+    }
+
+    pipe = popen(command, "r");
+    free(command);
+    if (!pipe) {
+        set_error(error, error_size, "Could not execute ffprobe");
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), pipe)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (*line) parse_ffprobe_line(line, metadata);
+    }
+    pclose(pipe);
+    return (metadata->title || metadata->artist || metadata->album) ? 1 : 0;
+}
+
 void metadata_destroy(AudioMetadata *metadata) {
     if (!metadata) return;
     free(metadata->title);

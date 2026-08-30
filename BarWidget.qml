@@ -118,6 +118,12 @@ BarWidget {
     property int actionsIndex: -1
     property int editIndex: -1
     property bool editVisible: false
+    property bool addVisible: false
+    property string addType: "local"
+    property string addPath: ""
+    property string addUser: ""
+    property string addHost: ""
+    property string addUrl: ""
     property string editTitle: ""
     property string editArtist: ""
     property string editAlbum: ""
@@ -130,7 +136,18 @@ BarWidget {
      * timer and file watcher (see the `!root.closed` bindings below). */
     readonly property bool collapsed: root.closed || root.effectiveHidden
 
-    implicitWidth: root.collapsed ? root.barSize : Style.space(24) + root.barSize + Style.space(6) + Style.space(150) + Style.space(18)
+    /* Longest the title is allowed to grow before it is elided.  Shared by the
+     * implicit-width math and the label's size so the widget's requested width
+     * matches what the row actually draws (no trailing dead space or clipping). */
+    readonly property real labelMaxWidth: Style.space(150)
+
+    /* Size the widget from the glyph's real ink width (glyphSlot) instead of a
+     * fixed barSize: the old formula requested barSize for the icon slot but the
+     * icon is typically narrower, leaving an invisible strip of unused space on
+     * the right so the title sat off-centre with asymmetric padding. */
+    implicitWidth: root.collapsed
+        ? Math.max(root.barSize, Style.space(12) + glyphSlot.width)
+        : Style.space(24) + glyphSlot.width + Style.space(6) + root.labelMaxWidth + Style.space(18)
     implicitHeight: root.barSize
 
     function now() {
@@ -170,30 +187,30 @@ BarWidget {
         }
         return out;
     }
-    function sendControl(cmd) {
+    function sendControlRaw(cmdLine) {
         if (!root.runtimeDirSafe)
             return;
         root.lastCommandId = (root.lastCommandId + 1) & 0x7fffffff;
         root.pendingCommandId = root.lastCommandId;
         root.commandAcked = false;
+        /* Quote the literal control path so a runtime dir with spaces still
+         * resolves to a single redirection target. `cmdLine` is either one
+         * already-encoded token (enc()) or a list of encoded tokens joined by
+         * literal spaces: the backend splits encoded tokens on spaces, so the
+         * separator must never itself be encoded. */
+        Quickshell.execDetached(["sh", "-c", "printf '%s\\n' '" + root.lastCommandId + " " + cmdLine + "' > \"" + root.controlFile + "\""]);
+    }
+    function sendControl(cmd) {
         /* Encode the payload so values (titles/artists/albums) can contain
-         * newlines or shell-special characters without corrupting the line, and
-         * quote the literal control path so a runtime dir with spaces still
-         * resolves to a single redirection target. */
-        Quickshell.execDetached(["sh", "-c", "printf '%s\\n' '" + root.lastCommandId + " " + enc(cmd) + "' > \"" + root.controlFile + "\""]);
+         * newlines or shell-special characters without corrupting the line. */
+        root.sendControlRaw(enc(cmd));
     }
     /* Single-command multi-field edit: each value is percent-encoded with enc()
      * (no literal spaces/quotes/newlines remain), so the three values are joined
      * by literal spaces into one control line that the backend splits and
      * applies in a single atomic library write. */
     function sendControlFields(idx, f1, f2, f3) {
-        if (!root.runtimeDirSafe)
-            return;
-        root.lastCommandId = (root.lastCommandId + 1) & 0x7fffffff;
-        root.pendingCommandId = root.lastCommandId;
-        root.commandAcked = false;
-        var values = enc(f1) + " " + enc(f2) + " " + enc(f3);
-        Quickshell.execDetached(["sh", "-c", "printf '%s\\n' '" + root.lastCommandId + " set_fields " + idx + " " + values + "' > \"" + root.controlFile + "\""]);
+        root.sendControlRaw("set_fields " + idx + " " + enc(f1) + " " + enc(f2) + " " + enc(f3));
     }
     function seekTo(ms) {
         root.sendControl("seek " + Math.round(ms));
@@ -252,6 +269,87 @@ BarWidget {
         root.editVisible = false;
         root.loadLibrary();
     }
+    function addLocalTrack(path) {
+        var trimmed = path.trim();
+        if (trimmed === "") {
+            root.statusText = "Enter the path to an audio file first.";
+            return;
+        }
+        /* sendControl() encodes the complete line before it reaches the
+         * backend, so spaces and special characters in a local path remain a
+         * single safe command argument. */
+        root.sendControl("add_local " + trimmed);
+        root.addPath = "";
+        root.addVisible = false;
+    }
+    /* SSH ("ssh") and local-network ("network") sources share the same three
+     * fields but are stored under distinct kinds.  Each value is enc()'d so it
+     * contains no literal space; the tokens are joined by literal spaces that
+     * the backend splits on. */
+    function addSshTrack(user, host, path) {
+        var u = user.trim();
+        var h = host.trim();
+        var p = path.trim();
+        if (u === "" || h === "" || p === "") {
+            root.statusText = root.addType === "ssh"
+                ? "Enter the SSH user, host/IP, and remote path first."
+                : "Enter the network user, host/IP, and path first.";
+            return;
+        }
+        root.sendControlRaw("add_" + root.addType + " " + enc(u) + " " + enc(h) + " " + enc(p));
+        root.closeAddForm();
+    }
+    function addHttpsTrack(url) {
+        var trimmed = url.trim();
+        if (trimmed === "") {
+            root.statusText = "Enter an https:// URL first.";
+            return;
+        }
+        if (trimmed.toLowerCase().indexOf("https://") !== 0) {
+            root.statusText = "Only https:// URLs are supported.";
+            return;
+        }
+        root.sendControlRaw("add_https " + enc(trimmed));
+        root.closeAddForm();
+    }
+    function submitAdd() {
+        if (root.addType === "local")
+            root.addLocalTrack(addLocalField.text);
+        else if (root.addType === "https")
+            root.addHttpsTrack(addUrlField.text);
+        else
+            root.addSshTrack(addUserField.text, addHostField.text, addSshPathField.text);
+    }
+    function closeAddForm() {
+        root.addPath = "";
+        root.addUser = "";
+        root.addHost = "";
+        root.addUrl = "";
+        root.addVisible = false;
+    }
+    /* file:// URLs delivered by a drag-and-drop carry percent-encoded path
+     * segments; convert one back to a plain local path so the backend can stat
+     * it.  Non-file URLs (http/smb/webdav) fall through to a bare path the
+     * backend will reject as "not a regular file", which is fail-safe. */
+    function urlToPath(url) {
+        var s = String(url);
+        if (s.indexOf("file://") === 0)
+            s = s.substring(7);
+        else if (s.indexOf("file:") === 0)
+            s = s.substring(5);
+        var out = "", i = 0;
+        while (i < s.length) {
+            var c = s.charAt(i);
+            if (c === "%" && i + 2 < s.length && /^[0-9a-fA-F]{2}$/.test(s.substring(i + 1, i + 3))) {
+                out += String.fromCharCode(parseInt(s.substring(i + 1, i + 3), 16));
+                i += 3;
+            } else {
+                out += c;
+                i++;
+            }
+        }
+        return out;
+    }
     function fmt(ms) {
         if (!ms || ms <= 0)
             return "0:00";
@@ -260,7 +358,7 @@ BarWidget {
         var h = Math.floor(m / 60);
         s = s % 60;
         m = m % 60;
-        return h + ":" + (m < 10 ? "0" : "") + ":" + (s < 10 ? "0" : "") + s;
+        return (h > 0 ? "" : h + ":") + (m < 10 ? "0" : "") + ":" + (s < 10 ? "0" : "") + s;
     }
     function close() {
         root.popupOpen = false;
@@ -268,6 +366,7 @@ BarWidget {
         root.actionsIndex = -1;
         root.editVisible = false;
         root.editIndex = -1;
+        root.closeAddForm();
         root.pendingPlayIndex = -1;
     }
     /* Closing drops the widget to a collapsed sliver and halts all background
@@ -419,24 +518,33 @@ BarWidget {
         anchors.verticalCenter: parent.verticalCenter
         spacing: root.collapsed ? 0 : Style.space(6)
 
-        Text {
-            id: glyph
-            anchors.verticalCenter: parent.verticalCenter
-            text: root.closed ? "\uf05e" : (root.hasTrack ? root.playIcon : "\uf001")
-            color: root.closed ? Qt.darker(root.bar.foreground, 1.7) : (root.hasTrack ? (root.playing ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.4)) : Qt.darker(root.bar.foreground, 1.5))
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.body
-        }
+        Item {
+            id: glyphSlot
+            /* Size the slot to the glyph's real ink width plus a hair of slack
+             * so the icon never paints over the status text to its right (a
+             * fixed 18px slot under-sizes wide glyphs like the music note). */
+            width: glyph.implicitWidth + Style.space(2)
+            height: parent.height
 
-        MouseArea {
-            anchors.fill: glyph
-            z: 10
-            cursorShape: Qt.PointingHandCursor
-            hoverEnabled: true
-            enabled: !root.closed
-            onClicked: {
-                if (root.hasTrack)
-                    root.playPause();
+            Text {
+                id: glyph
+                anchors.centerIn: parent
+                text: root.closed ? "\uf05e" : (root.hasTrack ? root.playIcon : "\uf001")
+                color: root.closed ? Qt.darker(root.bar.foreground, 1.7) : (root.hasTrack ? (root.playing ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.4)) : Qt.darker(root.bar.foreground, 1.5))
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.body
+            }
+
+            MouseArea {
+                anchors.fill: parent
+                z: 10
+                cursorShape: Qt.PointingHandCursor
+                hoverEnabled: true
+                enabled: !root.closed
+                onClicked: {
+                    if (root.hasTrack)
+                        root.playPause();
+                }
             }
         }
 
@@ -450,7 +558,11 @@ BarWidget {
             font.pixelSize: Style.font.body
             font.italic: !root.hasTrack
             elide: Text.ElideRight
-            width: Math.max(0, Math.min(Style.space(150), row.width - Style.space(24) - glyph.width - row.spacing - Style.space(18)))
+            /* The icon lives in glyphSlot, a fixed-width row item.  Size the
+             * title from the actual remaining row width rather than the
+             * glyph's ink width, which varies by font and previously allowed
+             * the title to paint into the icon. */
+            width: Math.max(0, Math.min(root.labelMaxWidth, row.width - glyphSlot.width - row.spacing))
 
             ToolTip.visible: root.statusText !== "" && label.hovered
             ToolTip.text: root.statusText
@@ -700,6 +812,14 @@ BarWidget {
                     color: Qt.darker(root.bar.foreground, 1.3)
                     font.family: root.bar.fontFamily
                     font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                    text: "Tip: drag an audio file here and drop it to add it."
+                    color: Qt.darker(root.bar.foreground, 1.6)
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.italic: true
                 }
 
                 ListView {
@@ -995,6 +1115,228 @@ BarWidget {
                         }
                     }
                 }
+
+                Row {
+                    width: parent.width
+                    spacing: Style.space(8)
+
+                    Button {
+                        iconText: root.addVisible ? "\uf00d" : "\uf067"
+                        height: Style.space(32)
+                        iconSize: Style.font.icon
+                        foreground: root.bar.foreground
+                        verticalPadding: 0
+                        horizontalPadding: Style.spacing.controlPaddingX
+                        tooltipText: root.addVisible ? "Cancel adding a source" : "Add a local, SSH, https, or local-network source"
+                        onClicked: root.addVisible = !root.addVisible
+                    }
+                    Text {
+                        text: "Add source"
+                        anchors.verticalCenter: parent.verticalCenter
+                        color: Qt.darker(root.bar.foreground, 1.3)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.caption
+                    }
+                }
+
+                BorderSurface {
+                    width: parent.width
+                    visible: root.addVisible
+                    radius: Style.spacing.labelGap
+                    color: Style.selectedFillFor(root.bar.foreground, Color.accent)
+                    borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
+                    implicitHeight: addForm.implicitHeight + Style.space(16)
+
+                    Column {
+                        id: addForm
+                        anchors.fill: parent
+                        anchors.margins: Style.space(8)
+                        spacing: Style.space(6)
+
+                        Row {
+                            width: parent.width
+                            spacing: Style.space(4)
+
+                            Repeater {
+                                model: [ ["local", "Local"], ["ssh", "SSH"], ["https", "https"], ["network", "Network"] ]
+
+                                delegate: Button {
+                                    required property var modelData
+                                    text: modelData[1]
+                                    height: Style.space(28)
+                                    foreground: root.addType === modelData[0] ? Color.accent : root.bar.foreground
+                                    selected: root.addType === modelData[0]
+                                    verticalPadding: 0
+                                    horizontalPadding: Style.spacing.controlPaddingX
+                                    onClicked: root.addType = modelData[0]
+                                }
+                            }
+                        }
+
+                        Column {
+                            width: parent.width
+                            spacing: Style.space(4)
+                            visible: root.addType === "local"
+
+                            Text {
+                                text: "Path on this machine"
+                                color: root.bar.foreground
+                                font.family: root.bar.fontFamily
+                                font.pixelSize: Style.font.bodySmall
+                                font.bold: true
+                            }
+                            TextField {
+                                id: addLocalField
+                                width: parent.width
+                                text: root.addPath
+                                placeholderText: "/home/me/Music/song.flac"
+                                foreground: root.bar.foreground
+                                onAccepted: {
+                                    root.addPath = text;
+                                    root.addLocalTrack(text);
+                                }
+                            }
+                        }
+
+                        Column {
+                            width: parent.width
+                            spacing: Style.space(4)
+                            visible: root.addType === "ssh" || root.addType === "network"
+
+                            Text {
+                                text: root.addType === "ssh" ? "SSH user" : "Network user"
+                                color: root.bar.foreground
+                                font.family: root.bar.fontFamily
+                                font.pixelSize: Style.font.bodySmall
+                                font.bold: true
+                            }
+                            TextField {
+                                id: addUserField
+                                width: parent.width
+                                text: root.addUser
+                                placeholderText: "username"
+                                foreground: root.bar.foreground
+                                onAccepted: root.submitAdd()
+                            }
+                            Text {
+                                text: "Host or IP"
+                                color: root.bar.foreground
+                                font.family: root.bar.fontFamily
+                                font.pixelSize: Style.font.bodySmall
+                                font.bold: true
+                            }
+                            TextField {
+                                id: addHostField
+                                width: parent.width
+                                text: root.addHost
+                                placeholderText: "nas.local or 192.168.1.10"
+                                foreground: root.bar.foreground
+                                onAccepted: root.submitAdd()
+                            }
+                            Text {
+                                text: "Remote path"
+                                color: root.bar.foreground
+                                font.family: root.bar.fontFamily
+                                font.pixelSize: Style.font.bodySmall
+                                font.bold: true
+                            }
+                            TextField {
+                                id: addSshPathField
+                                width: parent.width
+                                text: root.addPath
+                                placeholderText: "/music/song.flac"
+                                foreground: root.bar.foreground
+                                onAccepted: {
+                                    root.addPath = text;
+                                    root.submitAdd();
+                                }
+                            }
+                        }
+
+                        Column {
+                            width: parent.width
+                            spacing: Style.space(4)
+                            visible: root.addType === "https"
+
+                            Text {
+                                text: "https:// URL"
+                                color: root.bar.foreground
+                                font.family: root.bar.fontFamily
+                                font.pixelSize: Style.font.bodySmall
+                                font.bold: true
+                            }
+                            TextField {
+                                id: addUrlField
+                                width: parent.width
+                                text: root.addUrl
+                                placeholderText: "https://example.com/song.flac"
+                                foreground: root.bar.foreground
+                                onAccepted: root.submitAdd()
+                            }
+                        }
+
+                        Text {
+                            text: root.addType === "local"
+                                ? "Metadata is read from the file; missing tags use the file name."
+                                : (root.addType === "https"
+                                    ? "The URL is streamed with curl; tags are read with ffprobe when possible."
+                                    : "The file is streamed over SSH; tags are read from the remote host when possible.")
+                            width: parent.width
+                            wrapMode: Text.WordWrap
+                            color: Qt.darker(root.bar.foreground, 1.5)
+                            font.family: root.bar.fontFamily
+                            font.pixelSize: Style.font.caption
+                        }
+                        Row {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            spacing: Style.space(8)
+                            Button {
+                                text: "Add"
+                                height: Style.space(32)
+                                foreground: root.bar.foreground
+                                verticalPadding: 0
+                                horizontalPadding: Style.spacing.controlPaddingX
+                                onClicked: root.submitAdd()
+                            }
+                            Button {
+                                text: "Cancel"
+                                height: Style.space(32)
+                                foreground: root.bar.foreground
+                                verticalPadding: 0
+                                horizontalPadding: Style.spacing.controlPaddingX
+                                onClicked: root.addVisible = false
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        DropArea {
+            id: libraryDropArea
+            anchors.fill: parent
+            z: 100
+            onEntered: (drop) => { drop.accepted = true }
+            onDropped: (drop) => {
+                var i;
+                var paths = [];
+                for (i = 0; i < drop.urls.length; i++)
+                    paths.push(root.urlToPath(drop.urls[i]));
+                if (paths.length === 0 && drop.text) {
+                    var lines = String(drop.text).split("\n");
+                    for (i = 0; i < lines.length; i++) {
+                        var t = lines[i].trim();
+                        if (t !== "")
+                            paths.push(root.urlToPath(t));
+                    }
+                }
+                if (paths.length === 0) {
+                    root.statusText = "Drop a local audio file to add it.";
+                    return;
+                }
+                for (i = 0; i < paths.length; i++)
+                    root.addLocalTrack(paths[i]);
+                root.loadLibrary();
             }
         }
     }
