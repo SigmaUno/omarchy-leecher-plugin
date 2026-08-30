@@ -359,7 +359,7 @@ BarWidget {
         var h = Math.floor(m / 60);
         s = s % 60;
         m = m % 60;
-        return (h > 0 ? "" : h + ":") + (m < 10 ? "0" : "") + ":" + (s < 10 ? "0" : "") + s;
+        return (h > 0 ? h + ":" : "") + (m < 10 ? "0" : "") + ":" + (s < 10 ? "0" : "") + s;
     }
     function close() {
         root.popupOpen = false;
@@ -779,6 +779,10 @@ BarWidget {
                     tooltipText: "Change song (library)"
                     onClicked: {
                         root.libraryOpen = !root.libraryOpen;
+                        if (!root.libraryOpen) {
+                            root.actionsIndex = -1;
+                            root.editVisible = false;
+                        }
                         if (root.libraryOpen)
                             root.loadLibrary();
                     }
@@ -802,475 +806,552 @@ BarWidget {
                 visible: root.libraryOpen
             }
 
-            Column {
+            Item {
                 id: librarySection
                 width: parent.width
                 visible: root.libraryOpen
-                spacing: Style.space(4)
 
-                Text {
-                    text: "Library"
-                    color: Qt.darker(root.bar.foreground, 1.3)
-                    font.family: root.bar.fontFamily
-                    font.pixelSize: Style.font.caption
-                }
-
-                Text {
-                    text: "Tip: drag an audio file here and drop it to add it."
-                    color: Qt.darker(root.bar.foreground, 1.6)
-                    font.family: root.bar.fontFamily
-                    font.pixelSize: Style.font.caption
-                    font.italic: true
-                }
-
-                ListView {
-                    id: trackList
+                Column {
+                    id: libraryCol
                     width: parent.width
-                    height: Math.min(260, trackList.contentHeight)
-                    clip: true
-                    model: root.tracks
-                    boundsBehavior: Flickable.StopAtBounds
+                    spacing: Style.space(4)
 
-                    delegate: BorderSurface {
-                        required property int index
-                        required property var modelData
-                        readonly property bool isActive: modelData.index === root.selectedTrackIndex && root.hasTrack
-                        readonly property bool isCurrent: modelData.index === root.selectedTrackIndex
-                        readonly property bool isPending: root.pendingPlayIndex === modelData.index
-
-                        width: trackList.width
-                        height: Style.space(34)
-                        radius: Style.spacing.labelGap
-                        color: isActive ? Style.selectedFillFor(root.bar.foreground, Color.accent) : ((isPending || rowHover.hovered) ? Style.hoverFillFor(root.bar.foreground, Color.accent) : "transparent")
-                        borderSpec: isActive ? Border.controlSpec("selected", root.bar.foreground, Color.accent) : Border.none()
-
-                        HoverHandler {
-                            id: rowHover
-                        }
-
-                        Shape {
-                            id: pendingOutline
-                            anchors.fill: parent
-                            visible: isPending
-                            preferredRendererType: Shape.CurveRenderer
-                            antialiasing: true
-
-                            ShapePath {
-                                id: pendingPath
-                                strokeColor: Color.accent
-                                strokeWidth: 1
-                                strokeStyle: ShapePath.DashLine
-                                dashPattern: [4, 3]
-                                fillColor: "transparent"
-
-                                startX: Style.spacing.labelGap
-                                startY: 0
-                                PathLine {
-                                    x: pendingOutline.width - Style.spacing.labelGap
-                                    y: 0
-                                }
-                                PathLine {
-                                    x: pendingOutline.width
-                                    y: Style.spacing.labelGap
-                                }
-                                PathLine {
-                                    x: pendingOutline.width
-                                    y: pendingOutline.height - Style.spacing.labelGap
-                                }
-                                PathLine {
-                                    x: pendingOutline.width - Style.spacing.labelGap
-                                    y: pendingOutline.height
-                                }
-                                PathLine {
-                                    x: Style.spacing.labelGap
-                                    y: pendingOutline.height
-                                }
-                                PathLine {
-                                    x: 0
-                                    y: pendingOutline.height - Style.spacing.labelGap
-                                }
-                                PathLine {
-                                    x: 0
-                                    y: Style.spacing.labelGap
-                                }
-                                PathLine {
-                                    x: Style.spacing.labelGap
-                                    y: 0
-                                }
-                            }
-                        }
-
-                        Row {
-                            anchors.fill: parent
-                            anchors.leftMargin: Style.space(8)
-                            anchors.rightMargin: Style.space(8)
-                            spacing: Style.space(8)
-                            z: 2
-
-                            Text {
-                                width: Style.space(24)
-                                text: String(modelData.index + 1)
-                                color: Qt.darker(root.bar.foreground, 1.6)
-                                font.family: root.bar.fontFamily
-                                font.pixelSize: Style.font.caption
-                                anchors.verticalCenter: parent.verticalCenter
-                            }
-                            Column {
-                                anchors.verticalCenter: parent.verticalCenter
-                                spacing: Style.space(1)
-                                width: parent.width - Style.space(24) - Style.space(24) - Style.space(16)
-                                Text {
-                                    text: modelData.title
-                                    textFormat: Text.PlainText
-                                    color: root.bar.foreground
-                                    font.family: root.bar.fontFamily
-                                    font.pixelSize: Style.font.bodySmall
-                                    font.bold: isCurrent
-                                    elide: Text.ElideRight
-                                    width: parent.width
-                                }
-                                Text {
-                                    text: modelData.artist
-                                    textFormat: Text.PlainText
-                                    color: Qt.darker(root.bar.foreground, 1.5)
-                                    font.family: root.bar.fontFamily
-                                    font.pixelSize: Style.font.caption
-                                    elide: Text.ElideRight
-                                    width: parent.width
-                                    visible: text !== ""
-                                }
-                            }
-
-                            Item {
-                                width: Style.space(24)
-                                height: parent.height
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: "\uf141"
-                                    color: rowHover.hovered ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.5)
-                                    font.family: root.bar.fontFamily
-                                    font.pixelSize: Style.font.caption
-                                }
-                                MouseArea {
-                                    anchors.fill: parent
-                                    z: 2
-                                    onClicked: {
-                                        root.editVisible = false;
-                                        root.actionsAnchor = actionAnchor;
-                                        root.actionsIndex = (root.actionsIndex === modelData.index) ? -1 : modelData.index;
-                                    }
-                                }
-                            }
-                        }
-
-                        Item {
-                            id: actionAnchor
-                            x: 0
-                            y: parent.height / 2
-                            width: 1
-                            height: 1
-                        }
-
-                        BorderSurface {
-                            width: parent.width
-                            visible: root.editVisible && root.editIndex === modelData.index
-                            z: 4
-                            radius: Style.spacing.labelGap
-                            color: Style.selectedFillFor(root.bar.foreground, Color.accent)
-                            borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
-
-                            Column {
-                                anchors.fill: parent
-                                anchors.margins: Style.space(8)
-                                spacing: Style.space(6)
-
-                                Text {
-                                    text: "Edit track info"
-                                    color: root.bar.foreground
-                                    font.family: root.bar.fontFamily
-                                    font.pixelSize: Style.font.subtitle
-                                    font.bold: true
-                                }
-                                Column {
-                                    width: parent.width
-                                    spacing: Style.space(4)
-                                    Text {
-                                        text: "Title"
-                                        color: Qt.darker(root.bar.foreground, 1.3)
-                                        font.family: root.bar.fontFamily
-                                        font.pixelSize: Style.font.caption
-                                    }
-                                    TextField {
-                                        id: efTitle
-                                        width: parent.width
-                                        text: root.editTitle
-                                        foreground: root.bar.foreground
-                                        onAccepted: efTitle.focus = false
-                                    }
-                                }
-                                Column {
-                                    width: parent.width
-                                    spacing: Style.space(4)
-                                    Text {
-                                        text: "Artist"
-                                        color: Qt.darker(root.bar.foreground, 1.3)
-                                        font.family: root.bar.fontFamily
-                                        font.pixelSize: Style.font.caption
-                                    }
-                                    TextField {
-                                        id: efArtist
-                                        width: parent.width
-                                        text: root.editArtist
-                                        foreground: root.bar.foreground
-                                        onAccepted: efArtist.focus = false
-                                    }
-                                }
-                                Column {
-                                    width: parent.width
-                                    spacing: Style.space(4)
-                                    Text {
-                                        text: "Album"
-                                        color: Qt.darker(root.bar.foreground, 1.3)
-                                        font.family: root.bar.fontFamily
-                                        font.pixelSize: Style.font.caption
-                                    }
-                                    TextField {
-                                        id: efAlbum
-                                        width: parent.width
-                                        text: root.editAlbum
-                                        foreground: root.bar.foreground
-                                        onAccepted: efAlbum.focus = false
-                                    }
-                                }
-
-                                Row {
-                                    anchors.horizontalCenter: parent.horizontalCenter
-                                    spacing: Style.space(8)
-                                    Button {
-                                        text: "Save"
-                                        height: Style.space(32)
-                                        iconSize: Style.font.icon
-                                        foreground: root.bar.foreground
-                                        verticalPadding: 0
-                                        horizontalPadding: Style.spacing.controlPaddingX
-                                        onClicked: {
-                                            root.editTitle = efTitle.text;
-                                            root.editArtist = efArtist.text;
-                                            root.editAlbum = efAlbum.text;
-                                            root.saveEdit();
-                                        }
-                                    }
-                                    Button {
-                                        text: "Cancel"
-                                        height: Style.space(32)
-                                        iconSize: Style.font.icon
-                                        foreground: root.bar.foreground
-                                        verticalPadding: 0
-                                        horizontalPadding: Style.spacing.controlPaddingX
-                                        onClicked: root.cancelEdit()
-                                    }
-                                }
-                            }
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            z: 1
-                            onClicked: root.playFromRow(modelData.index)
-                        }
-                    }
-                }
-
-                Row {
-                    width: parent.width
-                    spacing: Style.space(8)
-
-                    Button {
-                        iconText: root.addVisible ? "\uf00d" : "\uf067"
-                        height: Style.space(32)
-                        iconSize: Style.font.icon
-                        foreground: root.bar.foreground
-                        verticalPadding: 0
-                        horizontalPadding: Style.spacing.controlPaddingX
-                        tooltipText: root.addVisible ? "Cancel adding a source" : "Add a local, SSH, https, or local-network source"
-                        onClicked: root.addVisible = !root.addVisible
-                    }
                     Text {
-                        text: "Add source"
-                        anchors.verticalCenter: parent.verticalCenter
+                        text: "Library"
                         color: Qt.darker(root.bar.foreground, 1.3)
                         font.family: root.bar.fontFamily
                         font.pixelSize: Style.font.caption
                     }
-                }
 
-                BorderSurface {
-                    width: parent.width
-                    visible: root.addVisible
-                    radius: Style.spacing.labelGap
-                    color: Style.selectedFillFor(root.bar.foreground, Color.accent)
-                    borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
-                    implicitHeight: addForm.implicitHeight + Style.space(16)
+                    Text {
+                        text: "Tip: drag an audio file here and drop it to add it."
+                        color: Qt.darker(root.bar.foreground, 1.6)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.italic: true
+                    }
 
-                    Column {
-                        id: addForm
-                        anchors.fill: parent
-                        anchors.margins: Style.space(8)
-                        spacing: Style.space(6)
+                    ListView {
+                        id: trackList
+                        width: parent.width
+                        height: Math.min(260, trackList.contentHeight)
+                        clip: true
+                        model: root.tracks
+                        boundsBehavior: Flickable.StopAtBounds
 
-                        Row {
-                            width: parent.width
-                            spacing: Style.space(4)
+                        delegate: BorderSurface {
+                            required property int index
+                            required property var modelData
+                            readonly property bool isActive: modelData.index === root.selectedTrackIndex && root.hasTrack
+                            readonly property bool isCurrent: modelData.index === root.selectedTrackIndex
+                            readonly property bool isPending: root.pendingPlayIndex === modelData.index
 
-                            Repeater {
-                                model: [ ["local", "Local"], ["ssh", "SSH"], ["https", "https"], ["network", "Network"] ]
+                            width: trackList.width
+                            height: Style.space(34)
+                            radius: Style.spacing.labelGap
+                            color: isActive ? Style.selectedFillFor(root.bar.foreground, Color.accent) : ((isPending || rowHover.hovered) ? Style.hoverFillFor(root.bar.foreground, Color.accent) : "transparent")
+                            borderSpec: isActive ? Border.controlSpec("selected", root.bar.foreground, Color.accent) : Border.none()
 
-                                delegate: Button {
-                                    required property var modelData
-                                    text: modelData[1]
-                                    height: Style.space(28)
-                                    foreground: root.addType === modelData[0] ? Color.accent : root.bar.foreground
-                                    selected: root.addType === modelData[0]
-                                    verticalPadding: 0
-                                    horizontalPadding: Style.spacing.controlPaddingX
-                                    onClicked: root.addType = modelData[0]
+                            HoverHandler {
+                                id: rowHover
+                            }
+
+                            Shape {
+                                id: pendingOutline
+                                anchors.fill: parent
+                                visible: isPending
+                                preferredRendererType: Shape.CurveRenderer
+                                antialiasing: true
+
+                                ShapePath {
+                                    id: pendingPath
+                                    strokeColor: Color.accent
+                                    strokeWidth: 1
+                                    strokeStyle: ShapePath.DashLine
+                                    dashPattern: [4, 3]
+                                    fillColor: "transparent"
+
+                                    startX: Style.spacing.labelGap
+                                    startY: 0
+                                    PathLine {
+                                        x: pendingOutline.width - Style.spacing.labelGap
+                                        y: 0
+                                    }
+                                    PathLine {
+                                        x: pendingOutline.width
+                                        y: Style.spacing.labelGap
+                                    }
+                                    PathLine {
+                                        x: pendingOutline.width
+                                        y: pendingOutline.height - Style.spacing.labelGap
+                                    }
+                                    PathLine {
+                                        x: pendingOutline.width - Style.spacing.labelGap
+                                        y: pendingOutline.height
+                                    }
+                                    PathLine {
+                                        x: Style.spacing.labelGap
+                                        y: pendingOutline.height
+                                    }
+                                    PathLine {
+                                        x: 0
+                                        y: pendingOutline.height - Style.spacing.labelGap
+                                    }
+                                    PathLine {
+                                        x: 0
+                                        y: Style.spacing.labelGap
+                                    }
+                                    PathLine {
+                                        x: Style.spacing.labelGap
+                                        y: 0
+                                    }
                                 }
                             }
-                        }
 
-                        Column {
-                            width: parent.width
-                            spacing: Style.space(4)
-                            visible: root.addType === "local"
+                            Row {
+                                anchors.fill: parent
+                                anchors.leftMargin: Style.space(8)
+                                anchors.rightMargin: Style.space(8)
+                                spacing: Style.space(8)
+                                z: 2
 
-                            Text {
-                                text: "Path on this machine"
-                                color: root.bar.foreground
-                                font.family: root.bar.fontFamily
-                                font.pixelSize: Style.font.bodySmall
-                                font.bold: true
-                            }
-                            TextField {
-                                id: addLocalField
-                                width: parent.width
-                                text: root.addPath
-                                placeholderText: "/home/me/Music/song.flac"
-                                foreground: root.bar.foreground
-                                onAccepted: {
-                                    root.addPath = text;
-                                    root.addLocalTrack(text);
+                                Text {
+                                    width: Style.space(24)
+                                    text: String(modelData.index + 1)
+                                    color: Qt.darker(root.bar.foreground, 1.6)
+                                    font.family: root.bar.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                                Column {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    spacing: Style.space(1)
+                                    width: parent.width - Style.space(24) - Style.space(24) - Style.space(16)
+                                    Text {
+                                        text: modelData.title
+                                        textFormat: Text.PlainText
+                                        color: root.bar.foreground
+                                        font.family: root.bar.fontFamily
+                                        font.pixelSize: Style.font.bodySmall
+                                        font.bold: isCurrent
+                                        elide: Text.ElideRight
+                                        width: parent.width
+                                    }
+                                    Text {
+                                        text: modelData.artist
+                                        textFormat: Text.PlainText
+                                        color: Qt.darker(root.bar.foreground, 1.5)
+                                        font.family: root.bar.fontFamily
+                                        font.pixelSize: Style.font.caption
+                                        elide: Text.ElideRight
+                                        width: parent.width
+                                        visible: text !== ""
+                                    }
+                                }
+
+                                Item {
+                                    width: Style.space(24)
+                                    height: parent.height
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "\uf141"
+                                        color: rowHover.hovered ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.5)
+                                        font.family: root.bar.fontFamily
+                                        font.pixelSize: Style.font.caption
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        z: 2
+                                        onClicked: {
+                                            root.editVisible = false;
+                                            root.actionsAnchor = actionAnchor;
+                                            root.actionsIndex = (root.actionsIndex === modelData.index) ? -1 : modelData.index;
+                                        }
+                                    }
                                 }
                             }
-                        }
 
-                        Column {
-                            width: parent.width
-                            spacing: Style.space(4)
-                            visible: root.addType === "ssh" || root.addType === "network"
+                            Item {
+                                id: actionAnchor
+                                x: parent.width - Style.space(8) - Style.space(12)
+                                y: parent.height / 2
+                                width: 1
+                                height: 1
+                            }
 
-                            Text {
-                                text: root.addType === "ssh" ? "SSH user" : "Network user"
-                                color: root.bar.foreground
-                                font.family: root.bar.fontFamily
-                                font.pixelSize: Style.font.bodySmall
-                                font.bold: true
-                            }
-                            TextField {
-                                id: addUserField
+                            BorderSurface {
                                 width: parent.width
-                                text: root.addUser
-                                placeholderText: "username"
-                                foreground: root.bar.foreground
-                                onAccepted: root.submitAdd()
-                            }
-                            Text {
-                                text: "Host or IP"
-                                color: root.bar.foreground
-                                font.family: root.bar.fontFamily
-                                font.pixelSize: Style.font.bodySmall
-                                font.bold: true
-                            }
-                            TextField {
-                                id: addHostField
-                                width: parent.width
-                                text: root.addHost
-                                placeholderText: "nas.local or 192.168.1.10"
-                                foreground: root.bar.foreground
-                                onAccepted: root.submitAdd()
-                            }
-                            Text {
-                                text: "Remote path"
-                                color: root.bar.foreground
-                                font.family: root.bar.fontFamily
-                                font.pixelSize: Style.font.bodySmall
-                                font.bold: true
-                            }
-                            TextField {
-                                id: addSshPathField
-                                width: parent.width
-                                text: root.addPath
-                                placeholderText: "/music/song.flac"
-                                foreground: root.bar.foreground
-                                onAccepted: {
-                                    root.addPath = text;
-                                    root.submitAdd();
+                                visible: root.editVisible && root.editIndex === modelData.index
+                                z: 4
+                                radius: Style.spacing.labelGap
+                                color: Style.selectedFillFor(root.bar.foreground, Color.accent)
+                                borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
+
+                                Column {
+                                    anchors.fill: parent
+                                    anchors.margins: Style.space(8)
+                                    spacing: Style.space(6)
+
+                                    Text {
+                                        text: "Edit track info"
+                                        color: root.bar.foreground
+                                        font.family: root.bar.fontFamily
+                                        font.pixelSize: Style.font.subtitle
+                                        font.bold: true
+                                    }
+                                    Column {
+                                        width: parent.width
+                                        spacing: Style.space(4)
+                                        Text {
+                                            text: "Title"
+                                            color: Qt.darker(root.bar.foreground, 1.3)
+                                            font.family: root.bar.fontFamily
+                                            font.pixelSize: Style.font.caption
+                                        }
+                                        TextField {
+                                            id: efTitle
+                                            width: parent.width
+                                            text: root.editTitle
+                                            foreground: root.bar.foreground
+                                            onAccepted: efTitle.focus = false
+                                        }
+                                    }
+                                    Column {
+                                        width: parent.width
+                                        spacing: Style.space(4)
+                                        Text {
+                                            text: "Artist"
+                                            color: Qt.darker(root.bar.foreground, 1.3)
+                                            font.family: root.bar.fontFamily
+                                            font.pixelSize: Style.font.caption
+                                        }
+                                        TextField {
+                                            id: efArtist
+                                            width: parent.width
+                                            text: root.editArtist
+                                            foreground: root.bar.foreground
+                                            onAccepted: efArtist.focus = false
+                                        }
+                                    }
+                                    Column {
+                                        width: parent.width
+                                        spacing: Style.space(4)
+                                        Text {
+                                            text: "Album"
+                                            color: Qt.darker(root.bar.foreground, 1.3)
+                                            font.family: root.bar.fontFamily
+                                            font.pixelSize: Style.font.caption
+                                        }
+                                        TextField {
+                                            id: efAlbum
+                                            width: parent.width
+                                            text: root.editAlbum
+                                            foreground: root.bar.foreground
+                                            onAccepted: efAlbum.focus = false
+                                        }
+                                    }
+
+                                    Row {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        spacing: Style.space(8)
+                                        Button {
+                                            text: "Save"
+                                            height: Style.space(32)
+                                            iconSize: Style.font.icon
+                                            foreground: root.bar.foreground
+                                            verticalPadding: 0
+                                            horizontalPadding: Style.spacing.controlPaddingX
+                                            onClicked: {
+                                                root.editTitle = efTitle.text;
+                                                root.editArtist = efArtist.text;
+                                                root.editAlbum = efAlbum.text;
+                                                root.saveEdit();
+                                            }
+                                        }
+                                        Button {
+                                            text: "Cancel"
+                                            height: Style.space(32)
+                                            iconSize: Style.font.icon
+                                            foreground: root.bar.foreground
+                                            verticalPadding: 0
+                                            horizontalPadding: Style.spacing.controlPaddingX
+                                            onClicked: root.cancelEdit()
+                                        }
+                                    }
                                 }
                             }
-                        }
 
-                        Column {
-                            width: parent.width
-                            spacing: Style.space(4)
-                            visible: root.addType === "https"
-
-                            Text {
-                                text: "https:// URL"
-                                color: root.bar.foreground
-                                font.family: root.bar.fontFamily
-                                font.pixelSize: Style.font.bodySmall
-                                font.bold: true
-                            }
-                            TextField {
-                                id: addUrlField
-                                width: parent.width
-                                text: root.addUrl
-                                placeholderText: "https://example.com/song.flac"
-                                foreground: root.bar.foreground
-                                onAccepted: root.submitAdd()
+                            MouseArea {
+                                anchors.fill: parent
+                                z: 1
+                                onClicked: root.playFromRow(modelData.index)
                             }
                         }
+                    }
 
+                    Row {
+                        width: parent.width
+                        spacing: Style.space(8)
+
+                        Button {
+                            iconText: root.addVisible ? "\uf00d" : "\uf067"
+                            height: Style.space(32)
+                            iconSize: Style.font.icon
+                            foreground: root.bar.foreground
+                            verticalPadding: 0
+                            horizontalPadding: Style.spacing.controlPaddingX
+                            tooltipText: root.addVisible ? "Cancel adding a source" : "Add a local, SSH, https, or local-network source"
+                            onClicked: root.addVisible = !root.addVisible
+                        }
                         Text {
-                            text: root.addType === "local"
-                                ? "Metadata is read from the file; missing tags use the file name."
-                                : (root.addType === "https"
-                                    ? "The URL is streamed with curl; tags are read with ffprobe when possible."
-                                    : "The file is streamed over SSH; tags are read from the remote host when possible.")
-                            width: parent.width
-                            wrapMode: Text.WordWrap
-                            color: Qt.darker(root.bar.foreground, 1.5)
+                            text: "Add source"
+                            anchors.verticalCenter: parent.verticalCenter
+                            color: Qt.darker(root.bar.foreground, 1.3)
                             font.family: root.bar.fontFamily
                             font.pixelSize: Style.font.caption
                         }
-                        Row {
-                            anchors.horizontalCenter: parent.horizontalCenter
-                            spacing: Style.space(8)
-                            Button {
-                                text: "Add"
-                                height: Style.space(32)
-                                foreground: root.bar.foreground
-                                verticalPadding: 0
-                                horizontalPadding: Style.spacing.controlPaddingX
-                                onClicked: root.submitAdd()
+                    }
+
+                    BorderSurface {
+                        width: parent.width
+                        visible: root.addVisible
+                        radius: Style.spacing.labelGap
+                        color: Style.selectedFillFor(root.bar.foreground, Color.accent)
+                        borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
+                        implicitHeight: addForm.implicitHeight + Style.space(16)
+
+                        Column {
+                            id: addForm
+                            anchors.fill: parent
+                            anchors.margins: Style.space(8)
+                            spacing: Style.space(6)
+
+                            Row {
+                                width: parent.width
+                                spacing: Style.space(4)
+
+                                Repeater {
+                                    model: [ ["local", "Local"], ["ssh", "SSH"], ["https", "https"], ["network", "Network"] ]
+
+                                    delegate: Button {
+                                        required property var modelData
+                                        text: modelData[1]
+                                        height: Style.space(28)
+                                        foreground: root.addType === modelData[0] ? Color.accent : root.bar.foreground
+                                        selected: root.addType === modelData[0]
+                                        verticalPadding: 0
+                                        horizontalPadding: Style.spacing.controlPaddingX
+                                        onClicked: root.addType = modelData[0]
+                                    }
+                                }
                             }
-                            Button {
-                                text: "Cancel"
-                                height: Style.space(32)
-                                foreground: root.bar.foreground
-                                verticalPadding: 0
-                                horizontalPadding: Style.spacing.controlPaddingX
-                                onClicked: root.addVisible = false
+
+                            Column {
+                                width: parent.width
+                                spacing: Style.space(4)
+                                visible: root.addType === "local"
+
+                                Text {
+                                    text: "Path on this machine"
+                                    color: root.bar.foreground
+                                    font.family: root.bar.fontFamily
+                                    font.pixelSize: Style.font.bodySmall
+                                    font.bold: true
+                                }
+                                TextField {
+                                    id: addLocalField
+                                    width: parent.width
+                                    text: root.addPath
+                                    placeholderText: "/home/me/Music/song.flac"
+                                    foreground: root.bar.foreground
+                                    onAccepted: {
+                                        root.addPath = text;
+                                        root.addLocalTrack(text);
+                                    }
+                                }
                             }
+
+                            Column {
+                                width: parent.width
+                                spacing: Style.space(4)
+                                visible: root.addType === "ssh" || root.addType === "network"
+
+                                Text {
+                                    text: root.addType === "ssh" ? "SSH user" : "Network user"
+                                    color: root.bar.foreground
+                                    font.family: root.bar.fontFamily
+                                    font.pixelSize: Style.font.bodySmall
+                                    font.bold: true
+                                }
+                                TextField {
+                                    id: addUserField
+                                    width: parent.width
+                                    text: root.addUser
+                                    placeholderText: "username"
+                                    foreground: root.bar.foreground
+                                    onAccepted: root.submitAdd()
+                                }
+                                Text {
+                                    text: "Host or IP"
+                                    color: root.bar.foreground
+                                    font.family: root.bar.fontFamily
+                                    font.pixelSize: Style.font.bodySmall
+                                    font.bold: true
+                                }
+                                TextField {
+                                    id: addHostField
+                                    width: parent.width
+                                    text: root.addHost
+                                    placeholderText: "nas.local or 192.168.1.10"
+                                    foreground: root.bar.foreground
+                                    onAccepted: root.submitAdd()
+                                }
+                                Text {
+                                    text: "Remote path"
+                                    color: root.bar.foreground
+                                    font.family: root.bar.fontFamily
+                                    font.pixelSize: Style.font.bodySmall
+                                    font.bold: true
+                                }
+                                TextField {
+                                    id: addSshPathField
+                                    width: parent.width
+                                    text: root.addPath
+                                    placeholderText: "/music/song.flac"
+                                    foreground: root.bar.foreground
+                                    onAccepted: {
+                                        root.addPath = text;
+                                        root.submitAdd();
+                                    }
+                                }
+                            }
+
+                            Column {
+                                width: parent.width
+                                spacing: Style.space(4)
+                                visible: root.addType === "https"
+
+                                Text {
+                                    text: "https:// URL"
+                                    color: root.bar.foreground
+                                    font.family: root.bar.fontFamily
+                                    font.pixelSize: Style.font.bodySmall
+                                    font.bold: true
+                                }
+                                TextField {
+                                    id: addUrlField
+                                    width: parent.width
+                                    text: root.addUrl
+                                    placeholderText: "https://example.com/song.flac"
+                                    foreground: root.bar.foreground
+                                    onAccepted: root.submitAdd()
+                                }
+                            }
+
+                            Text {
+                                text: root.addType === "local"
+                                    ? "Metadata is read from the file; missing tags use the file name."
+                                    : (root.addType === "https"
+                                        ? "The URL is streamed with curl; tags are read with ffprobe when possible."
+                                        : "The file is streamed over SSH; tags are read from the remote host when possible.")
+                                width: parent.width
+                                wrapMode: Text.WordWrap
+                                color: Qt.darker(root.bar.foreground, 1.5)
+                                font.family: root.bar.fontFamily
+                                font.pixelSize: Style.font.caption
+                            }
+                            Row {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                spacing: Style.space(8)
+                                Button {
+                                    text: "Add"
+                                    height: Style.space(32)
+                                    foreground: root.bar.foreground
+                                    verticalPadding: 0
+                                    horizontalPadding: Style.spacing.controlPaddingX
+                                    onClicked: root.submitAdd()
+                                }
+                                Button {
+                                    text: "Cancel"
+                                    height: Style.space(32)
+                                    foreground: root.bar.foreground
+                                    verticalPadding: 0
+                                    horizontalPadding: Style.spacing.controlPaddingX
+                                    onClicked: root.addVisible = false
+                                }
+                            }
+                        }
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    z: 40
+                    visible: root.actionsIndex >= 0 && !root.editVisible
+                    onClicked: {
+                        root.actionsIndex = -1;
+                        root.editVisible = false;
+                    }
+                }
+
+                BorderSurface {
+                    id: actionsMenu
+                    z: 50
+                    visible: root.actionsIndex >= 0 && !root.editVisible
+                    width: Style.space(150)
+                    height: actionsCol.implicitHeight + Style.space(8)
+                    radius: Style.spacing.labelGap
+                    color: Color.popups.background
+                    borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
+
+                    x: root.actionsAnchor
+                        ? Math.max(0, librarySection.mapFromItem(root.actionsAnchor, 0, 0).x - width)
+                        : 0
+                    y: root.actionsAnchor
+                        ? Math.max(0, librarySection.mapFromItem(root.actionsAnchor, 0, 0).y - height / 2)
+                        : 0
+
+                    Column {
+                        id: actionsCol
+                        anchors.fill: parent
+                        anchors.margins: Style.space(4)
+                        spacing: Style.space(2)
+
+                        Button {
+                            text: "Play"
+                            iconText: "\uf04b"
+                            width: parent.width
+                            height: Style.space(32)
+                            iconSize: Style.font.icon
+                            foreground: root.bar.foreground
+                            verticalPadding: 0
+                            horizontalPadding: Style.spacing.controlPaddingX
+                            onClicked: root.playIndex(root.actionsIndex)
+                        }
+                        Button {
+                            text: "Edit info"
+                            iconText: "\uf040"
+                            width: parent.width
+                            height: Style.space(32)
+                            iconSize: Style.font.icon
+                            foreground: root.bar.foreground
+                            verticalPadding: 0
+                            horizontalPadding: Style.spacing.controlPaddingX
+                            onClicked: {
+                                var idx = root.actionsIndex;
+                                root.actionsIndex = -1;
+                                root.startEdit(idx);
+                            }
+                        }
+                        Button {
+                            text: "Remove"
+                            iconText: "\uf2ed"
+                            width: parent.width
+                            height: Style.space(32)
+                            iconSize: Style.font.icon
+                            foreground: Color.urgent
+                            verticalPadding: 0
+                            horizontalPadding: Style.spacing.controlPaddingX
+                            onClicked: root.removeTrack(root.actionsIndex)
                         }
                     }
                 }
@@ -1345,67 +1426,6 @@ BarWidget {
                     root.contextOpen = false;
                     root.setClosed(!root.closed);
                 }
-            }
-        }
-    }
-
-    QtObject {
-        id: actionsOwner
-        function close() {
-            root.actionsIndex = -1;
-        }
-    }
-
-    PopupCard {
-        id: actionsPopup
-        anchorItem: root.actionsAnchor
-        bar: root.bar
-        owner: actionsOwner
-        open: root.actionsIndex >= 0 && !root.editVisible
-        contentWidth: actionsPopup.fittedContentWidth(Style.space(150))
-        contentHeight: actionsPopup.fittedContentHeight(actionsCol.implicitHeight)
-
-        Column {
-            id: actionsCol
-            anchors.fill: parent
-            spacing: Style.space(2)
-
-            Button {
-                text: "Play"
-                iconText: "\uf04b"
-                width: parent.width
-                height: Style.space(32)
-                iconSize: Style.font.icon
-                foreground: root.bar.foreground
-                verticalPadding: 0
-                horizontalPadding: Style.spacing.controlPaddingX
-                onClicked: root.playIndex(root.actionsIndex)
-            }
-            Button {
-                text: "Edit info"
-                iconText: "\uf040"
-                width: parent.width
-                height: Style.space(32)
-                iconSize: Style.font.icon
-                foreground: root.bar.foreground
-                verticalPadding: 0
-                horizontalPadding: Style.spacing.controlPaddingX
-                onClicked: {
-                    var idx = root.actionsIndex;
-                    root.actionsIndex = -1;
-                    root.startEdit(idx);
-                }
-            }
-            Button {
-                text: "Remove"
-                iconText: "\uf2ed"
-                width: parent.width
-                height: Style.space(32)
-                iconSize: Style.font.icon
-                foreground: Color.urgent
-                verticalPadding: 0
-                horizontalPadding: Style.spacing.controlPaddingX
-                onClicked: root.removeTrack(root.actionsIndex)
             }
         }
     }
