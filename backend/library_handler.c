@@ -164,10 +164,16 @@ static void print_json_string(const char *value) {
     putchar('"');
 }
 #endif
+/* Safety ceiling on the library JSON size.  A library of even tens of
+ * thousands of tracks is a few megabytes; capping the read prevents an
+ * unbounded allocation from an oversized or corrupted file. */
+#define LIBRARY_JSON_MAX ((long)64 * 1024 * 1024)
+
 static char *read_file(const char *path) {
     FILE *file = fopen(path, "rb"); long size; char *buf;
     if (!file) return NULL;
     if (fseek(file, 0, SEEK_END) || (size = ftell(file)) < 0 || fseek(file, 0, SEEK_SET)) { fclose(file); return NULL; }
+    if (size > LIBRARY_JSON_MAX) { errno = EFBIG; fclose(file); return NULL; }
     buf = malloc((size_t)size + 1); if (!buf) { fclose(file); return NULL; }
     if (fread(buf, 1, (size_t)size, file) != (size_t)size) { free(buf); fclose(file); return NULL; }
     buf[size] = '\0'; fclose(file); return buf;
