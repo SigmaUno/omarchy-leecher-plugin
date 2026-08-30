@@ -553,7 +553,7 @@ BarWidget {
             id: label
             anchors.verticalCenter: parent.verticalCenter
             visible: !root.collapsed
-            text: root.hasTrack ? (root.title + (root.artist !== "" ? "  \u00b7  " + root.artist : "")) : (root.statusText !== "" ? root.statusText : "Nothing's playing")
+            text: root.hasTrack ? (root.title + (root.artist !== "" ? "  \u00b7  " + root.artist : "")) : (root.statusText !== "" ? root.statusText : "Nothing playing")
             color: root.hasTrack ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.4)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.body
@@ -591,7 +591,7 @@ BarWidget {
                 root.hoverPeek = true;
                 peekTimer.restart();
             } else if (root.bar) {
-                root.bar.showTooltip(root, root.hasTrack ? (root.title + (root.artist !== "" ? " \u2014 " + root.artist : "")) : "Nothing's playing");
+                root.bar.showTooltip(root, root.hasTrack ? (root.title + (root.artist !== "" ? " \u2014 " + root.artist : "")) : "Nothing playing");
             }
         }
         onExited: {
@@ -810,6 +810,9 @@ BarWidget {
                 id: librarySection
                 width: parent.width
                 visible: root.libraryOpen
+                // A plain Item has no implicit size, so without this binding the
+                // popup only measures the player controls and clips the library.
+                implicitHeight: visible ? libraryCol.implicitHeight : 0
 
                 Column {
                     id: libraryCol
@@ -821,14 +824,6 @@ BarWidget {
                         color: Qt.darker(root.bar.foreground, 1.3)
                         font.family: root.bar.fontFamily
                         font.pixelSize: Style.font.caption
-                    }
-
-                    Text {
-                        text: "Tip: drag an audio file here and drop it to add it."
-                        color: Qt.darker(root.bar.foreground, 1.6)
-                        font.family: root.bar.fontFamily
-                        font.pixelSize: Style.font.caption
-                        font.italic: true
                     }
 
                     ListView {
