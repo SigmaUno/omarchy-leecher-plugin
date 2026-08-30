@@ -13,14 +13,76 @@ BarWidget {
     /* IPC directory shared with the backend.  Resolved once to a literal path
      * via Quickshell.env() (no shell fragment) so the file watchers below can
      * watch it directly and no per-poll `sh -c cat` process is needed.  Mirrors
-     * app.c init_ipc_dir(): $XDG_RUNTIME_DIR/leecher, else /tmp/leecher-<uid>. */
-    readonly property string runtimeDir: (function () {
+     * app.c init_ipc_dir(): $XDG_RUNTIME_DIR/leecher, else /tmp/leecher-<uid>.
+     *
+     * `$UID` is a shell variable that is normally NOT exported, so it must not
+     * be used to derive the fallback path (it would collapse to the fixed name
+     * `/tmp/leecher-`, letting another user pre-create it as a symlink).  The
+     * numeric uid is instead read from `id -u` once (see numericUid/fetch). */
+    property int numericUid: -1
+    property string runtimeDir: (function () {
         var rd = Quickshell.env("XDG_RUNTIME_DIR");
-        var uid = Quickshell.env("UID");
-        return (rd && rd !== "") ? (rd + "/leecher") : ("/tmp/leecher-" + uid);
+        return (rd && rd !== "") ? (rd + "/leecher") : ("/tmp/leecher-" + root.numericUid);
     })()
     readonly property string statusFile: root.runtimeDir + "/status.json"
     readonly property string controlFile: root.runtimeDir + "/control"
+
+    /* The backend only uses the IPC dir after validating that it exists, is a
+     * real directory (not a symlink) and is owned by the current user, else it
+     * falls back to a freshly mkdtemp'd dir.  Mirror that guard on the write
+     * side: cache a stat of the directory and only submit control commands once
+     * it is confirmed to be a directory owned by our numeric uid.  Until then
+     * commands are dropped, which fails safe (no hostile path is ever written). */
+    property bool runtimeDirSafe: false
+    property bool restatNeeded: false
+    Process {
+        id: runtimeProbe
+        command: ["sh", "-c", "id -u; ls -ldn \"" + root.runtimeDir + "\""]
+        running: true
+        stdout: SplitParser {
+            onRead: data => {
+                var raw = String(data);
+                if (root.numericUid < 0) {
+                    /* First line: `id -u`.  The fallback path depends on this, so
+                     * once the uid is known mark the directory for a re-stat. */
+                    var u = parseInt(raw.trim());
+                    if (!isNaN(u) && u >= 0) {
+                        root.numericUid = u;
+                        root.runtimeDirSafe = false;
+                        root.restatNeeded = true;
+                    }
+                } else {
+                    /* `ls -ldn` line, e.g.
+                     * "drwx------ 2 1000 1000 40 ... /run/user/1000/leecher"
+                     * (perms, link count, owner uid, group gid, ...).  Must be a
+                     * real directory (leading 'd', never a symlink 'l'),
+                     * owner-writable, and owned by our numeric uid. */
+                    var m = /^\s*([dl])([rwxsStT-]{9})\s+\d+\s+(\d+)/.exec(raw);
+                    if (m) {
+                        /* Owner bits are the first "rwx" (charset indices 0-2);
+                         * the owner write bit is index 1.  A directory we do not
+                         * own, a symlink, or a read-only path must never be
+                         * written through. */
+                        if (m[1] === "d" && m[2].charAt(1) === "w" && parseInt(m[3], 10) === root.numericUid) {
+                            root.runtimeDirSafe = true;
+                            root.restatNeeded = false;
+                            root.refresh();
+                        } else {
+                            root.runtimeDirSafe = false;
+                        }
+                    }
+                }
+            }
+        }
+        onRunningChanged: {
+            if (!running && root.restatNeeded) {
+                /* The uid only just became known, so the command started with a
+                 * stale fallback path.  Restart once against the corrected dir. */
+                root.restatNeeded = false;
+                runtimeProbe.running = true;
+            }
+        }
+    }
 
     property string title: ""
     property string artist: ""
@@ -109,6 +171,8 @@ BarWidget {
         return out;
     }
     function sendControl(cmd) {
+        if (!root.runtimeDirSafe)
+            return;
         root.lastCommandId = (root.lastCommandId + 1) & 0x7fffffff;
         root.pendingCommandId = root.lastCommandId;
         root.commandAcked = false;
@@ -123,6 +187,8 @@ BarWidget {
      * by literal spaces into one control line that the backend splits and
      * applies in a single atomic library write. */
     function sendControlFields(idx, f1, f2, f3) {
+        if (!root.runtimeDirSafe)
+            return;
         root.lastCommandId = (root.lastCommandId + 1) & 0x7fffffff;
         root.pendingCommandId = root.lastCommandId;
         root.commandAcked = false;
