@@ -1382,6 +1382,8 @@ BarWidget {
         }
     }
 
+    }
+
     PopupCard {
         id: contextPopup
         anchorItem: root
