@@ -116,6 +116,7 @@ BarWidget {
     property var tracks: []
 
     property int actionsIndex: -1
+    property var actionsAnchor: root
     property int editIndex: -1
     property bool editVisible: false
     property bool addVisible: false
@@ -955,55 +956,19 @@ BarWidget {
                                     z: 2
                                     onClicked: {
                                         root.editVisible = false;
+                                        root.actionsAnchor = actionAnchor;
                                         root.actionsIndex = (root.actionsIndex === modelData.index) ? -1 : modelData.index;
                                     }
                                 }
                             }
                         }
 
-                        BorderSurface {
-                            width: parent.width
-                            visible: root.actionsIndex === modelData.index && !root.editVisible
-                            z: 3
-                            radius: Style.spacing.labelGap
-                            color: "transparent"
-                            borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
-                            height: Style.space(40)
-
-                            Row {
-                                anchors.centerIn: parent
-                                spacing: Style.space(6)
-                                Button {
-                                    iconText: "\uf04b"
-                                    height: Style.space(34)
-                                    iconSize: Style.font.icon
-                                    foreground: root.bar.foreground
-                                    verticalPadding: 0
-                                    horizontalPadding: Style.spacing.controlPaddingX
-                                    tooltipText: "Play"
-                                    onClicked: root.playIndex(modelData.index)
-                                }
-                                Button {
-                                    iconText: "\uf040"
-                                    height: Style.space(34)
-                                    iconSize: Style.font.icon
-                                    foreground: root.bar.foreground
-                                    verticalPadding: 0
-                                    horizontalPadding: Style.spacing.controlPaddingX
-                                    tooltipText: "Edit info"
-                                    onClicked: root.startEdit(modelData.index)
-                                }
-                                Button {
-                                    iconText: "\uf2ed"
-                                    height: Style.space(34)
-                                    iconSize: Style.font.icon
-                                    foreground: Color.urgent
-                                    verticalPadding: 0
-                                    horizontalPadding: Style.spacing.controlPaddingX
-                                    tooltipText: "Remove"
-                                    onClicked: root.removeTrack(modelData.index)
-                                }
-                            }
+                        Item {
+                            id: actionAnchor
+                            x: 0
+                            y: parent.height / 2
+                            width: 1
+                            height: 1
                         }
 
                         BorderSurface {
@@ -1380,6 +1345,67 @@ BarWidget {
                     root.contextOpen = false;
                     root.setClosed(!root.closed);
                 }
+            }
+        }
+    }
+
+    QtObject {
+        id: actionsOwner
+        function close() {
+            root.actionsIndex = -1;
+        }
+    }
+
+    PopupCard {
+        id: actionsPopup
+        anchorItem: root.actionsAnchor
+        bar: root.bar
+        owner: actionsOwner
+        open: root.actionsIndex >= 0 && !root.editVisible
+        contentWidth: actionsPopup.fittedContentWidth(Style.space(150))
+        contentHeight: actionsPopup.fittedContentHeight(actionsCol.implicitHeight)
+
+        Column {
+            id: actionsCol
+            anchors.fill: parent
+            spacing: Style.space(2)
+
+            Button {
+                text: "Play"
+                iconText: "\uf04b"
+                width: parent.width
+                height: Style.space(32)
+                iconSize: Style.font.icon
+                foreground: root.bar.foreground
+                verticalPadding: 0
+                horizontalPadding: Style.spacing.controlPaddingX
+                onClicked: root.playIndex(root.actionsIndex)
+            }
+            Button {
+                text: "Edit info"
+                iconText: "\uf040"
+                width: parent.width
+                height: Style.space(32)
+                iconSize: Style.font.icon
+                foreground: root.bar.foreground
+                verticalPadding: 0
+                horizontalPadding: Style.spacing.controlPaddingX
+                onClicked: {
+                    var idx = root.actionsIndex;
+                    root.actionsIndex = -1;
+                    root.startEdit(idx);
+                }
+            }
+            Button {
+                text: "Remove"
+                iconText: "\uf2ed"
+                width: parent.width
+                height: Style.space(32)
+                iconSize: Style.font.icon
+                foreground: Color.urgent
+                verticalPadding: 0
+                horizontalPadding: Style.spacing.controlPaddingX
+                onClicked: root.removeTrack(root.actionsIndex)
             }
         }
     }
