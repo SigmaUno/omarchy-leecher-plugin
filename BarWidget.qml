@@ -454,6 +454,7 @@ BarWidget {
 
                     Text {
                         text: root.title || "No song loaded"
+                        textFormat: Text.PlainText
                         color: root.bar.foreground
                         font.family: root.bar.fontFamily
                         font.pixelSize: Style.font.subtitle
@@ -463,6 +464,7 @@ BarWidget {
                     }
                     Text {
                         text: root.artist
+                        textFormat: Text.PlainText
                         color: Qt.darker(root.bar.foreground, 1.3)
                         font.family: root.bar.fontFamily
                         font.pixelSize: Style.font.bodySmall
@@ -472,6 +474,7 @@ BarWidget {
                     }
                     Text {
                         text: root.album
+                        textFormat: Text.PlainText
                         color: Qt.darker(root.bar.foreground, 1.6)
                         font.family: root.bar.fontFamily
                         font.pixelSize: Style.font.caption
@@ -731,6 +734,7 @@ BarWidget {
                                 width: parent.width - Style.space(24) - Style.space(24) - Style.space(16)
                                 Text {
                                     text: modelData.title
+                                    textFormat: Text.PlainText
                                     color: root.bar.foreground
                                     font.family: root.bar.fontFamily
                                     font.pixelSize: Style.font.bodySmall
@@ -740,6 +744,7 @@ BarWidget {
                                 }
                                 Text {
                                     text: modelData.artist
+                                    textFormat: Text.PlainText
                                     color: Qt.darker(root.bar.foreground, 1.5)
                                     font.family: root.bar.fontFamily
                                     font.pixelSize: Style.font.caption
