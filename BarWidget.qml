@@ -848,6 +848,11 @@ BarWidget {
         bar: root.bar
         owner: root
         open: root.popupOpen
+        // The panel holds text fields (filter, playlist name, track edit, add
+        // source). Without an explicit keyboard-focus grab the compositor only
+        // routes keys here incidentally, so a click on a field can sit dead for
+        // a beat before it starts typing.
+        grabFocus: root.popupOpen
         contentWidth: popup.fittedContentWidth(Style.space(360))
         contentHeight: popup.fittedContentHeight(column.implicitHeight)
         padding: Style.space(16)
@@ -1450,7 +1455,9 @@ BarWidget {
                                         onVisibleChanged: {
                                             if (visible) {
                                                 text = "";
-                                                forceActiveFocus();
+                                                /* Defer: the item isn't in the scene
+                                                 * graph yet on the same frame it shows. */
+                                                Qt.callLater(newPlaylistInput.forceActiveFocus);
                                             }
                                         }
                                         onAccepted: root.commitAddPlaylist(text)
