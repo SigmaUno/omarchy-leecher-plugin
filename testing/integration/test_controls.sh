@@ -170,6 +170,24 @@ broken_idx=$(jq '.tracks | length - 1' "$work/lib/library.json")
 send "play $broken_idx"
 wait_for '.status | test("Skipped|Could not play")' "broken source is reported, not silent"
 
+# ---- library mutation mid-playback keeps playing (#11) -------------------
+send "play 0"
+wait_for '.track_index == 0 and .is_playing == true' "back on a real track"
+before=$(jq '.tracks | length' "$work/lib/library.json")
+"$here/make_fixture.sh" "$work/extra" >/dev/null
+add=$work/extra/track0.wav
+send "add_local $add"
+wait_for '.is_playing == true' "playback survives a mid-playback add"
+wait_for '.status | test("[Ii]mport")' "add reported"
+after=$(jq '.tracks | length' "$work/lib/library.json")
+[ "$after" -gt "$before" ] && pass "added track landed in the library" \
+    || fail "added track landed in the library"
+# position must still be advancing after the reload settles
+q1=$(jq '.position_ms' "$D/status.json"); sleep 0.6
+q2=$(jq '.position_ms' "$D/status.json")
+[ "$q2" -gt "$q1" ] && pass "position keeps advancing after the mutation" \
+    || fail "position keeps advancing after the mutation"
+
 # --------------------------------------------------------------------------
 echo
 if [ "$fails" -eq 0 ]; then
