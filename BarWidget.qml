@@ -1373,7 +1373,7 @@ BarWidget {
                                             anchors.centerIn: parent
                                             text: ptab.pname
                                             textFormat: Text.PlainText
-                                            color: root.bar.foreground
+                                            color: Qt.darker(root.bar.foreground, 1.6)
                                             font.family: root.bar.fontFamily
                                             font.pixelSize: Style.font.caption
                                             font.bold: ptab.isViewed || ptab.isPlaying
