@@ -344,7 +344,7 @@ static void write_status(const AppState *state) {
                  output ? output : "", outputs,
                  cover ? cover : "",
                  dir ? dir : "", playlists, viewed ? viewed : "", playing ? playing : "",
-                 (state->scan_thread_valid && state->scan_active) ? "true" : "false", state->scan_count,
+                 state->scan_thread_valid ? "true" : "false", state->scan_count,
                  status ? status : "", state->last_cmd_id);
     free(title); free(artist); free(album); free(library); free(cover); free(status); free(output);
     free(dir); free(viewed); free(playing);
@@ -2412,34 +2412,68 @@ typedef struct {
     char incoming_path[LIBRARY_PATH_MAX];
 } ScanJob;
 
-/* Runs off the main loop: walk a local directory (or an ssh/network find) for
- * audio files and append each as a source to the staging playlist file. Every
- * add is its own atomic write, so the widget's file watcher shows the list
- * filling in live. */
+/* Minimal growable string buffer for building the staging JSON in one shot. */
+typedef struct { char *buf; size_t len, cap; } StrBuf;
+static int sb_puts(StrBuf *b, const char *s) {
+    size_t n = strlen(s);
+    if (b->len + n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap : 8192;
+        char *nb;
+        while (nc < b->len + n + 1) nc *= 2;
+        nb = (char *)realloc(b->buf, nc);
+        if (!nb) return 0;
+        b->buf = nb;
+        b->cap = nc;
+    }
+    memcpy(b->buf + b->len, s, n);
+    b->len += n;
+    b->buf[b->len] = '\0';
+    return 1;
+}
+/* Append a JSON string value ("...") from `s`, or the literal null. */
+static int sb_json_string(StrBuf *b, const char *s) {
+    char *e;
+    int ok;
+    if (!s) return sb_puts(b, "null");
+    e = json_escape(s);
+    ok = sb_puts(b, "\"") && sb_puts(b, e ? e : "") && sb_puts(b, "\"");
+    free(e);
+    return ok;
+}
+
+/* Runs off the main loop: list every audio file in a local directory (or via a
+ * single ssh `find`) and write them all to the staging playlist in ONE atomic
+ * write. Titles come from the file names -- no per-file tag probe -- so a big
+ * folder stages near-instantly; the user fixes anything wrong in the review
+ * list before accepting. */
 static void *scan_worker(void *arg) {
     ScanJob *job = (ScanJob *)arg;
     AppState *s = job->state;
-    int count = 0;
+    StrBuf out = {0};
+    int count = 0, ok = 1;
+    const char *kind_name = job->kind == LIBRARY_SOURCE_SSH ? "ssh"
+                          : job->kind == LIBRARY_SOURCE_NETWORK ? "network" : "local";
+
+    ok = sb_puts(&out, "{\n  \"version\": 1,\n  \"tracks\": [");
 
     if (job->kind == LIBRARY_SOURCE_LOCAL) {
         DIR *d = opendir(job->dir);
         struct dirent *e;
         if (d) {
-            while (!s->scan_cancel && (e = readdir(d)) != NULL) {
-                char full[1400];
+            while (ok && !s->scan_cancel && (e = readdir(d)) != NULL) {
+                char full[1400], title[256];
                 struct stat st;
-                char title[256], artist[256], album[256];
-                LibrarySongQuery song;
-                LibrarySource src;
-                char err[128];
                 if (e->d_name[0] == '.' || !is_audio_name(e->d_name)) continue;
                 if (snprintf(full, sizeof(full), "%s/%s", job->dir, e->d_name) >= (int)sizeof(full)) continue;
                 if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) continue;
-                song = build_song_query_for(s, full, NULL, NULL, NULL,
-                                            title, sizeof(title), artist, sizeof(artist), album, sizeof(album));
-                src = (LibrarySource){ .kind = LIBRARY_SOURCE_LOCAL, .path = full };
-                if (library_handler_add_source(job->incoming_path, &song, &src, err, sizeof(err)) == 1)
-                    s->scan_count = ++count;
+                basename_no_ext(full, title, sizeof(title));
+                ok = sb_puts(&out, count ? "," : "")
+                  && sb_puts(&out, "{\"title\":") && sb_json_string(&out, title)
+                  && sb_puts(&out, ",\"artist\":\"Unknown artist\",\"album\":\"Unknown album\","
+                                   "\"sources\":[{\"kind\":\"local\",\"PATH\":")
+                  && sb_json_string(&out, full)
+                  && sb_puts(&out, ",\"USERNAME\":null,\"URL\":null,\"IP\":null}]}");
+                if (ok) s->scan_count = ++count;
             }
             closedir(d);
         }
@@ -2447,30 +2481,30 @@ static void *scan_worker(void *arg) {
         char tmp[] = "/tmp/leecher_scan_XXXXXX";
         int fd = mkstemp(tmp);
         if (fd >= 0) {
-            char *remote = remote_find_command(job->dir);
+            char *rcmd = remote_find_command(job->dir);
             close(fd);
-            if (remote) {
+            if (rcmd) {
                 FILE *list;
-                run_ssh_to_file(job->user, job->host, remote, tmp);
-                free(remote);
+                run_ssh_to_file(job->user, job->host, rcmd, tmp);
+                free(rcmd);
                 list = fopen(tmp, "r");
                 if (list) {
                     char line[1400];
-                    while (!s->scan_cancel && fgets(line, sizeof(line), list)) {
-                        char *path = line;
-                        char title[256], artist[256], album[256];
-                        LibrarySongQuery song;
-                        LibrarySource src;
-                        char err[128];
+                    while (ok && !s->scan_cancel && fgets(line, sizeof(line), list)) {
+                        char *path = line, title[256];
                         line[strcspn(line, "\r\n")] = '\0';
                         while (*path == ' ' || *path == '\t') path++;
                         if (!*path) continue;
-                        song = build_song_query_for(s, path, job->user, job->host, NULL,
-                                                    title, sizeof(title), artist, sizeof(artist), album, sizeof(album));
-                        src = (LibrarySource){ .kind = job->kind, .path = path,
-                                               .username = job->user, .ip = job->host };
-                        if (library_handler_add_source(job->incoming_path, &song, &src, err, sizeof(err)) == 1)
-                            s->scan_count = ++count;
+                        basename_no_ext(path, title, sizeof(title));
+                        ok = sb_puts(&out, count ? "," : "")
+                          && sb_puts(&out, "{\"title\":") && sb_json_string(&out, title)
+                          && sb_puts(&out, ",\"artist\":\"Unknown artist\",\"album\":\"Unknown album\",\"sources\":[{\"kind\":\"")
+                          && sb_puts(&out, kind_name) && sb_puts(&out, "\",\"PATH\":")
+                          && sb_json_string(&out, path)
+                          && sb_puts(&out, ",\"USERNAME\":") && sb_json_string(&out, job->user)
+                          && sb_puts(&out, ",\"URL\":null,\"IP\":") && sb_json_string(&out, job->host)
+                          && sb_puts(&out, "}]}");
+                        if (ok) s->scan_count = ++count;
                     }
                     fclose(list);
                 }
@@ -2478,6 +2512,11 @@ static void *scan_worker(void *arg) {
             unlink(tmp);
         }
     }
+    if (ok) ok = sb_puts(&out, "]\n}\n");
+    if (ok && !s->scan_cancel && out.buf)
+        atomic_write(job->incoming_path, out.buf, out.len);
+    free(out.buf);
+
     s->scan_count = count;
     s->scan_active = 0;
     free(job);
