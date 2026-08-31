@@ -110,6 +110,7 @@ BarWidget {
     property bool popupOpen: false
     property bool contextOpen: false
     property bool libraryOpen: false
+    property bool audioOpen: false
     property bool hidden: false
     property bool hoverPeek: false
     property bool closed: false
@@ -319,16 +320,11 @@ BarWidget {
     function clearQueue() {
         root.sendControl("queue_clear");
     }
-    /* Step through: system default -> each enumerated output -> back to default. */
-    function cycleOutput() {
-        var opts = [""].concat(root.outputDevices);
-        var cur = opts.indexOf(root.outputDevice);
-        var next = opts[(cur + 1) % opts.length];
-        root.sendControl("output " + (next === "" ? "default" : next));
+    function selectOutput(name) {
+        root.sendControl("output " + (name === "" ? "default" : name));
     }
-    function outputLabel() {
-        return root.outputDevice === "" ? "System default" : root.outputDevice;
-    }
+    /* The audio button hints at non-default state so it is worth opening. */
+    readonly property bool audioAdjusted: root.muted || root.volume !== 100 || root.outputDevice !== ""
     /* Bar tooltip text: track (or "Nothing playing"), plus the latest backend
      * status on its own line when it says something the title doesn't already.
      * Uses the bar's themed tooltip -- the old inline QtQuick ToolTip rendered
@@ -472,6 +468,7 @@ BarWidget {
     function close() {
         root.popupOpen = false;
         root.libraryOpen = false;
+        root.audioOpen = false;
         root.actionsIndex = -1;
         root.editVisible = false;
         root.editIndex = -1;
@@ -986,10 +983,12 @@ BarWidget {
                     onClicked: root.toggleRepeatOne()
                 }
                 Button {
-                    // Only worth showing when there is more than one sink to pick.
-                    visible: root.outputDevices.length > 1
-                    iconText: "\uf025"
-                    foreground: root.outputDevice !== "" ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
+                    /* One entry point for volume + output; the panel below is
+                     * collapsed until this is clicked. Accent-tinted while it
+                     * is open or while anything is off its default. */
+                    iconText: (root.muted || root.volume === 0) ? "\uf026"
+                        : (root.volume < 50 ? "\uf027" : "\uf028")
+                    foreground: (root.audioOpen || root.audioAdjusted) ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
                     width: root.controlButtonSize
                     height: root.controlButtonSize
                     iconSize: Style.font.icon
@@ -997,65 +996,114 @@ BarWidget {
                     borderSpec: root.transportButtonBorder
                     horizontalPadding: Style.spacing.controlPaddingX
                     verticalPadding: 0
-                    tooltipText: "Output: " + root.outputLabel() + " — click to switch"
-                    onClicked: root.cycleOutput()
+                    tooltipText: "Volume & output"
+                    onClicked: root.audioOpen = !root.audioOpen
                 }
             }
 
-            Row {
+            Item {
+                id: audioSection
                 width: parent.width
-                spacing: Style.space(8)
+                visible: root.audioOpen
+                implicitHeight: visible ? audioCol.implicitHeight : 0
 
-                Button {
-                    iconText: (root.muted || root.volume === 0) ? "\uf026"
-                        : (root.volume < 50 ? "\uf027" : "\uf028")
-                    foreground: root.muted ? Qt.darker(root.bar.foreground, 1.8) : root.bar.foreground
-                    width: root.controlButtonSize
-                    height: root.controlButtonSize
-                    iconSize: Style.font.icon
-                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
-                    borderSpec: root.transportButtonBorder
-                    horizontalPadding: Style.spacing.controlPaddingX
-                    verticalPadding: 0
-                    tooltipText: root.muted ? "Muted (click to unmute)" : "Mute"
-                    onClicked: root.toggleMute()
-                }
+                Column {
+                    id: audioCol
+                    width: parent.width
+                    spacing: Style.space(8)
 
-                PanelSlider {
-                    id: volSlider
-                    width: parent.width - Style.space(36) - Style.space(40) - Style.space(16)
-                    height: root.barSize
-                    bar: root.bar
-                    anchors.verticalCenter: parent.verticalCenter
-                    minimum: 0
-                    maximum: 100
-                    step: 1
-                    value: root.volume
-                    enabled: !root.muted
-                    trackHeight: Math.max(Style.space(6), Math.round(Style.spacing.controlHeight * 0.18))
-                    knobSize: Math.max(Style.space(18), Math.round(Style.spacing.controlHeight * 0.48))
-                    trackColor: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.28)
-                    fillColor: Color.accent
-                    knobColor: root.bar.foreground
-                    onMoved: function (v) {
-                        root.volume = Math.round(v);
-                        volApply.restart();
+                    Row {
+                        width: parent.width
+                        spacing: Style.space(8)
+
+                        Button {
+                            iconText: (root.muted || root.volume === 0) ? "\uf026"
+                                : (root.volume < 50 ? "\uf027" : "\uf028")
+                            foreground: root.muted ? Qt.darker(root.bar.foreground, 1.8) : root.bar.foreground
+                            width: root.controlButtonSize
+                            height: root.controlButtonSize
+                            iconSize: Style.font.icon
+                            background: Style.normalFillFor(root.bar.foreground, Color.accent)
+                            borderSpec: root.transportButtonBorder
+                            horizontalPadding: Style.spacing.controlPaddingX
+                            verticalPadding: 0
+                            tooltipText: root.muted ? "Muted (click to unmute)" : "Mute"
+                            onClicked: root.toggleMute()
+                        }
+
+                        PanelSlider {
+                            id: volSlider
+                            width: parent.width - Style.space(36) - Style.space(40) - Style.space(16)
+                            height: root.barSize
+                            bar: root.bar
+                            anchors.verticalCenter: parent.verticalCenter
+                            minimum: 0
+                            maximum: 100
+                            step: 1
+                            value: root.volume
+                            enabled: !root.muted
+                            trackHeight: Math.max(Style.space(6), Math.round(Style.spacing.controlHeight * 0.18))
+                            knobSize: Math.max(Style.space(18), Math.round(Style.spacing.controlHeight * 0.48))
+                            trackColor: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.28)
+                            fillColor: Color.accent
+                            knobColor: root.bar.foreground
+                            onMoved: function (v) {
+                                root.volume = Math.round(v);
+                                volApply.restart();
+                            }
+                            onReleased: function (v) {
+                                volApply.stop();
+                                root.setVolume(v);
+                            }
+                        }
+
+                        Text {
+                            text: (root.muted ? 0 : root.volume) + "%"
+                            color: Qt.darker(root.bar.foreground, 1.3)
+                            font.family: root.bar.fontFamily
+                            font.pixelSize: Style.font.caption
+                            width: Style.space(40)
+                            horizontalAlignment: Text.AlignRight
+                            verticalAlignment: Text.AlignVCenter
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
                     }
-                    onReleased: function (v) {
-                        volApply.stop();
-                        root.setVolume(v);
-                    }
-                }
 
-                Text {
-                    text: (root.muted ? 0 : root.volume) + "%"
-                    color: Qt.darker(root.bar.foreground, 1.3)
-                    font.family: root.bar.fontFamily
-                    font.pixelSize: Style.font.caption
-                    width: Style.space(40)
-                    horizontalAlignment: Text.AlignRight
-                    verticalAlignment: Text.AlignVCenter
-                    anchors.verticalCenter: parent.verticalCenter
+                    Column {
+                        width: parent.width
+                        spacing: Style.space(2)
+                        visible: root.outputDevices.length > 0
+
+                        Text {
+                            text: "Output"
+                            color: Qt.darker(root.bar.foreground, 1.3)
+                            font.family: root.bar.fontFamily
+                            font.pixelSize: Style.font.caption
+                        }
+
+                        Repeater {
+                            model: [""].concat(root.outputDevices)
+
+                            delegate: Button {
+                                required property var modelData
+                                readonly property string devName: String(modelData)
+                                readonly property bool current: root.outputDevice === devName
+                                width: parent.width
+                                height: Style.space(28)
+                                leftAlign: true
+                                fontSize: Style.font.bodySmall
+                                text: (current ? "●  " : "○  ")
+                                    + (devName === "" ? "System default"
+                                       : (devName.length > 38 ? devName.slice(0, 37) + "…" : devName))
+                                foreground: current ? Color.accent : Qt.darker(root.bar.foreground, 1.2)
+                                selected: current
+                                verticalPadding: 0
+                                horizontalPadding: Style.spacing.controlPaddingX
+                                tooltipText: devName === "" ? "System default" : devName
+                                onClicked: root.selectOutput(devName)
+                            }
+                        }
+                    }
                 }
             }
 
