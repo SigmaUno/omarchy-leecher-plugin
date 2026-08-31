@@ -1480,14 +1480,122 @@ BarWidget {
                     TextField {
                         id: librarySearchField
                         width: parent.width
+                        visible: !root.editVisible
                         placeholderText: "Filter by title, artist or album"
                         foreground: root.bar.foreground
                         onTextChanged: root.librarySearch = text
                     }
 
+                    /* Track-info editor. Shown instead of the list (not on top of
+                     * it) so the two never overlap. */
+                    BorderSurface {
+                        id: editPanel
+                        width: parent.width
+                        visible: root.editVisible
+                        radius: Style.spacing.labelGap
+                        color: Style.selectedFillFor(root.bar.foreground, Color.accent)
+                        borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
+                        implicitHeight: editCol.implicitHeight + Style.space(16)
+                        onVisibleChanged: if (visible) Qt.callLater(efTitle.forceActiveFocus)
+
+                        Column {
+                            id: editCol
+                            anchors.fill: parent
+                            anchors.margins: Style.space(8)
+                            spacing: Style.space(6)
+
+                            Text {
+                                text: "Edit track info"
+                                color: root.bar.foreground
+                                font.family: root.bar.fontFamily
+                                font.pixelSize: Style.font.subtitle
+                                font.bold: true
+                            }
+                            Column {
+                                width: parent.width
+                                spacing: Style.space(4)
+                                Text {
+                                    text: "Title"
+                                    color: Qt.darker(root.bar.foreground, 1.3)
+                                    font.family: root.bar.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                }
+                                TextField {
+                                    id: efTitle
+                                    width: parent.width
+                                    text: root.editTitle
+                                    foreground: root.bar.foreground
+                                    onAccepted: efTitle.focus = false
+                                }
+                            }
+                            Column {
+                                width: parent.width
+                                spacing: Style.space(4)
+                                Text {
+                                    text: "Artist"
+                                    color: Qt.darker(root.bar.foreground, 1.3)
+                                    font.family: root.bar.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                }
+                                TextField {
+                                    id: efArtist
+                                    width: parent.width
+                                    text: root.editArtist
+                                    foreground: root.bar.foreground
+                                    onAccepted: efArtist.focus = false
+                                }
+                            }
+                            Column {
+                                width: parent.width
+                                spacing: Style.space(4)
+                                Text {
+                                    text: "Album"
+                                    color: Qt.darker(root.bar.foreground, 1.3)
+                                    font.family: root.bar.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                }
+                                TextField {
+                                    id: efAlbum
+                                    width: parent.width
+                                    text: root.editAlbum
+                                    foreground: root.bar.foreground
+                                    onAccepted: efAlbum.focus = false
+                                }
+                            }
+
+                            Row {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                spacing: Style.space(8)
+                                Button {
+                                    text: "Save"
+                                    height: Style.space(32)
+                                    iconSize: Style.font.icon
+                                    foreground: root.bar.foreground
+                                    verticalPadding: 0
+                                    horizontalPadding: Style.spacing.controlPaddingX
+                                    onClicked: {
+                                        root.editTitle = efTitle.text;
+                                        root.editArtist = efArtist.text;
+                                        root.editAlbum = efAlbum.text;
+                                        root.saveEdit();
+                                    }
+                                }
+                                Button {
+                                    text: "Cancel"
+                                    height: Style.space(32)
+                                    iconSize: Style.font.icon
+                                    foreground: root.bar.foreground
+                                    verticalPadding: 0
+                                    horizontalPadding: Style.spacing.controlPaddingX
+                                    onClicked: root.cancelEdit()
+                                }
+                            }
+                        }
+                    }
+
                     Item {
                         width: parent.width
-                        visible: root.queue.length > 0 && root.viewingPlayingList
+                        visible: root.queue.length > 0 && root.viewingPlayingList && !root.editVisible
                         implicitHeight: visible ? clearQueueBtn.height : 0
 
                         Text {
@@ -1516,7 +1624,7 @@ BarWidget {
 
                     Text {
                         width: parent.width
-                        visible: root.queue.length > 0 && root.viewingPlayingList
+                        visible: root.queue.length > 0 && root.viewingPlayingList && !root.editVisible
                         text: root.queueSummary
                         textFormat: Text.PlainText
                         color: Qt.darker(root.bar.foreground, 1.3)
@@ -1530,6 +1638,7 @@ BarWidget {
                     ListView {
                         id: trackList
                         width: parent.width
+                        visible: !root.editVisible
                         height: Math.min(260, trackList.contentHeight)
                         clip: true
                         model: root.filteredTracks
@@ -1701,108 +1810,6 @@ BarWidget {
                                 height: 1
                             }
 
-                            BorderSurface {
-                                width: parent.width
-                                visible: root.editVisible && root.editIndex === modelData.index
-                                z: 4
-                                radius: Style.spacing.labelGap
-                                color: Style.selectedFillFor(root.bar.foreground, Color.accent)
-                                borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
-
-                                Column {
-                                    anchors.fill: parent
-                                    anchors.margins: Style.space(8)
-                                    spacing: Style.space(6)
-
-                                    Text {
-                                        text: "Edit track info"
-                                        color: root.bar.foreground
-                                        font.family: root.bar.fontFamily
-                                        font.pixelSize: Style.font.subtitle
-                                        font.bold: true
-                                    }
-                                    Column {
-                                        width: parent.width
-                                        spacing: Style.space(4)
-                                        Text {
-                                            text: "Title"
-                                            color: Qt.darker(root.bar.foreground, 1.3)
-                                            font.family: root.bar.fontFamily
-                                            font.pixelSize: Style.font.caption
-                                        }
-                                        TextField {
-                                            id: efTitle
-                                            width: parent.width
-                                            text: root.editTitle
-                                            foreground: root.bar.foreground
-                                            onAccepted: efTitle.focus = false
-                                        }
-                                    }
-                                    Column {
-                                        width: parent.width
-                                        spacing: Style.space(4)
-                                        Text {
-                                            text: "Artist"
-                                            color: Qt.darker(root.bar.foreground, 1.3)
-                                            font.family: root.bar.fontFamily
-                                            font.pixelSize: Style.font.caption
-                                        }
-                                        TextField {
-                                            id: efArtist
-                                            width: parent.width
-                                            text: root.editArtist
-                                            foreground: root.bar.foreground
-                                            onAccepted: efArtist.focus = false
-                                        }
-                                    }
-                                    Column {
-                                        width: parent.width
-                                        spacing: Style.space(4)
-                                        Text {
-                                            text: "Album"
-                                            color: Qt.darker(root.bar.foreground, 1.3)
-                                            font.family: root.bar.fontFamily
-                                            font.pixelSize: Style.font.caption
-                                        }
-                                        TextField {
-                                            id: efAlbum
-                                            width: parent.width
-                                            text: root.editAlbum
-                                            foreground: root.bar.foreground
-                                            onAccepted: efAlbum.focus = false
-                                        }
-                                    }
-
-                                    Row {
-                                        anchors.horizontalCenter: parent.horizontalCenter
-                                        spacing: Style.space(8)
-                                        Button {
-                                            text: "Save"
-                                            height: Style.space(32)
-                                            iconSize: Style.font.icon
-                                            foreground: root.bar.foreground
-                                            verticalPadding: 0
-                                            horizontalPadding: Style.spacing.controlPaddingX
-                                            onClicked: {
-                                                root.editTitle = efTitle.text;
-                                                root.editArtist = efArtist.text;
-                                                root.editAlbum = efAlbum.text;
-                                                root.saveEdit();
-                                            }
-                                        }
-                                        Button {
-                                            text: "Cancel"
-                                            height: Style.space(32)
-                                            iconSize: Style.font.icon
-                                            foreground: root.bar.foreground
-                                            verticalPadding: 0
-                                            horizontalPadding: Style.spacing.controlPaddingX
-                                            onClicked: root.cancelEdit()
-                                        }
-                                    }
-                                }
-                            }
-
                             MouseArea {
                                 anchors.fill: parent
                                 z: 1
@@ -1813,7 +1820,7 @@ BarWidget {
 
                     Text {
                         width: parent.width
-                        visible: root.tracks.length > 0 && root.filteredTracks.length === 0
+                        visible: root.tracks.length > 0 && root.filteredTracks.length === 0 && !root.editVisible
                         text: "No tracks match “" + root.librarySearch.trim() + "”"
                         color: Qt.darker(root.bar.foreground, 1.5)
                         font.family: root.bar.fontFamily
@@ -1825,6 +1832,7 @@ BarWidget {
                     Row {
                         width: parent.width
                         spacing: Style.space(8)
+                        visible: !root.editVisible
 
                         Button {
                             iconText: root.addVisible ? "\uf00d" : "\uf067"
@@ -1847,7 +1855,7 @@ BarWidget {
 
                     BorderSurface {
                         width: parent.width
-                        visible: root.addVisible
+                        visible: root.addVisible && !root.editVisible
                         radius: Style.spacing.labelGap
                         color: Style.selectedFillFor(root.bar.foreground, Color.accent)
                         borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
