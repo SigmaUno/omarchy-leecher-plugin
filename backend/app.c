@@ -1126,43 +1126,67 @@ static LibrarySongQuery build_song_query(AppState *state, const char *file_path,
                                 title, title_size, artist, artist_size, album, album_size);
 }
 
-static int source_field_eq(const char *a, const char *b) {
-    return strcmp(a ? a : "", b ? b : "") == 0;
+/* A stable string key for a source, for dedup while rebuilding "*". */
+static void source_key(const LibrarySource *s, char *out, size_t out_size) {
+    snprintf(out, out_size, "%d\x1f%s\x1f%s\x1f%s\x1f%s", (int)s->kind,
+             s->path ? s->path : "", s->url ? s->url : "",
+             s->username ? s->username : "", s->ip ? s->ip : "");
 }
 
-/* Two sources refer to the same thing: same transport and same locator. */
-static int source_equal(const LibrarySource *a, const LibrarySource *b) {
-    return a->kind == b->kind &&
-           source_field_eq(a->path, b->path) && source_field_eq(a->url, b->url) &&
-           source_field_eq(a->username, b->username) && source_field_eq(a->ip, b->ip);
-}
-
-/* Mirror a freshly-added source into the auto-collect "*" playlist (file only,
- * no in-memory handles). Skipped when "*" is the playlist it was just added to,
- * and when that exact source is already collected there, so adding the same
- * file to several playlists does not pile up duplicates. If "*" happens to be
- * the one playing, its play_lib handle is refreshed on the next `playlist *`. */
-static void mirror_add_to_star(const AppState *s, const LibrarySongQuery *song,
-                               const LibrarySource *source) {
+/* Rebuild the "*" playlist from the union of every other playlist's sources,
+ * deduplicated by source identity. Lazy on purpose: run only when the user
+ * actually looks at "*" (switches to view it) and once at startup, so a normal
+ * add to another playlist costs nothing until then. O(total sources) atomic
+ * writes -- fine for the small curated libraries this serves. */
+static void rebuild_star_playlist(AppState *s) {
     char star[LIBRARY_PATH_MAX], err[256];
-    LibraryHandler *h;
-    size_t count, i, j;
-    int already = 0;
-    if (!strcmp(s->viewed_playlist, STAR_PLAYLIST)) return;
+    char (*seen)[1024] = NULL;
+    size_t seen_len = 0, seen_cap = 0;
+    int pi;
     playlist_file_path(s, STAR_PLAYLIST, star, sizeof(star));
-    h = library_handler_open(star, err, sizeof(err));
-    if (!h) return;
-    count = library_handler_track_count(h);
-    for (i = 0; i < count && !already; i++) {
-        LibraryTrack t = {0};
-        if (library_handler_track_at(h, i, &t, err, sizeof(err)) == 1)
-            for (j = 0; j < t.source_count; j++)
-                if (source_equal(&t.sources[j], source)) { already = 1; break; }
-        library_handler_track_destroy(&t);
+    /* Start from empty so a source deleted everywhere also leaves "*". */
+    if (!atomic_write(star, EMPTY_LIBRARY_JSON, sizeof(EMPTY_LIBRARY_JSON) - 1)) return;
+    for (pi = 0; pi < s->playlist_count; pi++) {
+        char path[LIBRARY_PATH_MAX];
+        LibraryHandler *h;
+        size_t count, i, j;
+        if (!strcmp(s->playlists[pi], STAR_PLAYLIST)) continue;
+        playlist_file_path(s, s->playlists[pi], path, sizeof(path));
+        h = library_handler_open(path, err, sizeof(err));
+        if (!h) continue;
+        count = library_handler_track_count(h);
+        for (i = 0; i < count; i++) {
+            LibraryTrack t = {0};
+            if (library_handler_track_at(h, i, &t, err, sizeof(err)) != 1) {
+                library_handler_track_destroy(&t);
+                continue;
+            }
+            for (j = 0; j < t.source_count; j++) {
+                char key[1024];
+                size_t k;
+                int dup = 0;
+                source_key(&t.sources[j], key, sizeof(key));
+                for (k = 0; k < seen_len; k++)
+                    if (!strcmp(seen[k], key)) { dup = 1; break; }
+                if (dup) continue;
+                if (seen_len == seen_cap) {
+                    size_t nc = seen_cap ? seen_cap * 2 : 64;
+                    char (*ns)[1024] = realloc(seen, nc * sizeof(*seen));
+                    if (!ns) { j = t.source_count; break; }
+                    seen = ns;
+                    seen_cap = nc;
+                }
+                snprintf(seen[seen_len++], sizeof(seen[0]), "%s", key);
+                {
+                    LibrarySongQuery q = { .title = t.title, .artist = t.artist, .album = t.album };
+                    library_handler_add_source(star, &q, &t.sources[j], err, sizeof(err));
+                }
+            }
+            library_handler_track_destroy(&t);
+        }
+        library_handler_close(h);
     }
-    library_handler_close(h);
-    if (!already)
-        library_handler_add_source(star, song, source, err, sizeof(err));
+    free(seen);
 }
 
 /* Adds a source for a single audio file to the library and reloads the in-memory
@@ -1176,7 +1200,6 @@ static int import_single_source(const char *library_path, AppState *state,
         snprintf(state->status, sizeof(state->status), "Import failed for %.160s: %s", song->title, error);
         return 0;
     }
-    mirror_add_to_star(state, song, source);
     LibraryHandler *reloaded = library_handler_open(library_path, error, sizeof(error));
     if (reloaded) {
         cancel_fetch(state);
@@ -2259,17 +2282,21 @@ static void handle_add_https_track(LibraryHandler **library, MusicRipper *ripper
 }
 
 /* Switch the VIEWED playlist: reopen the display/mutation handle at its file.
- * Playback is untouched -- it keeps running over playing_playlist. */
+ * Playback is untouched -- it keeps running over playing_playlist. Viewing "*"
+ * rebuilds it first from the other playlists, so it always shows what has been
+ * added since (a no-op re-view of "*" still refreshes it). */
 static void switch_viewed_playlist(LibraryHandler **library, MusicRipper *ripper,
                                    AppState *state, const char *name) {
     char path[LIBRARY_PATH_MAX], err[128];
     LibraryHandler *h;
+    int is_star = !strcmp(name, STAR_PLAYLIST);
     if (!playlist_known(state, name)) {
         snprintf(state->status, sizeof(state->status), "No such playlist: %.80s", name);
         write_status(state);
         return;
     }
-    if (!strcmp(name, state->viewed_playlist)) return;
+    if (!strcmp(name, state->viewed_playlist) && !is_star) return;
+    if (is_star) rebuild_star_playlist(state);
     playlist_file_path(state, name, path, sizeof(path));
     h = library_handler_open(path, err, sizeof(err));
     if (!h) {
@@ -2792,6 +2819,7 @@ int main(int argc, char **argv) {
         size_t rt; Uint32 rpos; int rplay;
         resolve_library_dir(library_arg, &state, legacy, sizeof(legacy));
         init_resume_path(state.library_dir);
+        rebuild_star_playlist(&state);   /* reconcile "*" with the other playlists */
         snprintf(state.viewed_playlist, sizeof(state.viewed_playlist), "%s",
                  state.playlist_count > 0 ? state.playlists[0] : "home");
         if (read_resume(rpl, sizeof(rpl), &rt, &rpos, &rplay) && rpl[0] && playlist_known(&state, rpl))
