@@ -76,6 +76,7 @@ typedef struct {
     int repeat_one;   /* autoplay replays the current track instead of advancing */
     int volume;       /* software output gain, 0..100 */
     int muted;        /* force silence without losing the volume setting */
+    char audio_device_name[128];  /* chosen SDL output; empty = system default */
     MusicRipperTransports transports;
     pthread_mutex_t fetch_mutex;
     volatile int fetch_cancel;
@@ -257,10 +258,13 @@ static void write_status(const AppState *state) {
     char *title = json_escape(state->title), *artist = json_escape(state->artist),
          *album = json_escape(state->album), *library = json_escape(state->library_path),
          *cover = json_escape(state->cover_file[0] ? state->cover_file : NULL),
-         *status = json_escape(state->status);
-    char tmp[4096];
+         *status = json_escape(state->status),
+         *output = json_escape(state->audio_device_name[0] ? state->audio_device_name : NULL);
+    char tmp[8192];
     char queue[16 * 64 + 4];  /* "[" + up to 64 "NNNNN," + "]" */
+    char outputs[2560];       /* enumerated output device names, JSON array */
     int qn = 0, qi;
+    int on = 0, od, ocount;
     int n;
     queue[qn++] = '[';
     for (qi = 0; qi < state->play_queue_len && qn < (int)sizeof(queue) - 16; qi++)
@@ -268,10 +272,24 @@ static void write_status(const AppState *state) {
                        qi ? "," : "", state->play_queue[qi]);
     queue[qn++] = ']';
     queue[qn] = '\0';
+    outputs[on++] = '[';
+    ocount = SDL_GetNumAudioDevices(0);
+    for (od = 0; od < ocount && on < (int)sizeof(outputs) - 260; od++) {
+        const char *dn = SDL_GetAudioDeviceName(od, 0);
+        char *de;
+        if (!dn) continue;
+        de = json_escape(dn);
+        on += snprintf(outputs + on, sizeof(outputs) - (size_t)on, "%s\"%s\"",
+                       od ? "," : "", de ? de : "");
+        free(de);
+    }
+    outputs[on++] = ']';
+    outputs[on] = '\0';
     n = snprintf(tmp, sizeof(tmp),
                  "{\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
                  "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s,"
-                 "\"shuffle\":%s,\"repeat_one\":%s,\"volume\":%d,\"muted\":%s,\"queue\":%s,\"cover\":\"%s\","
+                 "\"shuffle\":%s,\"repeat_one\":%s,\"volume\":%d,\"muted\":%s,\"queue\":%s,"
+                 "\"output\":\"%s\",\"outputs\":%s,\"cover\":\"%s\","
                  "\"status\":\"%s\",\"cmd_id\":%lu}\n",
                  title ? title : "", artist ? artist : "", album ? album : "",
                  state->position_ms, state->duration_ms,
@@ -279,9 +297,10 @@ static void write_status(const AppState *state) {
                  library ? library : "", state->autoplay ? "true" : "false",
                  state->shuffle ? "true" : "false", state->repeat_one ? "true" : "false",
                  state->volume, state->muted ? "true" : "false", queue,
+                 output ? output : "", outputs,
                  cover ? cover : "",
                  status ? status : "", state->last_cmd_id);
-    free(title); free(artist); free(album); free(library); free(cover); free(status);
+    free(title); free(artist); free(album); free(library); free(cover); free(status); free(output);
     if (n < 0 || (size_t)n >= sizeof(tmp)) return; /* oversized; leave old status intact */
     atomic_write(status_file, tmp, (size_t)n);
 }
@@ -1313,6 +1332,47 @@ static void cancel_fetch(AppState *s) {
 
 static void stream_audio(AppState *s);
 
+/* Open the chosen output (audio_device_name), or the system default when it is
+ * empty. If a named device fails to open it has probably been unplugged or
+ * renamed: report it, forget the choice, and fall back to the default so
+ * playback is never left with no device at all. */
+static SDL_AudioDeviceID open_audio_device(AppState *s, SDL_AudioSpec *want, SDL_AudioSpec *have) {
+    const char *name = s->audio_device_name[0] ? s->audio_device_name : NULL;
+    SDL_AudioDeviceID dev = SDL_OpenAudioDevice(name, 0, want, have, 0);
+    if (!dev && name) {
+        fprintf(stderr, "leecher: output '%s' unavailable (%s), using default\n", name, SDL_GetError());
+        snprintf(s->status, sizeof(s->status), "Output \"%.80s\" unavailable, using default.", s->audio_device_name);
+        s->audio_device_name[0] = '\0';
+        dev = SDL_OpenAudioDevice(NULL, 0, want, have, 0);
+    }
+    return dev;
+}
+
+/* Move the running stream to the currently-selected output, resuming from the
+ * frame that was actually playing. Used when the user picks a device. */
+static void reopen_audio_device(AppState *s) {
+    SDL_AudioSpec want = {0}, have = {0};
+    Uint64 frame = 0;
+    if (!s->decoder || s->audio_channels <= 0 || s->audio_rate <= 0) return;
+    if (s->audio_device) {
+        Uint32 queued = SDL_GetQueuedAudioSize(s->audio_device);
+        Uint64 fiq = queued / ((Uint32)s->audio_channels * 2u);
+        frame = (s->audio_queued_frame > fiq) ? s->audio_queued_frame - fiq : 0;
+        SDL_CloseAudioDevice(s->audio_device);
+        s->audio_device = 0;
+    }
+    want.freq = s->audio_rate; want.format = AUDIO_S16SYS;
+    want.channels = (Uint8)s->audio_channels; want.samples = 4096;
+    s->audio_device = open_audio_device(s, &want, &have);
+    if (!s->audio_device) { s->is_playing = 0; return; }
+    if (decoder_seek(s->decoder, (long long)frame) < 0) { decoder_seek(s->decoder, 0); frame = 0; }
+    s->audio_queued_frame = frame;
+    s->stream_eof = 0;
+    s->track_ended = 0;
+    stream_audio(s);
+    SDL_PauseAudioDevice(s->audio_device, s->is_playing ? 0 : 1);
+}
+
 /* Swap the fetched stream into the SDL audio device and start streaming it.
  * Only a small rolling window is decoded at a time (see stream_audio), so the
  * whole track is never materialised in RAM as PCM. */
@@ -1348,7 +1408,7 @@ static void commit_fetch(AppState *s, size_t idx) {
     s->audio_device = 0;
     if (channels > 0 && rate > 0) {
         desired.freq = rate; desired.format = AUDIO_S16SYS; desired.channels = (Uint8)channels; desired.samples = 4096;
-        s->audio_device = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
+        s->audio_device = open_audio_device(s, &desired, &obtained);
     }
     if (!s->audio_device || total_frames == 0) {
         snprintf(s->status, sizeof(s->status), "SDL audio: %s", SDL_GetError());
@@ -1576,7 +1636,7 @@ static void retry_audio_device(AppState *s) {
     }
     desired.freq = s->audio_rate; desired.format = AUDIO_S16SYS;
     desired.channels = (Uint8)s->audio_channels; desired.samples = 4096;
-    s->audio_device = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
+    s->audio_device = open_audio_device(s, &desired, &obtained);
     if (!s->audio_device) {
         fprintf(stderr, "leecher: SDL audio reopen failed (attempt %d): %s\n", s->audio_retries, SDL_GetError());
         snprintf(s->status, sizeof(s->status), "Audio unavailable, retrying...");
@@ -1921,6 +1981,32 @@ static void handle_control(const char *command, LibraryHandler **library, MusicR
             if (state->play_queue[i] == idx) { play_queue_remove_at(state, i); break; }
         }
         snprintf(state->status, sizeof(state->status), "Play queue: %d.", state->play_queue_len);
+        write_status(state);
+    }
+    else if (!strncmp(command, "output ", 7)) {
+        const char *name = command + 7;
+        while (*name == ' ') name++;
+        if (!*name || !strcmp(name, "default")) {
+            state->audio_device_name[0] = '\0';
+            snprintf(state->status, sizeof(state->status), "Output: system default.");
+        } else {
+            /* Only accept a name SDL currently lists, so a stale or mistyped
+             * choice is rejected now rather than at the next track open. */
+            int di, dc = SDL_GetNumAudioDevices(0), found = 0;
+            for (di = 0; di < dc; di++) {
+                const char *dn = SDL_GetAudioDeviceName(di, 0);
+                if (dn && !strcmp(dn, name)) { found = 1; break; }
+            }
+            if (!found) {
+                snprintf(state->status, sizeof(state->status), "No such output: %.90s", name);
+                write_status(state);
+                return;
+            }
+            snprintf(state->audio_device_name, sizeof(state->audio_device_name), "%s", name);
+            snprintf(state->status, sizeof(state->status), "Output: %.90s", name);
+        }
+        if (state->audio_device && state->decoder)
+            reopen_audio_device(state);
         write_status(state);
     }
     else if (!strncmp(command, "set_title ", 10)) handle_set_field(library, ripper, library_path, state, "set_title ", "title", command);

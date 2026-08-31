@@ -95,6 +95,8 @@ BarWidget {
     property bool repeatOne: false
     property int volume: 100
     property bool muted: false
+    property string outputDevice: ""
+    property var outputDevices: []
     property string coverSource: ""
     property int coverVersion: 0
 
@@ -312,6 +314,16 @@ BarWidget {
     }
     function clearQueue() {
         root.sendControl("queue_clear");
+    }
+    /* Step through: system default -> each enumerated output -> back to default. */
+    function cycleOutput() {
+        var opts = [""].concat(root.outputDevices);
+        var cur = opts.indexOf(root.outputDevice);
+        var next = opts[(cur + 1) % opts.length];
+        root.sendControl("output " + (next === "" ? "default" : next));
+    }
+    function outputLabel() {
+        return root.outputDevice === "" ? "System default" : root.outputDevice;
     }
     function startEdit(i) {
         for (var k = 0; k < root.tracks.length; k++) {
@@ -546,6 +558,8 @@ BarWidget {
         root.statusText = data.status ? String(data.status) : "";
         root.hasTrack = root.title !== "";
         root.queue = Array.isArray(data.queue) ? data.queue : [];
+        root.outputDevices = Array.isArray(data.outputs) ? data.outputs : [];
+        root.outputDevice = typeof data.output === "string" ? data.output : "";
         root.coverSource = data.cover ? String(data.cover) : "";
         root.selectedTrackIndex = idx;
         if (isPlayingNow && root.pendingPlayIndex >= 0 && idx === root.pendingPlayIndex) {
@@ -958,6 +972,21 @@ BarWidget {
                     verticalPadding: 0
                     tooltipText: root.repeatOne ? "Repeat one (turns off)" : "Repeat off (repeats current track)"
                     onClicked: root.toggleRepeatOne()
+                }
+                Button {
+                    // Only worth showing when there is more than one sink to pick.
+                    visible: root.outputDevices.length > 1
+                    iconText: "\uf025"
+                    foreground: root.outputDevice !== "" ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
+                    width: Style.space(36)
+                    height: Style.space(36)
+                    iconSize: Style.font.icon
+                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
+                    borderSpec: root.transportButtonBorder
+                    horizontalPadding: Style.spacing.controlPaddingX
+                    verticalPadding: 0
+                    tooltipText: "Output: " + root.outputLabel() + " — click to switch"
+                    onClicked: root.cycleOutput()
                 }
             }
 
