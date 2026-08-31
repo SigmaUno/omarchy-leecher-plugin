@@ -1373,7 +1373,13 @@ BarWidget {
                                             anchors.centerIn: parent
                                             text: ptab.pname
                                             textFormat: Text.PlainText
-                                            color: Qt.darker(root.bar.foreground, 1.6)
+                                            /* Passive tabs sit on the dark popup, so a dimmed
+                                             * foreground reads as secondary. A filled tab is on
+                                             * the accent (or half-accent) fill, so switch to the
+                                             * popup's own dark colour for contrast against it. */
+                                            color: (ptab.isViewed || ptab.isPlaying)
+                                                ? Color.popups.background
+                                                : Qt.darker(root.bar.foreground, 1.6)
                                             font.family: root.bar.fontFamily
                                             font.pixelSize: Style.font.caption
                                             font.bold: ptab.isViewed || ptab.isPlaying
