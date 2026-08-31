@@ -80,6 +80,9 @@ typedef struct {
     int volume;       /* software output gain, 0..100 */
     int muted;        /* force silence without losing the volume setting */
     char audio_device_name[128];  /* chosen SDL output; empty = system default */
+    Uint32 resume_position_ms;    /* one-shot: seek here on the next commit_fetch */
+    int resume_paused;            /* one-shot: start that track paused */
+    Uint32 last_resume_write_ms;  /* throttle the resume-state file writes */
     MusicRipperTransports transports;
     pthread_mutex_t fetch_mutex;
     volatile int fetch_cancel;
@@ -308,6 +311,53 @@ static void write_status(const AppState *state) {
     free(title); free(artist); free(album); free(library); free(cover); free(status); free(output);
     if (n < 0 || (size_t)n >= sizeof(tmp)) return; /* oversized; leave old status intact */
     atomic_write(status_file, tmp, (size_t)n);
+}
+
+/* Resume state persists across a backend restart, so it lives next to the
+ * library file (a data-home path), not in the volatile IPC dir. */
+static char resume_file[512];
+
+static void init_resume_path(const char *library_path) {
+    const char *slash = strrchr(library_path, '/');
+    long dlen = slash ? (long)(slash - library_path) : -1;
+    if (dlen >= 0 && dlen < (long)sizeof(resume_file) - 16)
+        snprintf(resume_file, sizeof(resume_file), "%.*s/resume.json", (int)dlen, library_path);
+    else
+        snprintf(resume_file, sizeof(resume_file), "resume.json");
+}
+
+/* Remember the current track and position so a restarted backend can pick the
+ * song back up where it left off. Throttled by the caller. */
+static void write_resume(const AppState *s) {
+    char tmp[192];
+    int n;
+    if (!resume_file[0] || s->selected_track == (size_t)-1 || s->duration_ms == 0) return;
+    n = snprintf(tmp, sizeof(tmp),
+                 "{\"track_index\":%zu,\"position_ms\":%u,\"is_playing\":%s}\n",
+                 s->selected_track, s->position_ms, s->is_playing ? "true" : "false");
+    if (n > 0 && (size_t)n < sizeof(tmp)) atomic_write(resume_file, tmp, (size_t)n);
+}
+
+/* Parse the resume file written above. Returns 1 and fills the outputs when it
+ * holds a usable track_index + position_ms. */
+static int read_resume(size_t *track_index, Uint32 *position_ms, int *was_playing) {
+    char buf[256];
+    FILE *f = resume_file[0] ? fopen(resume_file, "r") : NULL;
+    size_t got;
+    char *p;
+    long ti = -1, pos = -1;
+    if (!f) return 0;
+    got = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[got] = '\0';
+    if ((p = strstr(buf, "\"track_index\":"))) ti = strtol(p + 14, NULL, 10);
+    if ((p = strstr(buf, "\"position_ms\":"))) pos = strtol(p + 14, NULL, 10);
+    if (ti < 0 || pos < 0) return 0;
+    *track_index = (size_t)ti;
+    *position_ms = (Uint32)pos;
+    p = strstr(buf, "\"is_playing\":");
+    *was_playing = !(p && strncmp(p + 13, "false", 5) == 0);
+    return 1;
 }
 
 /* Zenity is a separate GTK process.  Do not let it inherit SDL, SSH-agent, or
@@ -1448,7 +1498,31 @@ static void commit_fetch(AppState *s, size_t idx) {
     SDL_PauseAudioDevice(s->audio_device, 0);
     snprintf(s->status, sizeof(s->status), "Playing %s.", s->title[0] ? s->title : "track");
     stream_audio(s);
+    /* Resume from the saved position/state, once, on the track we were told to
+     * pick up (see the startup path). */
+    if ((s->resume_position_ms > 0 || s->resume_paused) && s->audio_rate > 0) {
+        Uint32 rp = s->resume_position_ms;
+        s->resume_position_ms = 0;
+        if (rp > 0 && rp + 1000u < s->duration_ms) {
+            Uint64 frame = (Uint64)rp * (Uint64)s->audio_rate / 1000u;
+            if (frame < s->audio_total_frames && decoder_seek(s->decoder, (long long)frame) >= 0) {
+                SDL_ClearQueuedAudio(s->audio_device);
+                s->audio_queued_frame = frame;
+                s->position_ms = rp;
+                s->stream_eof = 0;
+                stream_audio(s);
+            }
+        }
+        if (s->resume_paused) {
+            s->resume_paused = 0;
+            s->is_playing = 0;
+            SDL_PauseAudioDevice(s->audio_device, 1);
+        }
+        snprintf(s->status, sizeof(s->status), "%s%s",
+                 s->is_playing ? "Resumed: " : "Resumed (paused): ", s->title[0] ? s->title : "track");
+    }
     write_status(s);
+    write_resume(s);
 }
 
 /* Queue a track to play as soon as it is fetched (interrupts current). */
@@ -1532,6 +1606,7 @@ static void toggle_play_pause(AppState *state) {
     SDL_PauseAudioDevice(state->audio_device, state->is_playing ? 0 : 1);
     snprintf(state->status, sizeof(state->status), state->is_playing ? "Playing." : "Paused.");
     write_status(state);
+    write_resume(state);
 }
 
 static Uint32 playback_ms(const AppState *s) {
@@ -1612,6 +1687,7 @@ static void seek_ms(AppState *s, Uint32 ms) {
     SDL_PauseAudioDevice(s->audio_device, s->is_playing ? 0 : 1);
     snprintf(s->status, sizeof(s->status), "Seeked to %u:%02u.", s->position_ms / 60000, (s->position_ms / 1000) % 60);
     write_status(s);
+    write_resume(s);
 }
 
 /* Called when `is_playing` but audio is not actually reaching the sink. Two
@@ -2382,6 +2458,7 @@ int main(int argc, char **argv) {
         if (realpath(library_path, absolute)) snprintf(state.library_path, sizeof(state.library_path), "%.*s", (int)sizeof(state.library_path) - 1, absolute);
         else snprintf(state.library_path, sizeof(state.library_path), "%s", library_path);
     }
+    init_resume_path(state.library_path);
     int running = 1;
     unsigned pos_tick = 0;
     struct nk_font_atlas *font_atlas;
@@ -2424,14 +2501,22 @@ int main(int argc, char **argv) {
         apply_theme(ctx, &palette, ui_font);
     }
     write_status(&state);
-    /* With autoplay on, start the first track so the widget has something to
-     * play immediately rather than showing an empty, idle player. The fetch
-     * runs in the background and is committed by the loop once it is ready. */
+    /* With autoplay on, start playing at once so the widget isn't idle. Resume
+     * the track + position from the last run when the resume file still points
+     * at a real track; otherwise start from the top. */
     if (state.autoplay && !state.immediate_pending && !state.pending_valid && !state.audio_device && !state.autoplay_advancing) {
         size_t count = library_handler_track_count(library);
         if (count > 0) {
+            size_t start = 0, rt;
+            Uint32 rpos;
+            int rplay;
+            if (read_resume(&rt, &rpos, &rplay) && rt < count) {
+                start = rt;
+                state.resume_position_ms = rpos;
+                state.resume_paused = !rplay;
+            }
             state.autoplay_advancing = 1;
-            request_play(library, &state, 0);
+            request_play(library, &state, start);
         }
     }
     while (running && !stop_requested) {
@@ -2519,6 +2604,11 @@ int main(int argc, char **argv) {
             }
             state.last_position_ms = p;
             if (p != state.position_ms) { state.position_ms = p; write_status(&state); }
+            /* Persist the resume point every ~5s of playback. */
+            if ((Uint32)(SDL_GetTicks() - state.last_resume_write_ms) >= 5000) {
+                state.last_resume_write_ms = SDL_GetTicks();
+                write_resume(&state);
+            }
             /* Self-heal audio that never reached the sink. Two failure shapes:
              * the position is not advancing (queue never consumed), or SDL sees
              * no output devices at all for a sustained window (the device
@@ -2614,6 +2704,8 @@ int main(int argc, char **argv) {
             SDL_SetRenderDrawColor(renderer, palette.background.r, palette.background.g, palette.background.b, 255); SDL_RenderClear(renderer); nk_sdl_render(NK_ANTI_ALIASING_ON); SDL_RenderPresent(renderer);
         }
     }
+    if (state.audio_device) state.position_ms = playback_ms(&state);
+    write_resume(&state);   /* final resume point on a clean shutdown */
     cancel_fetch(&state);
     if (state.audio_device) SDL_CloseAudioDevice(state.audio_device);
     if (state.decoder) { decoder_close(state.decoder); state.decoder = NULL; }
