@@ -85,6 +85,7 @@ typedef struct {
     char fetch_artist[128];
     char fetch_album[128];
     char fetch_cover[512];
+    char fetch_error[256];  /* why the last fetch failed, for the skip notice */
     int immediate_pending;
     size_t immediate_index;
     int pending_valid;
@@ -1206,10 +1207,18 @@ static void *fetch_worker(void *arg) {
         snprintf(s->fetch_artist, sizeof(s->fetch_artist), "%s", save_artist);
         snprintf(s->fetch_album, sizeof(s->fetch_album), "%s", save_album);
         snprintf(s->fetch_cover, sizeof(s->fetch_cover), "%s", save_cover);
+        s->fetch_error[0] = '\0';
         s->fetch_ready = 1;
         fetch_unlock(s);
     } else {
         if (decoder) decoder_close(decoder);
+        /* Record why, so an autoplay skip can say more than "track vanished".
+         * A cancel is not a failure: the next fetch is already starting. */
+        fetch_lock(s);
+        if (!s->fetch_cancel)
+            snprintf(s->fetch_error, sizeof(s->fetch_error), "%s",
+                     error[0] ? error : "source unavailable");
+        fetch_unlock(s);
     }
     fetch_lock(s);
     s->fetch_active = 0;
@@ -1234,6 +1243,7 @@ static void start_fetch(const LibraryHandler *library, AppState *s, size_t index
     s->fetch_cancel = 0;
     s->fetch_active = 1;
     s->fetch_ready = 0;
+    s->fetch_error[0] = '\0';
     s->fetch_index = index;
     pthread_mutex_unlock(&s->fetch_mutex);
 
@@ -1497,6 +1507,39 @@ static void retry_audio_device(AppState *s) {
     fprintf(stderr, "leecher: rebuilt audio output (attempt %d, %d device(s) visible)\n",
             s->audio_retries, SDL_GetNumAudioDevices(0));
     snprintf(s->status, sizeof(s->status), "Rebuilt audio output.");
+    write_status(s);
+}
+
+/* A fetch for `failed_index` came back with nothing. Publish a status that
+ * names the track and the reason, so a source that never plays is visibly a
+ * broken source rather than looking like a normal track change. `skipped` is
+ * true when autoplay moved on to the next track, false for a direct request
+ * that simply could not start. */
+static void announce_fetch_failure(AppState *s, const LibraryHandler *library,
+                                   size_t failed_index, int skipped) {
+    LibraryTrack track = {0};
+    char err[256] = {0};
+    char reason[256];
+    const char *title = NULL;
+    if (library_handler_track_at(library, failed_index, &track, err, sizeof(err)) == 1 &&
+        track.title && track.title[0])
+        title = track.title;
+    fetch_lock(s);
+    snprintf(reason, sizeof(reason), "%s",
+             s->fetch_error[0] ? s->fetch_error : "source unavailable");
+    s->fetch_error[0] = '\0';
+    fetch_unlock(s);
+    if (title)
+        snprintf(s->status, sizeof(s->status), "%s \"%.120s\": %.100s",
+                 skipped ? "Skipped" : "Could not play", title, reason);
+    else
+        snprintf(s->status, sizeof(s->status), "%s track %zu: %.100s",
+                 skipped ? "Skipped" : "Could not play", failed_index + 1, reason);
+    /* Also log it: when autoplay skips, the status line is overwritten by the
+     * next track within a frame, so the journal is the durable record that a
+     * source is broken. */
+    fprintf(stderr, "leecher: %s\n", s->status);
+    library_handler_track_destroy(&track);
     write_status(s);
 }
 
@@ -2155,12 +2198,16 @@ int main(int argc, char **argv) {
             fetch_unlock(&state);
             if (ready) {
                 commit_fetch(&state, state.immediate_index);
-            } else if (failed && state.autoplay && state.autoplay_advancing) {
+            } else if (failed) {
                 size_t count = library_handler_track_count(library);
-                size_t nxt = count ? (state.immediate_index + 1) % count : state.immediate_index;
                 state.immediate_pending = 0;
-                state.autoplay_advancing = 1;
-                request_play(library, &state, nxt);
+                if (state.autoplay && state.autoplay_advancing && count > 1) {
+                    size_t nxt = (state.immediate_index + 1) % count;
+                    announce_fetch_failure(&state, library, state.immediate_index, 1);
+                    request_play(library, &state, nxt);
+                } else {
+                    announce_fetch_failure(&state, library, state.immediate_index, 0);
+                }
             }
         }
 
@@ -2201,10 +2248,12 @@ int main(int argc, char **argv) {
                 commit_fetch(&state, idx);
             } else if (pending_failed && state.autoplay && state.autoplay_advancing) {
                 size_t count = library_handler_track_count(library);
-                size_t nxt = count ? (idx + 1) % count : idx;
+                announce_fetch_failure(&state, library, idx, 1);
                 state.pending_valid = 0;
-                state.autoplay_advancing = 1;
-                request_play(library, &state, nxt);
+                if (count > 1) {
+                    size_t nxt = (idx + 1) % count;
+                    request_play(library, &state, nxt);
+                }
             }
         }
 
