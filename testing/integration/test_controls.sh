@@ -84,9 +84,19 @@ send "next"
 wait_for '.track_index == 1' "next advances track"
 send "previous"
 wait_for '.track_index == 0' "previous goes back"
+send "previous"
+wait_for '.track_index == 2' "previous wraps to the last track"
+send "next"
+wait_for '.track_index == 0' "next wraps to the first track"
 
 send "seek 500"
 wait_for '.position_ms >= 400' "seek moves the position"
+send "seek -1000"
+wait_for '.position_ms < 500' "negative seek clamps to 0"
+
+send "play 99"
+wait_for '.status | test("[Cc]annot|[Cc]ould not|range")' "out-of-range play is rejected"
+wait_for '.is_playing == true' "playback continues after a bad play"
 
 # ---- modes -----------------------------------------------------------------
 send "autoplay off"
@@ -191,6 +201,52 @@ q1=$(jq '.position_ms' "$D/status.json"); sleep 0.6
 q2=$(jq '.position_ms' "$D/status.json")
 [ "$q2" -gt "$q1" ] && pass "position keeps advancing after the mutation" \
     || fail "position keeps advancing after the mutation"
+
+# ---- editing a track's fields --------------------------------------------------
+send "set_fields 0 Renamed%20Track NewArtist NewAlbum"
+wait_for '.status | test("[Uu]pdate")' "set_fields reported"
+jq -e '.tracks[0].title == "Renamed Track" and .tracks[0].artist == "NewArtist"' \
+    "$work/lib/library.json" >/dev/null 2>&1 \
+    && pass "set_fields wrote the new title/artist" \
+    || { fail "set_fields wrote the new title/artist"; jq '.tracks[0]' "$work/lib/library.json"; }
+
+# ---- behaviour at the end of a track -----------------------------------------
+# playing() asserts a track is actually committed (fetch done) so a follow-up
+# seek isn't dropped as "no audio loaded".
+seek_near_end() {   # $1 = expected track index
+    wait_for '.track_index == '"$1"' and .duration_ms > 0 and (.status | test("Playing"))' \
+        "track $1 is committed and playing"
+    dur=$(jq '.duration_ms' "$D/status.json")
+    send "seek $((dur - 800))"
+    wait_for '.position_ms > '"$((dur - 1500))" "seeked to the end of track $1"
+}
+
+send "autoplay on"; send "repeat off"; send "play 0"
+seek_near_end 0
+wait_for '.track_index == 1' "autoplay advances at end of track" 80
+
+send "autoplay off"; send "play 0"
+seek_near_end 0
+wait_for '.is_playing == false and .track_index == 0' "autoplay off: playback stops at end, no advance" 80
+
+send "autoplay on"; send "repeat one"; send "play 2"
+seek_near_end 2
+wait_for '.track_index == 2 and .position_ms < 5000' "repeat-one replays the same track from the start" 80
+send "repeat off"
+
+# ---- shuffle picks a variety of tracks --------------------------------------
+send "shuffle on"
+seen=""
+for _ in 1 2 3 4 5 6 7 8; do
+    send "next"
+    sleep 0.2
+    t=$(jq -r '.track_index' "$D/status.json")
+    case "$seen" in *" $t "*) : ;; *) seen="$seen $t " ;; esac
+done
+send "shuffle off"
+distinct=$(printf '%s\n' $seen | wc -w)
+[ "$distinct" -ge 2 ] && pass "shuffle reaches more than one track ($distinct of 3)" \
+    || fail "shuffle reaches more than one track (only $distinct)"
 
 # ---- resume the song + position across a restart ------------------------------
 send "play 1"

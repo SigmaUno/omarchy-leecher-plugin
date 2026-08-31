@@ -20,11 +20,11 @@ $cc -std=c11 -Wall -Wextra -O2 -I"$here/../../backend" \
 rc=$?
 
 echo
-echo "== unit: widget fmt() =="
+echo "== unit: widget helpers =="
 if command -v node >/dev/null 2>&1; then
-    node "$here/test_widget_fmt.mjs" || rc=1
+    node "$here/test_widget.mjs" || rc=1
 else
-    echo "  node not found -- skipping widget fmt test"
+    echo "  node not found -- skipping widget helper tests"
 fi
 
 exit $rc
