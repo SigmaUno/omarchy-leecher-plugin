@@ -46,20 +46,28 @@ wait_for() {
     fail "$desc"; return 1
 }
 
-# The backend reads one line then deletes the control file, so a second write
-# before it polls would clobber the first. Send, then wait for the echoed
-# cmd_id before returning so callers can fire commands back to back.
+# The control file is written non-atomically (truncate then write) and the
+# backend polls asynchronously, so on a loaded CI runner a single write can be
+# missed and then clobbered by the next command. Re-issue the same line (same
+# id, so the backend can't act on it twice) until the id is echoed back. The
+# ack check reads the file with a shell `case` rather than forking jq every
+# tick, so the loop stays tight.
 cmd_id=0
 send() {
     cmd_id=$((cmd_id + 1))
-    printf '%d %s\n' "$cmd_id" "$1" > "$D/control"
-    # Poll a good while: on a loaded CI runner the backend can take a moment to
-    # get around to the control file (it also does blocking fetch-thread joins).
-    tries=250
-    while [ "$tries" -gt 0 ]; do
-        [ -f "$D/status.json" ] && \
-            [ "$(jq -r '.cmd_id' "$D/status.json" 2>/dev/null)" = "$cmd_id" ] && return 0
-        sleep 0.02; tries=$((tries - 1))
+    attempt=0
+    while [ "$attempt" -lt 5 ]; do
+        printf '%d %s\n' "$cmd_id" "$1" > "$D/control"
+        deadline=$(( $(date +%s) + 4 ))
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            if [ -f "$D/status.json" ]; then
+                case "$(cat "$D/status.json" 2>/dev/null)" in
+                    *"\"cmd_id\":$cmd_id}"*) return 0 ;;
+                esac
+            fi
+            sleep 0.05
+        done
+        attempt=$((attempt + 1))
     done
     printf '  (command "%s" was not acknowledged)\n' "$1" >&2
     return 1
@@ -93,6 +101,18 @@ send "play_pause"
 wait_for '.is_playing == false' "play_pause pauses"
 send "play_pause"
 wait_for '.is_playing == true' "play_pause resumes"
+
+# A resent line (same id) must be acted on once, not toggled twice.
+dup_id=$((cmd_id + 1)); cmd_id=$dup_id
+printf '%d play_pause\n' "$dup_id" > "$D/control"
+wait_for '.is_playing == false' "resend: first copy pauses"
+printf '%d play_pause\n' "$dup_id" > "$D/control"   # identical id
+sleep 0.5
+jq -e '.is_playing == false' "$D/status.json" >/dev/null 2>&1 \
+    && pass "resend with the same id is not run twice" \
+    || { fail "resend with the same id is not run twice"; jq '{is_playing,cmd_id}' "$D/status.json"; }
+send "play_pause"
+wait_for '.is_playing == true' "playback resumed after the resend check"
 
 send "next"
 wait_for '.track_index == 1' "next advances track"

@@ -643,6 +643,11 @@ BarWidget {
         root.album = newAlbum !== "" ? newAlbum : "No Album";
         root.durationMs = newDur;
         root.playing = isPlayingNow;
+        /* Continue the command-id sequence from wherever the backend already is,
+         * so a widget reload against a still-running backend doesn't reissue ids
+         * it would treat as duplicates of earlier commands. */
+        if (root.lastCommandId === 0 && typeof data.cmd_id === "number" && data.cmd_id > 0)
+            root.lastCommandId = Number(data.cmd_id);
         /* Command acknowledgment: when the backend echoes the id we sent with a
          * control write, a previously-issued command has been processed. Only
          * then do we let the backend's autoplay value override an optimistic
