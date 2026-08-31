@@ -91,6 +91,8 @@ BarWidget {
     property int durationMs: 0
     property bool hasTrack: false
     property bool autoplay: true
+    property bool shuffle: false
+    property bool repeatOne: false
     property string coverSource: ""
     property int coverVersion: 0
 
@@ -243,6 +245,14 @@ BarWidget {
     function toggleAutoplay() {
         root.autoplay = !root.autoplay;
         root.sendControl(root.autoplay ? "autoplay on" : "autoplay off");
+    }
+    function toggleShuffle() {
+        root.shuffle = !root.shuffle;
+        root.sendControl(root.shuffle ? "shuffle on" : "shuffle off");
+    }
+    function toggleRepeatOne() {
+        root.repeatOne = !root.repeatOne;
+        root.sendControl(root.repeatOne ? "repeat one" : "repeat off");
     }
     function startEdit(i) {
         for (var k = 0; k < root.tracks.length; k++) {
@@ -460,8 +470,11 @@ BarWidget {
             root.commandAcked = true;
             root.pendingCommandId = -1;
         }
-        if (root.pendingCommandId < 0)
+        if (root.pendingCommandId < 0) {
             root.autoplay = data.autoplay !== false;
+            root.shuffle = data.shuffle === true;
+            root.repeatOne = data.repeat_one === true;
+        }
         root.statusText = data.status ? String(data.status) : "";
         root.hasTrack = root.title !== "";
         root.coverSource = data.cover ? String(data.cover) : "";
@@ -819,6 +832,14 @@ BarWidget {
                             root.loadLibrary();
                     }
                 }
+            }
+
+            /* Playback modes, kept off the transport row so the row does not
+             * overflow the popup width as more toggles are added. */
+            Row {
+                anchors.horizontalCenter: parent.horizontalCenter
+                spacing: Style.space(6)
+
                 Button {
                     iconText: root.autoplay ? "\uf01e" : "\uf00d"
                     foreground: root.autoplay ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
@@ -831,6 +852,32 @@ BarWidget {
                     verticalPadding: 0
                     tooltipText: root.autoplay ? "Autoplay on (turns off)" : "Autoplay off (turns on)"
                     onClicked: root.toggleAutoplay()
+                }
+                Button {
+                    iconText: "\uf074"
+                    foreground: root.shuffle ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
+                    width: Style.space(36)
+                    height: Style.space(36)
+                    iconSize: Style.font.icon
+                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
+                    borderSpec: root.transportButtonBorder
+                    horizontalPadding: Style.spacing.controlPaddingX
+                    verticalPadding: 0
+                    tooltipText: root.shuffle ? "Shuffle on (turns off)" : "Shuffle off (turns on)"
+                    onClicked: root.toggleShuffle()
+                }
+                Button {
+                    iconText: "\uf021"
+                    foreground: root.repeatOne ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
+                    width: Style.space(36)
+                    height: Style.space(36)
+                    iconSize: Style.font.icon
+                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
+                    borderSpec: root.transportButtonBorder
+                    horizontalPadding: Style.spacing.controlPaddingX
+                    verticalPadding: 0
+                    tooltipText: root.repeatOne ? "Repeat one (turns off)" : "Repeat off (repeats current track)"
+                    onClicked: root.toggleRepeatOne()
                 }
             }
 
