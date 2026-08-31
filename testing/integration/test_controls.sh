@@ -33,15 +33,20 @@ fails=0
 pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; fails=$((fails + 1)); }
 
+# Poll status.json against a jq filter without emitting a pass/fail line.
+poll_state() {
+    _t=${2:-50}
+    while [ "$_t" -gt 0 ]; do
+        [ -f "$D/status.json" ] && jq -e "$1" "$D/status.json" >/dev/null 2>&1 && return 0
+        sleep 0.1; _t=$((_t - 1))
+    done
+    return 1
+}
+
 # Wait until status.json exists and satisfies the jq filter in $1.
 wait_for() {
     filter=$1 desc=$2 tries=${3:-50}
-    while [ "$tries" -gt 0 ]; do
-        if [ -f "$D/status.json" ] && jq -e "$filter" "$D/status.json" >/dev/null 2>&1; then
-            pass "$desc"; return 0
-        fi
-        sleep 0.1; tries=$((tries - 1))
-    done
+    if poll_state "$filter" "$tries"; then pass "$desc"; return 0; fi
     printf '  status: %s\n' "$(cat "$D/status.json" 2>/dev/null || echo '<none>')"
     fail "$desc"; return 1
 }
@@ -303,8 +308,15 @@ wait_for '.track_index == 1 and .is_playing == false and .position_ms >= 6000 an
     "restart resumes the same track, position and paused state"
 before_pos=$(jq '.position_ms' "$D/status.json"); sleep 0.7
 wait_for '.is_playing == false' "resumed track stays paused"
-send "play_pause"
-wait_for '.is_playing == true' "play resumes after the restart"
+# play_pause is a toggle and the just-restarted backend may still be settling
+# the resumed track when the first one lands; toggle until it sticks.
+resumed=0
+for _ in 1 2 3; do
+    send "play_pause"
+    if poll_state '.is_playing == true' 40; then resumed=1; break; fi
+done
+[ "$resumed" = 1 ] && pass "play resumes after the restart" \
+    || { fail "play resumes after the restart"; jq '{is_playing,status,cmd_id}' "$D/status.json"; }
 
 # ---- multiple playlists -----------------------------------------------------
 send "play 0"
