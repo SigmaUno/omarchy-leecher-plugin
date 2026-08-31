@@ -2461,6 +2461,7 @@ static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
     int fd = open(control_file, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     FILE *file;
     char line[512];
+    int consumed = 0;
     if (fd < 0) return;
     /* Only accept a control file we own and that is a regular file; reject
      * symlinks and attacker-owned files outright. */
@@ -2472,7 +2473,13 @@ static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
     file = fdopen(fd, "r");
     if (!file) { close(fd); unlink(control_file); return; }
     line[0] = '\0';
-    if (fgets(line, sizeof(line), file)) {
+    if (fgets(line, sizeof(line), file) && strchr(line, '\n')) {
+        /* Only act on a line that arrived whole (has its terminating newline).
+         * A client writes non-atomically, so a poll can catch a half-written
+         * line -- acting on it would mis-parse the command and, worse, burn its
+         * id so the complete retry gets deduped away. Leave it for the next
+         * poll (see the unlink guard below). */
+        consumed = 1;
         line[strcspn(line, "\r\n")] = '\0';
         /* Optional command acknowledgment: a numeric id followed by a space is
          * a client-generated token echoed back as `cmd_id` in the status JSON
@@ -2516,11 +2523,11 @@ static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
         }
     }
     fclose(file);
-    /* A client writes the control line non-atomically (truncate then write), so
-     * a poll landing in that gap sees an empty file. Don't unlink it then --
-     * the pending write would be lost and the command silently dropped. Leave
-     * it for the next poll; a genuinely empty file just gets re-read once. */
-    if (line[0] != '\0' || st.st_size > 0)
+    /* Clear the file only once a whole line has been consumed. An empty file
+     * (poll landed in the client's truncate/write gap) or a partial line is
+     * left in place so the completed write is picked up on the next poll,
+     * instead of being unlinked out from under the client. */
+    if (consumed)
         unlink(control_file);
     write_status(state);
     (void)0;
