@@ -1089,16 +1089,37 @@ BarWidget {
                             height: Math.min(Style.space(28) * 3 + Style.space(4), outputList.contentHeight)
                             clip: true
                             spacing: Style.space(2)
-                            interactive: contentHeight > height
+                            readonly property bool overflowing: contentHeight > height
+                            interactive: overflowing
                             boundsBehavior: Flickable.StopAtBounds
                             model: [""].concat(root.outputDevices)
+
+                            /* Persistent rail on the right whenever the list is
+                             * longer than it looks, so it reads as scrollable. */
+                            ScrollBar.vertical: ScrollBar {
+                                id: outputScroll
+                                policy: outputList.overflowing ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
+                                width: Style.space(7)
+                                padding: Style.space(1)
+                                contentItem: Rectangle {
+                                    implicitWidth: Style.space(5)
+                                    radius: width / 2
+                                    color: outputScroll.pressed ? Color.accent
+                                        : Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.7)
+                                }
+                                background: Rectangle {
+                                    radius: width / 2
+                                    color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g,
+                                                   root.bar.foreground.b, 0.22)
+                                }
+                            }
 
                             delegate: Button {
                                 required property var modelData
                                 required property int index
                                 readonly property string devName: String(modelData)
                                 readonly property bool current: root.outputDevice === devName
-                                width: outputList.width
+                                width: outputList.width - (outputList.overflowing ? Style.space(8) : 0)
                                 height: Style.space(28)
                                 leftAlign: true
                                 fontSize: Style.font.bodySmall
