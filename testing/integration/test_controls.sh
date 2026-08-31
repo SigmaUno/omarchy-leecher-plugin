@@ -53,7 +53,9 @@ cmd_id=0
 send() {
     cmd_id=$((cmd_id + 1))
     printf '%d %s\n' "$cmd_id" "$1" > "$D/control"
-    tries=100
+    # Poll a good while: on a loaded CI runner the backend can take a moment to
+    # get around to the control file (it also does blocking fetch-thread joins).
+    tries=250
     while [ "$tries" -gt 0 ]; do
         [ -f "$D/status.json" ] && \
             [ "$(jq -r '.cmd_id' "$D/status.json" 2>/dev/null)" = "$cmd_id" ] && return 0

@@ -2391,6 +2391,7 @@ static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
     }
     file = fdopen(fd, "r");
     if (!file) { close(fd); unlink(control_file); return; }
+    line[0] = '\0';
     if (fgets(line, sizeof(line), file)) {
         line[strcspn(line, "\r\n")] = '\0';
         /* Optional command acknowledgment: a numeric id followed by a space is
@@ -2426,7 +2427,12 @@ static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
         }
     }
     fclose(file);
-    unlink(control_file);
+    /* A client writes the control line non-atomically (truncate then write), so
+     * a poll landing in that gap sees an empty file. Don't unlink it then --
+     * the pending write would be lost and the command silently dropped. Leave
+     * it for the next poll; a genuinely empty file just gets re-read once. */
+    if (line[0] != '\0' || st.st_size > 0)
+        unlink(control_file);
     write_status(state);
     (void)0;
 }
