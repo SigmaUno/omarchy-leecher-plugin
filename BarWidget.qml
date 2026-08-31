@@ -767,8 +767,11 @@ BarWidget {
                         font.family: root.bar.fontFamily
                         font.pixelSize: Style.font.subtitle
                         font.bold: true
-                        elide: Text.ElideRight
+                        /* Wrap the full title onto as many lines as it needs;
+                         * only ever break between words, never mid-word. */
                         width: parent.width
+                        wrapMode: Text.WordWrap
+                        maximumLineCount: 4
                     }
                     Text {
                         text: root.artist
