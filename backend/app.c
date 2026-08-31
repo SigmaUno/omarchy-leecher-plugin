@@ -60,6 +60,8 @@ typedef struct {
     Uint32 last_position_ms;
     int position_stalls;
     Uint32 last_audio_retry_ms;
+    int audio_retries;
+    int no_output_ticks;
     Uint32 duration_ms;
     int track_ended;
     int stream_open;
@@ -1341,6 +1343,11 @@ static void commit_fetch(AppState *s, size_t idx) {
     s->selected_track = idx;
     s->pending_valid = 0;
     s->immediate_pending = 0;
+    /* Fresh track: clear the stall/no-output detectors so the first buffer
+     * fill is not mistaken for a stalled device. */
+    s->position_stalls = 0;
+    s->no_output_ticks = 0;
+    s->last_position_ms = 0;
     SDL_PauseAudioDevice(s->audio_device, 0);
     snprintf(s->status, sizeof(s->status), "Playing %s.", s->title[0] ? s->title : "track");
     stream_audio(s);
@@ -1438,13 +1445,20 @@ static void seek_ms(AppState *s, Uint32 ms) {
     write_status(s);
 }
 
-/* Called when `is_playing` but the SDL device is not actually draining (no
- * position advance). This happens when the backend starts before the
- * PulseAudio/PipeWire graph is ready: SDL_OpenAudioDevice may report success
- * but never create a working output stream, so the queued PCM is never
- * consumed and the player silently "plays" into nothing. Reopen the device and
- * re-stream from the current position so playback self-heals instead of
- * running dead until a manual restart. */
+/* Called when `is_playing` but audio is not actually reaching the sink. Two
+ * shapes of this failure both trace back to the backend starting before the
+ * PipeWire graph has a usable output:
+ *
+ *   1. SDL_OpenAudioDevice reports success but the stream is never scheduled,
+ *      so the queued PCM is never consumed and the position stays at 0.
+ *   2. After a plain close/reopen the new SDL_AudioDeviceID drains its queue
+ *      (the position advances) but is wired to nothing, so it plays silence.
+ *
+ * A bare SDL_CloseAudioDevice + SDL_OpenAudioDevice does not clear shape 2:
+ * SDL keeps the same broken connection to the audio server. Tearing the whole
+ * audio subsystem down and back up makes SDL drop and rebuild that connection,
+ * exactly as a fresh process would, then we reopen and re-stream from where
+ * playback sat. */
 static void retry_audio_device(AppState *s) {
     SDL_AudioSpec desired = {0}, obtained = {0};
     Uint64 played;
@@ -1455,10 +1469,23 @@ static void retry_audio_device(AppState *s) {
         write_status(s);
         return;
     }
+    s->audio_retries++;
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+        fprintf(stderr, "leecher: SDL audio reinit failed (attempt %d): %s\n", s->audio_retries, SDL_GetError());
+        snprintf(s->status, sizeof(s->status), "Audio unavailable, retrying...");
+        write_status(s);
+        return;
+    }
     desired.freq = s->audio_rate; desired.format = AUDIO_S16SYS;
     desired.channels = (Uint8)s->audio_channels; desired.samples = 4096;
     s->audio_device = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
-    if (!s->audio_device) { snprintf(s->status, sizeof(s->status), "SDL audio: %s", SDL_GetError()); s->is_playing = 0; write_status(s); return; }
+    if (!s->audio_device) {
+        fprintf(stderr, "leecher: SDL audio reopen failed (attempt %d): %s\n", s->audio_retries, SDL_GetError());
+        snprintf(s->status, sizeof(s->status), "Audio unavailable, retrying...");
+        write_status(s);
+        return;
+    }
     /* The prior queue was never drained; resume from where playback sat. */
     played = s->audio_queued_frame;
     if (decoder_seek(s->decoder, (long long)played) < 0) { decoder_seek(s->decoder, 0); played = 0; }
@@ -1467,7 +1494,9 @@ static void retry_audio_device(AppState *s) {
     s->track_ended = 0;
     stream_audio(s);
     SDL_PauseAudioDevice(s->audio_device, s->is_playing ? 0 : 1);
-    snprintf(s->status, sizeof(s->status), "Restarted audio output.");
+    fprintf(stderr, "leecher: rebuilt audio output (attempt %d, %d device(s) visible)\n",
+            s->audio_retries, SDL_GetNumAudioDevices(0));
+    snprintf(s->status, sizeof(s->status), "Rebuilt audio output.");
     write_status(s);
 }
 
@@ -2181,6 +2210,9 @@ int main(int argc, char **argv) {
 
         if (state.is_playing && ++pos_tick % 30 == 0) {
             Uint32 p = playback_ms(&state);
+            /* -1 means the backend cannot enumerate; only a hard 0 is "no sink". */
+            int no_output = SDL_GetNumAudioDevices(0) == 0;
+            state.no_output_ticks = no_output ? state.no_output_ticks + 1 : 0;
             if (p > state.last_position_ms) {
                 state.position_stalls = 0;
             } else if (state.audio_device && !state.track_ended && state.duration_ms > 0) {
@@ -2188,19 +2220,25 @@ int main(int argc, char **argv) {
             }
             state.last_position_ms = p;
             if (p != state.position_ms) { state.position_ms = p; write_status(&state); }
-            /* Self-heal a device that opened before the audio graph was ready.
-             * SDL_OpenAudioDevice can succeed yet never create a working output
-             * stream, so the queued PCM is never consumed and the position never
-             * advances (stays at 0). Reopen the device from the buffered samples
-             * so playback recovers without a manual restart. */
+            /* Self-heal audio that never reached the sink. Two failure shapes:
+             * the position is not advancing (queue never consumed), or SDL sees
+             * no output devices at all for a sustained window (the device
+             * opened before the graph was ready and is now playing into nothing
+             * while the position still ticks up). Rebuild from the buffered
+             * samples so playback recovers without a manual restart. */
             if (state.audio_device && !state.track_ended && state.duration_ms > 0 &&
-                state.position_stalls >= 8 &&
+                (state.position_stalls >= 8 || state.no_output_ticks >= 3) &&
                 (Uint32)(SDL_GetTicks() - state.last_audio_retry_ms) >= 6000) {
                 state.last_audio_retry_ms = SDL_GetTicks();
                 state.position_stalls = 0;
                 state.last_position_ms = 0;
                 p = state.position_ms;
                 retry_audio_device(&state);
+            } else if (!no_output && state.audio_retries > 0 &&
+                       state.position_stalls == 0 && p > 0) {
+                /* A real sink is present and the position is moving again: the
+                 * last rebuild took, so stop carrying the attempt count. */
+                state.audio_retries = 0;
             }
             if (!state.track_ended && state.duration_ms > 0 && p >= state.duration_ms - 250u) {
                 state.track_ended = 1;
@@ -2228,6 +2266,13 @@ int main(int argc, char **argv) {
             }
         }
         if (headless) {
+            /* Pump the event queue even with no window: SDL only refreshes its
+             * audio device list (what SDL_GetNumAudioDevices reports) when the
+             * loop is pumped and it can see AUDIODEVICEADDED/REMOVED. Without
+             * this a backend that started before the sink existed never learns
+             * the sink arrived. */
+            SDL_PumpEvents();
+            SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
             SDL_Delay(16);
         } else {
             nk_input_begin(ctx);

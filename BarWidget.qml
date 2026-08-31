@@ -142,6 +142,13 @@ BarWidget {
      * matches what the row actually draws (no trailing dead space or clipping). */
     readonly property real labelMaxWidth: Style.space(150)
 
+    /* Transport-control borders: a muted trace of the bar foreground so the
+     * buttons read as a set without a hard outline.  Foreground-derived (not
+     * accent) and low-alpha so it re-tints with whatever theme is active. */
+    readonly property var transportButtonBorder: Border.flat(
+        Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.20),
+        Math.max(1, Style.space(1)))
+
     /* Size the widget from the glyph's real ink width (glyphSlot) instead of a
      * fixed barSize: the old formula requested barSize for the icon slot but the
      * icon is typically narrower, leaving an invisible strip of unused space on
@@ -354,12 +361,15 @@ BarWidget {
     function fmt(ms) {
         if (!ms || ms <= 0)
             return "0:00";
-        var s = Math.floor(ms / 1000);
-        var m = Math.floor(s / 60);
-        var h = Math.floor(m / 60);
-        s = s % 60;
-        m = m % 60;
-        return (h > 0 ? h + ":" : "") + (m < 10 ? "0" : "") + ":" + (s < 10 ? "0" : "") + s;
+        var total = Math.floor(ms / 1000);
+        var h = Math.floor(total / 3600);
+        var m = Math.floor((total % 3600) / 60);
+        var s = total % 60;
+        /* Minutes are zero-padded only past the hour mark ("1:02:03"); below
+         * an hour the leading digit is bare ("5:31"). Seconds always pad. */
+        var mm = (h > 0 && m < 10) ? "0" + m : String(m);
+        var ss = s < 10 ? "0" + s : String(s);
+        return (h > 0 ? h + ":" : "") + mm + ":" + ss;
     }
     function close() {
         root.popupOpen = false;
@@ -531,7 +541,7 @@ BarWidget {
                 id: glyph
                 anchors.centerIn: parent
                 text: root.closed ? "\uf05e" : (root.hasTrack ? root.playIcon : "\uf001")
-                color: root.closed ? Qt.darker(root.bar.foreground, 1.7) : (root.hasTrack ? (root.playing ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.4)) : Qt.darker(root.bar.foreground, 1.5))
+                color: root.closed ? Qt.darker(root.bar.foreground, 1.7) : (root.hasTrack ? (root.playing ? Color.accent : Qt.darker(Color.accent, 1.25)) : Qt.darker(root.bar.foreground, 1.5))
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.body
             }
@@ -554,9 +564,11 @@ BarWidget {
             anchors.verticalCenter: parent.verticalCenter
             visible: !root.collapsed
             text: root.hasTrack ? (root.title + (root.artist !== "" ? "  \u00b7  " + root.artist : "")) : (root.statusText !== "" ? root.statusText : "Nothing playing")
+            textFormat: Text.PlainText
             color: root.hasTrack ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.4)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.body
+            font.bold: root.hasTrack
             font.italic: !root.hasTrack
             elide: Text.ElideRight
             /* The icon lives in glyphSlot, a fixed-width row item.  Size the
@@ -616,6 +628,7 @@ BarWidget {
         open: root.popupOpen
         contentWidth: popup.fittedContentWidth(Style.space(340))
         contentHeight: popup.fittedContentHeight(column.implicitHeight)
+        padding: Style.space(16)
 
         Column {
             id: column
@@ -669,18 +682,18 @@ BarWidget {
                     height: Style.space(96)
                     anchors.verticalCenter: parent.verticalCenter
 
-                    Rectangle {
+                    BorderSurface {
                         id: coverBox
                         anchors.fill: parent
-                        radius: Style.cornerRadius
-                        color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
-                        border.width: 1
-                        border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.18)
+                        radius: Math.max(Style.cornerRadius, Style.space(8))
+                        color: Style.normalFillFor(root.bar.foreground, Color.accent)
+                        borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
                     }
 
                     Image {
                         id: coverImg
                         anchors.fill: parent
+                        anchors.margins: Style.space(2)
                         /* Append a cache-busting nonce so QML re-fetches the file
                          * when a track changes (the backend also gives each cover
                          * a fresh filename, but this makes coverVersion meaningful
@@ -718,6 +731,11 @@ BarWidget {
                     step: 500
                     value: 0
                     enabled: root.durationMs > 0
+                    trackHeight: Math.max(Style.space(6), Math.round(Style.spacing.controlHeight * 0.18))
+                    knobSize: Math.max(Style.space(18), Math.round(Style.spacing.controlHeight * 0.48))
+                    trackColor: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.28)
+                    fillColor: Color.accent
+                    knobColor: root.bar.foreground
                     onReleased: function (v) {
                         slider.value = v;
                         root.seekTo(v);
@@ -744,6 +762,8 @@ BarWidget {
                     foreground: root.bar.foreground
                     height: Style.space(36)
                     iconSize: Style.font.icon
+                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
+                    borderSpec: root.transportButtonBorder
                     horizontalPadding: Style.spacing.controlPaddingX
                     verticalPadding: 0
                     tooltipText: "Skip to start / back"
@@ -753,7 +773,15 @@ BarWidget {
                     iconText: root.playIcon
                     foreground: root.bar.foreground
                     height: Style.space(36)
-                    iconSize: Style.font.icon
+                    width: Style.space(44)
+                    iconSize: Style.font.iconLarge
+                    /* No `active`/`selected` here: those paint the persistent
+                     * selected-fill (0.18) which is stronger than the kit's
+                     * hover-fill (0.08), so the button looked hovered at rest
+                     * and dimmed when actually hovered.  Match the sibling
+                     * controls and let the larger glyph carry the emphasis. */
+                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
+                    borderSpec: root.transportButtonBorder
                     horizontalPadding: Style.spacing.panelGap
                     verticalPadding: 0
                     tooltipText: "Play / pause"
@@ -764,6 +792,8 @@ BarWidget {
                     foreground: root.bar.foreground
                     height: Style.space(36)
                     iconSize: Style.font.icon
+                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
+                    borderSpec: root.transportButtonBorder
                     horizontalPadding: Style.spacing.controlPaddingX
                     verticalPadding: 0
                     tooltipText: "Skip forward"
@@ -774,6 +804,8 @@ BarWidget {
                     foreground: root.bar.foreground
                     height: Style.space(36)
                     iconSize: Style.font.icon
+                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
+                    borderSpec: root.transportButtonBorder
                     horizontalPadding: Style.spacing.controlPaddingX
                     verticalPadding: 0
                     tooltipText: "Change song (library)"
@@ -793,6 +825,8 @@ BarWidget {
                     width: Style.space(36)
                     height: Style.space(36)
                     iconSize: Style.font.icon
+                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
+                    borderSpec: root.transportButtonBorder
                     horizontalPadding: Style.spacing.controlPaddingX
                     verticalPadding: 0
                     tooltipText: root.autoplay ? "Autoplay on (turns off)" : "Autoplay off (turns on)"
@@ -1276,6 +1310,7 @@ BarWidget {
                                 }
                             }
                         }
+                    }
                 }
 
                 MouseArea {
@@ -1380,8 +1415,6 @@ BarWidget {
                 root.loadLibrary();
             }
         }
-    }
-
     }
 
     PopupCard {
