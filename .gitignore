@@ -9,6 +9,9 @@
 backend/app
 backend/library-handler
 
+# Playlist directory created when the backend runs from the checkout
+/backend/library/
+
 # Local development helpers -- not shipped. install-backend.sh and
 # uninstall-backend.sh are the supported scripts; these just wrap a
 # deploy-to-live-config and a shell restart for iterating on the widget.
