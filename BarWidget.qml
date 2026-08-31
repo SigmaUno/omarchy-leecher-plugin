@@ -194,6 +194,10 @@ BarWidget {
         Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.20),
         Math.max(1, Style.space(1)))
 
+    /* Every transport/mode button in the popup is this exact square so the two
+     * control rows read as one even grid -- no bespoke size for play/pause. */
+    readonly property real controlButtonSize: Style.space(36)
+
     /* Size the widget from the glyph's real ink width (glyphSlot) instead of a
      * fixed barSize: the old formula requested barSize for the icon slot but the
      * icon is typically narrower, leaving an invisible strip of unused space on
@@ -868,7 +872,8 @@ BarWidget {
                 Button {
                     iconText: "\uf048"
                     foreground: root.bar.foreground
-                    height: Style.space(36)
+                    width: root.controlButtonSize
+                    height: root.controlButtonSize
                     iconSize: Style.font.icon
                     background: Style.normalFillFor(root.bar.foreground, Color.accent)
                     borderSpec: root.transportButtonBorder
@@ -880,17 +885,17 @@ BarWidget {
                 Button {
                     iconText: root.playIcon
                     foreground: root.bar.foreground
-                    height: Style.space(36)
-                    width: Style.space(44)
-                    iconSize: Style.font.iconLarge
-                    /* No `active`/`selected` here: those paint the persistent
-                     * selected-fill (0.18) which is stronger than the kit's
-                     * hover-fill (0.08), so the button looked hovered at rest
-                     * and dimmed when actually hovered.  Match the sibling
-                     * controls and let the larger glyph carry the emphasis. */
+                    width: root.controlButtonSize
+                    height: root.controlButtonSize
+                    iconSize: Style.font.icon
+                    /* Same square as its neighbours -- no bespoke width or
+                     * larger glyph; the play/pause state carries the meaning.
+                     * (No `active`/`selected`: the kit's selected-fill is
+                     * stronger than its hover-fill, so it read as hovered at
+                     * rest and dimmed on actual hover.) */
                     background: Style.normalFillFor(root.bar.foreground, Color.accent)
                     borderSpec: root.transportButtonBorder
-                    horizontalPadding: Style.spacing.panelGap
+                    horizontalPadding: Style.spacing.controlPaddingX
                     verticalPadding: 0
                     tooltipText: "Play / pause"
                     onClicked: root.playPause()
@@ -898,7 +903,8 @@ BarWidget {
                 Button {
                     iconText: "\uf051"
                     foreground: root.bar.foreground
-                    height: Style.space(36)
+                    width: root.controlButtonSize
+                    height: root.controlButtonSize
                     iconSize: Style.font.icon
                     background: Style.normalFillFor(root.bar.foreground, Color.accent)
                     borderSpec: root.transportButtonBorder
@@ -910,7 +916,8 @@ BarWidget {
                 Button {
                     iconText: "\uf01d"
                     foreground: root.bar.foreground
-                    height: Style.space(36)
+                    width: root.controlButtonSize
+                    height: root.controlButtonSize
                     iconSize: Style.font.icon
                     background: Style.normalFillFor(root.bar.foreground, Color.accent)
                     borderSpec: root.transportButtonBorder
@@ -939,8 +946,8 @@ BarWidget {
                 Button {
                     iconText: root.autoplay ? "\uf01e" : "\uf00d"
                     foreground: root.autoplay ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
-                    width: Style.space(36)
-                    height: Style.space(36)
+                    width: root.controlButtonSize
+                    height: root.controlButtonSize
                     iconSize: Style.font.icon
                     background: Style.normalFillFor(root.bar.foreground, Color.accent)
                     borderSpec: root.transportButtonBorder
@@ -952,8 +959,8 @@ BarWidget {
                 Button {
                     iconText: "\uf074"
                     foreground: root.shuffle ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
-                    width: Style.space(36)
-                    height: Style.space(36)
+                    width: root.controlButtonSize
+                    height: root.controlButtonSize
                     iconSize: Style.font.icon
                     background: Style.normalFillFor(root.bar.foreground, Color.accent)
                     borderSpec: root.transportButtonBorder
@@ -965,8 +972,8 @@ BarWidget {
                 Button {
                     iconText: "\uf021"
                     foreground: root.repeatOne ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
-                    width: Style.space(36)
-                    height: Style.space(36)
+                    width: root.controlButtonSize
+                    height: root.controlButtonSize
                     iconSize: Style.font.icon
                     background: Style.normalFillFor(root.bar.foreground, Color.accent)
                     borderSpec: root.transportButtonBorder
@@ -980,8 +987,8 @@ BarWidget {
                     visible: root.outputDevices.length > 1
                     iconText: "\uf025"
                     foreground: root.outputDevice !== "" ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
-                    width: Style.space(36)
-                    height: Style.space(36)
+                    width: root.controlButtonSize
+                    height: root.controlButtonSize
                     iconSize: Style.font.icon
                     background: Style.normalFillFor(root.bar.foreground, Color.accent)
                     borderSpec: root.transportButtonBorder
@@ -1000,8 +1007,8 @@ BarWidget {
                     iconText: (root.muted || root.volume === 0) ? "\uf026"
                         : (root.volume < 50 ? "\uf027" : "\uf028")
                     foreground: root.muted ? Qt.darker(root.bar.foreground, 1.8) : root.bar.foreground
-                    width: Style.space(36)
-                    height: Style.space(36)
+                    width: root.controlButtonSize
+                    height: root.controlButtonSize
                     iconSize: Style.font.icon
                     background: Style.normalFillFor(root.bar.foreground, Color.accent)
                     borderSpec: root.transportButtonBorder
