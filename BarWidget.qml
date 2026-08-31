@@ -329,6 +329,19 @@ BarWidget {
     function outputLabel() {
         return root.outputDevice === "" ? "System default" : root.outputDevice;
     }
+    /* Bar tooltip text: track (or "Nothing playing"), plus the latest backend
+     * status on its own line when it says something the title doesn't already.
+     * Uses the bar's themed tooltip -- the old inline QtQuick ToolTip rendered
+     * with the unstyled platform default. */
+    function hoverTooltip() {
+        if (!root.hasTrack)
+            return root.statusText !== "" ? root.statusText : "Nothing playing";
+        var base = root.title + (root.artist !== "" ? " — " + root.artist : "");
+        var s = root.statusText;
+        if (s !== "" && s.indexOf(root.title) === -1)
+            return base + "\n" + s;
+        return base;
+    }
     function startEdit(i) {
         for (var k = 0; k < root.tracks.length; k++) {
             if (root.tracks[k].index === i) {
@@ -686,12 +699,6 @@ BarWidget {
              * glyph's ink width, which varies by font and previously allowed
              * the title to paint into the icon. */
             width: Math.max(0, Math.min(root.labelMaxWidth, row.width - glyphSlot.width - row.spacing))
-
-            /* Text has no `hovered` property; drive the tooltip from a handler. */
-            HoverHandler { id: labelHover }
-            ToolTip.visible: root.statusText !== "" && labelHover.hovered
-            ToolTip.text: root.statusText
-            ToolTip.delay: 400
         }
     }
 
@@ -715,7 +722,7 @@ BarWidget {
                 root.hoverPeek = true;
                 peekTimer.restart();
             } else if (root.bar) {
-                root.bar.showTooltip(root, root.hasTrack ? (root.title + (root.artist !== "" ? " \u2014 " + root.artist : "")) : "Nothing playing");
+                root.bar.showTooltip(root, root.hoverTooltip());
             }
         }
         onExited: {
@@ -738,7 +745,7 @@ BarWidget {
         bar: root.bar
         owner: root
         open: root.popupOpen
-        contentWidth: popup.fittedContentWidth(Style.space(340))
+        contentWidth: popup.fittedContentWidth(Style.space(360))
         contentHeight: popup.fittedContentHeight(column.implicitHeight)
         padding: Style.space(16)
 
@@ -865,9 +872,12 @@ BarWidget {
                 }
             }
 
+            /* Every control except the volume row on one line: transport
+             * (prev / play / next / library) then modes (autoplay / shuffle /
+             * repeat / output). Eight 36px squares + 4px gaps fit the popup. */
             Row {
                 anchors.horizontalCenter: parent.horizontalCenter
-                spacing: Style.space(6)
+                spacing: Style.space(4)
 
                 Button {
                     iconText: "\uf048"
@@ -935,13 +945,6 @@ BarWidget {
                             root.loadLibrary();
                     }
                 }
-            }
-
-            /* Playback modes, kept off the transport row so the row does not
-             * overflow the popup width as more toggles are added. */
-            Row {
-                anchors.horizontalCenter: parent.horizontalCenter
-                spacing: Style.space(6)
 
                 Button {
                     iconText: root.autoplay ? "\uf01e" : "\uf00d"
