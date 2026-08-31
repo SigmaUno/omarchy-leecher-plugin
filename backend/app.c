@@ -66,6 +66,9 @@ typedef struct {
     int track_ended;
     int stream_open;
     int stream_eof;
+    Uint32 stream_target_ms;  /* when set, stream_audio() buffers this far ahead
+                               * instead of the default -- used to cover a
+                               * blocking fetch-thread join without an audio gap */
     pid_t ssh_agent_pid;
     char ssh_agent_dir[PATH_MAX];
     char ssh_agent_socket[PATH_MAX];
@@ -103,6 +106,8 @@ typedef struct {
 /* Joins any in-flight background fetch thread before the library handler it
  * was given can be freed out from under it (see cancel_fetch's definition). */
 static void cancel_fetch(AppState *s);
+static void stream_audio(AppState *s);
+static void join_fetch_thread(AppState *s);
 
 /* Per-user private IPC directory.  All status / control / cover / ssh-agent
  * files live here so that a multi-user host cannot read or clobber another
@@ -1264,17 +1269,29 @@ static void *fetch_worker(void *arg) {
     return NULL;
 }
 
+/* Signal the background fetch thread to stop and join it. The join blocks the
+ * main loop, so stream_audio() cannot refill SDL's queue while it runs and a
+ * local file can take a few hundred ms to unwind -- long enough to be heard as
+ * a gap when the library is mutated mid-playback (#11). Fill the queue several
+ * seconds deep first so the wind-down is inaudible. The caller must hold
+ * fetch_mutex and have confirmed fetch_thread_valid; the lock is dropped for
+ * the fill + join and retaken before return. */
+static void join_fetch_thread(AppState *s) {
+    s->fetch_cancel = 1;
+    pthread_mutex_unlock(&s->fetch_mutex);
+    s->stream_target_ms = 6000;
+    stream_audio(s);
+    s->stream_target_ms = 0;
+    pthread_join(s->fetch_thread, NULL);
+    pthread_mutex_lock(&s->fetch_mutex);
+    s->fetch_thread_valid = 0;
+}
+
 /* Restart the worker (joining an in-flight one first) to fetch `index`. */
 static void start_fetch(const LibraryHandler *library, AppState *s, size_t index) {
     fetch_lock(s);
-    if (s->fetch_thread_valid) {
-        s->fetch_cancel = 1;
-        pthread_mutex_t *m = &s->fetch_mutex;
-        pthread_mutex_unlock(m);
-        pthread_join(s->fetch_thread, NULL);
-        pthread_mutex_lock(m);
-        s->fetch_thread_valid = 0;
-    }
+    if (s->fetch_thread_valid)
+        join_fetch_thread(s);
     free_fetch_cache(s);
     s->fetch_cancel = 0;
     s->fetch_active = 1;
@@ -1312,12 +1329,7 @@ static void start_fetch(const LibraryHandler *library, AppState *s, size_t index
 static void cancel_fetch(AppState *s) {
     fetch_lock(s);
     if (s->fetch_thread_valid) {
-        s->fetch_cancel = 1;
-        pthread_mutex_t *m = &s->fetch_mutex;
-        pthread_mutex_unlock(m);
-        pthread_join(s->fetch_thread, NULL);
-        pthread_mutex_lock(m);
-        s->fetch_thread_valid = 0;
+        join_fetch_thread(s);
         free_fetch_cache(s);
     }
     pthread_mutex_unlock(&s->fetch_mutex);
@@ -1329,8 +1341,6 @@ static void cancel_fetch(AppState *s) {
  * fraction of the track decoded at once bounds RAM regardless of length. */
 #define STREAM_QUEUE_FRAMES  (44100u / 4u)         /* ~0.25s per chunk */
 #define STREAM_QUEUE_TARGET  (44100u * 3u / 4u)    /* refill up to ~0.75s */
-
-static void stream_audio(AppState *s);
 
 /* Open the chosen output (audio_device_name), or the system default when it is
  * empty. If a named device fails to open it has probably been unplugged or
@@ -1544,7 +1554,9 @@ static void stream_audio(AppState *s) {
     if (!s->stream_open || !s->decoder || s->stream_eof) return;
     channels = s->audio_channels;
     if (!s->audio_device || channels <= 0 || channels > 8) return;
-    target_bytes = STREAM_QUEUE_TARGET * (Uint32)channels * 2u;
+    target_bytes = (s->stream_target_ms && s->audio_rate > 0
+        ? (Uint32)((Uint64)s->stream_target_ms * (Uint64)s->audio_rate / 1000u)
+        : STREAM_QUEUE_TARGET) * (Uint32)channels * 2u;
     while (s->stream_open && !s->stream_eof) {
         queued = SDL_GetQueuedAudioSize(s->audio_device);
         if (queued >= target_bytes) break;

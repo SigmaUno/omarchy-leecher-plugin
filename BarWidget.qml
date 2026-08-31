@@ -683,7 +683,9 @@ BarWidget {
              * the title to paint into the icon. */
             width: Math.max(0, Math.min(root.labelMaxWidth, row.width - glyphSlot.width - row.spacing))
 
-            ToolTip.visible: root.statusText !== "" && label.hovered
+            /* Text has no `hovered` property; drive the tooltip from a handler. */
+            HoverHandler { id: labelHover }
+            ToolTip.visible: root.statusText !== "" && labelHover.hovered
             ToolTip.text: root.statusText
             ToolTip.delay: 400
         }
