@@ -1361,7 +1361,7 @@ BarWidget {
 
                                         height: playlistRow.height
                                         width: ptabText.implicitWidth + Style.space(14)
-                                        radius: Style.spacing.labelGap
+                                        radius: 0
                                         color: isViewed
                                             ? Color.accent
                                             : (isPlaying
@@ -1391,7 +1391,7 @@ BarWidget {
                                     width: root.addingPlaylist
                                         ? Style.space(110)
                                         : (addPlusText.implicitWidth + Style.space(14))
-                                    radius: Style.spacing.labelGap
+                                    radius: 0
                                     color: "transparent"
                                     border.width: Math.max(1, Style.space(1))
                                     border.color: Color.accent

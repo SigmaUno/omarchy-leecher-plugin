@@ -81,10 +81,12 @@ wait_for '.title != "" and .is_playing == true' "autoplay starts a track" || exi
 # viewed-playlist file the status reports.
 libfile=$(jq -r '.library' "$D/status.json")
 libdir=$(dirname "$libfile")
-jq -e '.playlists == ["home"] and .viewed_playlist == "home" and .playing_playlist == "home"' \
+jq -e '.playlists == ["home", "*"] and .viewed_playlist == "home" and .playing_playlist == "home"' \
     "$D/status.json" >/dev/null 2>&1 \
-    && pass "legacy library.json migrated to library/home.json" \
-    || { fail "legacy library.json migrated to library/home.json"; jq '{playlists,viewed_playlist,playing_playlist,library}' "$D/status.json"; }
+    && pass "legacy library.json migrated; auto-collect * seeded" \
+    || { fail "legacy library.json migrated; auto-collect * seeded"; jq '{playlists,viewed_playlist,playing_playlist,library}' "$D/status.json"; }
+[ -f "$libdir/home.json" ] && [ -f "$libdir/*.json" ] \
+    && pass "home.json and *.json both exist" || fail "home.json and *.json both exist"
 
 # ---- transport ---------------------------------------------------------------
 send "play_pause"
@@ -312,6 +314,18 @@ wait_for '.viewed_playlist == "roadtrip"' "back to viewing roadtrip"
 "$here/make_fixture.sh" "$work/rt" >/dev/null
 send "add_local $work/rt/track0.wav"
 wait_for '.status | test("[Ii]mport")' "track added to roadtrip"
+
+# the auto-collect * playlist mirrors every add
+star="$libdir/*.json"
+jq -e '[.tracks[].sources[].PATH] | index("'"$work/rt/track0.wav"'") != null' "$star" >/dev/null 2>&1 \
+    && pass "add is mirrored into the * playlist" \
+    || { fail "add is mirrored into the * playlist"; jq '[.tracks[].sources[].PATH]' "$star"; }
+send "add_local $work/rt/track0.wav"   # same file again
+wait_for '.status | test("[Ii]mport")' "re-add of the same file reported"
+[ "$(jq '[.tracks[].sources[] | select(.PATH == "'"$work/rt/track0.wav"'")] | length' "$star")" = "1" ] \
+    && pass "* does not duplicate an already-collected source" \
+    || fail "* does not duplicate an already-collected source"
+
 send "play 0"
 wait_for '.playing_playlist == "roadtrip" and .is_playing == true' \
     "playing a roadtrip track switches playback to roadtrip"

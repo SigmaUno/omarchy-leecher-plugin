@@ -427,23 +427,39 @@ static void test_scan_and_known_playlists(void) {
     { char p[600]; snprintf(p, sizeof(p), "%s/home.json", dir); write_file(p, EMPTY_LIBRARY_JSON); }
     { char p[600]; snprintf(p, sizeof(p), "%s/chill.json", dir); write_file(p, EMPTY_LIBRARY_JSON); }
     { char p[600]; snprintf(p, sizeof(p), "%s/Ambient.json", dir); write_file(p, EMPTY_LIBRARY_JSON); }
+    { char p[600]; snprintf(p, sizeof(p), "%s/%s.json", dir, STAR_PLAYLIST); write_file(p, EMPTY_LIBRARY_JSON); }
     { char p[600]; snprintf(p, sizeof(p), "%s/.resume.json", dir); write_file(p, "{}"); }
     { char p[600]; snprintf(p, sizeof(p), "%s/notes.txt", dir); write_file(p, "x"); }
 
     scan_playlists(&s);
-    CHECK_EQ_SIZE((size_t)s.playlist_count, 3);   /* .resume.json and notes.txt skipped */
+    CHECK_EQ_SIZE((size_t)s.playlist_count, 4);   /* .resume.json and notes.txt skipped */
     CHECK_STR(s.playlists[0], "home");             /* home always sorts first */
     CHECK_STR(s.playlists[1], "Ambient");          /* then case-insensitive alpha */
     CHECK_STR(s.playlists[2], "chill");
+    CHECK_STR(s.playlists[3], STAR_PLAYLIST);      /* the auto-collect list sorts last */
     CHECK(playlist_known(&s, "chill"));
+    CHECK(playlist_known(&s, STAR_PLAYLIST));
     CHECK(!playlist_known(&s, "missing"));
 
     { char p[600]; snprintf(p, sizeof(p), "%s/home.json", dir); unlink(p); }
     { char p[600]; snprintf(p, sizeof(p), "%s/chill.json", dir); unlink(p); }
     { char p[600]; snprintf(p, sizeof(p), "%s/Ambient.json", dir); unlink(p); }
+    { char p[600]; snprintf(p, sizeof(p), "%s/%s.json", dir, STAR_PLAYLIST); unlink(p); }
     { char p[600]; snprintf(p, sizeof(p), "%s/.resume.json", dir); unlink(p); }
     { char p[600]; snprintf(p, sizeof(p), "%s/notes.txt", dir); unlink(p); }
     rmdir(dir);
+}
+
+static void test_source_equal(void) {
+    LibrarySource a = { .kind = LIBRARY_SOURCE_LOCAL, .path = (char *)"/m/x.flac" };
+    LibrarySource b = { .kind = LIBRARY_SOURCE_LOCAL, .path = (char *)"/m/x.flac" };
+    LibrarySource c = { .kind = LIBRARY_SOURCE_LOCAL, .path = (char *)"/m/y.flac" };
+    LibrarySource d = { .kind = LIBRARY_SOURCE_HTTPS, .url = (char *)"https://h/x" };
+    LibrarySource e = { .kind = LIBRARY_SOURCE_HTTPS, .url = (char *)"https://h/x" };
+    CHECK(source_equal(&a, &b));
+    CHECK(!source_equal(&a, &c));   /* different path */
+    CHECK(!source_equal(&a, &d));   /* different kind */
+    CHECK(source_equal(&d, &e));
 }
 
 static void test_resolve_library_dir_migrates(void) {
@@ -462,11 +478,13 @@ static void test_resolve_library_dir_migrates(void) {
     f = fopen(home, "r");
     CHECK(f != NULL);                       /* the legacy file was migrated in */
     if (f) fclose(f);
-    CHECK_EQ_SIZE((size_t)s.playlist_count, 1);
+    CHECK_EQ_SIZE((size_t)s.playlist_count, 2);   /* home + the seeded "*" */
     CHECK_STR(s.playlists[0], "home");
+    CHECK_STR(s.playlists[1], STAR_PLAYLIST);
     CHECK(strstr(s.library_dir, "/library") != NULL);
 
     unlink(arg); unlink(home);
+    { char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/library/%s.json", base, STAR_PLAYLIST); unlink(p); }
     { char d[PATH_MAX]; snprintf(d, sizeof(d), "%s/library", base); rmdir(d); }
     rmdir(base);
 }
@@ -596,6 +614,7 @@ int main(void) {
         { "resume_roundtrip",    test_resume_roundtrip },
         { "valid_playlist_name", test_valid_playlist_name },
         { "scan_known_playlists", test_scan_and_known_playlists },
+        { "source_equal",        test_source_equal },
         { "resolve_library_dir", test_resolve_library_dir_migrates },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
