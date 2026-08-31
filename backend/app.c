@@ -1886,8 +1886,11 @@ static void handle_set_fields(LibraryHandler **library, MusicRipper *ripper,
     const char *tok = end;
     if (end == p) { snprintf(state->status, sizeof(state->status), "Edit failed: missing track index."); return; }
     while (i < 3 && *tok) {
-        const char *sp = tok;
+        const char *sp;
         size_t len;
+        while (*tok == ' ') tok++;          /* the index is followed by a space */
+        if (!*tok) break;
+        sp = tok;
         while (*sp && *sp != ' ') sp++;
         len = (size_t)(sp - tok);
         if (len >= sizeof(decoded[i])) len = sizeof(decoded[i]) - 1;
@@ -2658,8 +2661,13 @@ int main(int argc, char **argv) {
                         state.autoplay_advancing = 1;
                         start_fetch(library, &state, next);
                     } else {
+                        /* Autoplay off and nothing queued: the track is over.
+                         * Publish is_playing=false -- the earlier write_status()
+                         * still showed it playing. */
                         state.is_playing = 0;
                         SDL_PauseAudioDevice(state.audio_device, 1);
+                        write_resume(&state);
+                        write_status(&state);
                     }
                 }
             }
