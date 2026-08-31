@@ -115,6 +115,14 @@ typedef struct {
     int autoplay_advancing;
     size_t play_queue[64];   /* ad-hoc "play next" order, consumed before library order */
     int play_queue_len;
+    /* Background directory scan -> "INCOMING >> <target> <<" staging playlist. */
+    pthread_t scan_thread;
+    int scan_thread_valid;
+    volatile int scan_active;
+    volatile int scan_cancel;
+    volatile int scan_count;
+    char scan_incoming[LIBRARY_NAME_MAX];  /* the staging playlist stem */
+    char scan_target[LIBRARY_NAME_MAX];    /* the playlist accepted tracks land in */
 } AppState;
 
 /* Joins any in-flight background fetch thread before the library handler it
@@ -325,6 +333,7 @@ static void write_status(const AppState *state) {
                  "\"shuffle\":%s,\"repeat_one\":%s,\"volume\":%d,\"muted\":%s,\"queue\":%s,"
                  "\"output\":\"%s\",\"outputs\":%s,\"cover\":\"%s\","
                  "\"library_dir\":\"%s\",\"playlists\":%s,\"viewed_playlist\":\"%s\",\"playing_playlist\":\"%s\","
+                 "\"scanning\":%s,\"scan_count\":%d,"
                  "\"status\":\"%s\",\"cmd_id\":%lu}\n",
                  title ? title : "", artist ? artist : "", album ? album : "",
                  state->position_ms, state->duration_ms,
@@ -335,6 +344,7 @@ static void write_status(const AppState *state) {
                  output ? output : "", outputs,
                  cover ? cover : "",
                  dir ? dir : "", playlists, viewed ? viewed : "", playing ? playing : "",
+                 (state->scan_thread_valid && state->scan_active) ? "true" : "false", state->scan_count,
                  status ? status : "", state->last_cmd_id);
     free(title); free(artist); free(album); free(library); free(cover); free(status); free(output);
     free(dir); free(viewed); free(playing);
@@ -358,6 +368,38 @@ static const char EMPTY_LIBRARY_JSON[] = "{\n  \"version\": 1,\n  \"tracks\": []
 /* The auto-collecting playlist: every source added to any other playlist is
  * also added here. Seeded at startup; users cannot create or name it. */
 #define STAR_PLAYLIST "*"
+
+/* A directory scan drops its finds into a staging playlist named
+ * "INCOMING >> <target> <<" rather than straight into <target>; the user then
+ * accepts or declines each. The name carries the target so accept knows where
+ * the track should land. The angle brackets keep it out of valid_playlist_name. */
+#define INCOMING_PREFIX "INCOMING >> "
+#define INCOMING_SUFFIX " <<"
+
+static void incoming_name_for(const char *target, char *out, size_t out_size) {
+    /* target is a validated playlist stem (<= 64 chars); bound it so the whole
+     * name always fits a LIBRARY_NAME_MAX buffer. */
+    snprintf(out, out_size, "%s%.64s%s", INCOMING_PREFIX, target, INCOMING_SUFFIX);
+}
+
+/* If `name` is a staging playlist, copy its target stem into `target` (may be
+ * NULL) and return 1. */
+static int incoming_target_of(const char *name, char *target, size_t target_size) {
+    size_t n = strlen(name);
+    size_t pl = sizeof(INCOMING_PREFIX) - 1, sl = sizeof(INCOMING_SUFFIX) - 1;
+    if (n <= pl + sl) return 0;
+    if (strncmp(name, INCOMING_PREFIX, pl) != 0) return 0;
+    if (strcmp(name + n - sl, INCOMING_SUFFIX) != 0) return 0;
+    if (target && target_size) {
+        size_t tl = n - pl - sl;
+        if (tl >= target_size) tl = target_size - 1;
+        memcpy(target, name + pl, tl);
+        target[tl] = '\0';
+    }
+    return 1;
+}
+
+static int is_incoming_name(const char *name) { return incoming_target_of(name, NULL, 0); }
 
 /* A playlist name doubles as a filename component, so keep it to a safe set:
  * 1..64 chars of [A-Za-z0-9 _-], no leading/trailing space. This rules out
@@ -387,14 +429,18 @@ static int playlist_known(const AppState *s, const char *name) {
     return 0;
 }
 
-/* "home" sorts first, the auto-collect "*" playlist sorts last, everything
- * between is case-insensitive alphabetical. */
+/* Tab order: "home", then regular playlists, then "INCOMING >> ..." staging
+ * lists, then the auto-collect "*". Ties broken case-insensitively. */
+static int playlist_rank(const char *n) {
+    if (!strcmp(n, "home")) return 0;
+    if (!strcmp(n, STAR_PLAYLIST)) return 3;
+    if (is_incoming_name(n)) return 2;
+    return 1;
+}
 static int playlist_cmp(const void *a, const void *b) {
     const char *x = (const char *)a, *y = (const char *)b;
-    int xh = !strcmp(x, "home"), yh = !strcmp(y, "home");
-    int xs = !strcmp(x, STAR_PLAYLIST), ys = !strcmp(y, STAR_PLAYLIST);
-    if (xh != yh) return yh - xh;
-    if (xs != ys) return xs - ys;
+    int rx = playlist_rank(x), ry = playlist_rank(y);
+    if (rx != ry) return rx - ry;
     return strcasecmp(x, y);
 }
 
@@ -1151,6 +1197,7 @@ static void rebuild_star_playlist(AppState *s) {
         LibraryHandler *h;
         size_t count, i, j;
         if (!strcmp(s->playlists[pi], STAR_PLAYLIST)) continue;
+        if (is_incoming_name(s->playlists[pi])) continue;   /* staging, not real content yet */
         playlist_file_path(s, s->playlists[pi], path, sizeof(path));
         h = library_handler_open(path, err, sizeof(err));
         if (!h) continue;
@@ -2341,6 +2388,269 @@ static void create_playlist(LibraryHandler **library, MusicRipper *ripper,
     write_status(state);
 }
 
+/* Reopen the viewed-playlist handle from disk without the "same name" guard in
+ * switch_viewed_playlist -- used after a background scan has grown the file, or
+ * after accept/decline mutated it. Safe w.r.t. the fetch thread: that holds its
+ * own play_lib handle, never *library. */
+static void reload_viewed_playlist(LibraryHandler **library, MusicRipper *ripper, AppState *state) {
+    char err[128];
+    LibraryHandler *h = library_handler_open(state->library_path, err, sizeof(err));
+    if (!h) return;
+    library_handler_close(*library);
+    *library = h;
+    if (ripper) ripper->library = h;
+}
+
+/* ---- Directory scan -> INCOMING staging playlist ---------------------- */
+
+typedef struct {
+    AppState *state;
+    LibrarySourceKind kind;
+    char user[128];
+    char host[128];
+    char dir[1024];
+    char incoming_path[LIBRARY_PATH_MAX];
+} ScanJob;
+
+/* Runs off the main loop: walk a local directory (or an ssh/network find) for
+ * audio files and append each as a source to the staging playlist file. Every
+ * add is its own atomic write, so the widget's file watcher shows the list
+ * filling in live. */
+static void *scan_worker(void *arg) {
+    ScanJob *job = (ScanJob *)arg;
+    AppState *s = job->state;
+    int count = 0;
+
+    if (job->kind == LIBRARY_SOURCE_LOCAL) {
+        DIR *d = opendir(job->dir);
+        struct dirent *e;
+        if (d) {
+            while (!s->scan_cancel && (e = readdir(d)) != NULL) {
+                char full[1400];
+                struct stat st;
+                char title[256], artist[256], album[256];
+                LibrarySongQuery song;
+                LibrarySource src;
+                char err[128];
+                if (e->d_name[0] == '.' || !is_audio_name(e->d_name)) continue;
+                if (snprintf(full, sizeof(full), "%s/%s", job->dir, e->d_name) >= (int)sizeof(full)) continue;
+                if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+                song = build_song_query_for(s, full, NULL, NULL, NULL,
+                                            title, sizeof(title), artist, sizeof(artist), album, sizeof(album));
+                src = (LibrarySource){ .kind = LIBRARY_SOURCE_LOCAL, .path = full };
+                if (library_handler_add_source(job->incoming_path, &song, &src, err, sizeof(err)) == 1)
+                    s->scan_count = ++count;
+            }
+            closedir(d);
+        }
+    } else {
+        char tmp[] = "/tmp/leecher_scan_XXXXXX";
+        int fd = mkstemp(tmp);
+        if (fd >= 0) {
+            char *remote = remote_find_command(job->dir);
+            close(fd);
+            if (remote) {
+                FILE *list;
+                run_ssh_to_file(job->user, job->host, remote, tmp);
+                free(remote);
+                list = fopen(tmp, "r");
+                if (list) {
+                    char line[1400];
+                    while (!s->scan_cancel && fgets(line, sizeof(line), list)) {
+                        char *path = line;
+                        char title[256], artist[256], album[256];
+                        LibrarySongQuery song;
+                        LibrarySource src;
+                        char err[128];
+                        line[strcspn(line, "\r\n")] = '\0';
+                        while (*path == ' ' || *path == '\t') path++;
+                        if (!*path) continue;
+                        song = build_song_query_for(s, path, job->user, job->host, NULL,
+                                                    title, sizeof(title), artist, sizeof(artist), album, sizeof(album));
+                        src = (LibrarySource){ .kind = job->kind, .path = path,
+                                               .username = job->user, .ip = job->host };
+                        if (library_handler_add_source(job->incoming_path, &song, &src, err, sizeof(err)) == 1)
+                            s->scan_count = ++count;
+                    }
+                    fclose(list);
+                }
+            }
+            unlink(tmp);
+        }
+    }
+    s->scan_count = count;
+    s->scan_active = 0;
+    free(job);
+    return NULL;
+}
+
+/* Kick off a background scan of `dir` into "INCOMING >> <target> <<", creating
+ * the staging playlist and switching the view to it right away. */
+static void start_scan(LibraryHandler **library, MusicRipper *ripper, AppState *state,
+                       LibrarySourceKind kind, const char *target,
+                       const char *user, const char *host, const char *dir) {
+    char real_target[LIBRARY_NAME_MAX];
+    char iname[LIBRARY_NAME_MAX];
+    char ipath[LIBRARY_PATH_MAX];
+    ScanJob *job;
+
+    if (state->scan_thread_valid) {
+        snprintf(state->status, sizeof(state->status), "A scan is already running.");
+        write_status(state);
+        return;
+    }
+    if (!dir || !dir[0]) {
+        snprintf(state->status, sizeof(state->status), "Scan failed: a directory path is required.");
+        write_status(state);
+        return;
+    }
+    /* If the caller passed a staging playlist, scan into its underlying target. */
+    if (!incoming_target_of(target, real_target, sizeof(real_target)))
+        snprintf(real_target, sizeof(real_target), "%s", target);
+    if (!playlist_known(state, real_target) || is_incoming_name(real_target) ||
+        !strcmp(real_target, STAR_PLAYLIST)) {
+        snprintf(state->status, sizeof(state->status), "Scan failed: no such playlist \"%.60s\".", real_target);
+        write_status(state);
+        return;
+    }
+    if ((kind == LIBRARY_SOURCE_SSH || kind == LIBRARY_SOURCE_NETWORK) &&
+        (!user || !host || !valid_ssh_name(user, 0) || !valid_ssh_name(host, 1))) {
+        snprintf(state->status, sizeof(state->status), "Scan failed: invalid username or host.");
+        write_status(state);
+        return;
+    }
+
+    incoming_name_for(real_target, iname, sizeof(iname));
+    playlist_file_path(state, iname, ipath, sizeof(ipath));
+    if (access(ipath, F_OK) != 0 &&
+        !atomic_write(ipath, EMPTY_LIBRARY_JSON, sizeof(EMPTY_LIBRARY_JSON) - 1)) {
+        snprintf(state->status, sizeof(state->status), "Scan failed: could not create the staging playlist.");
+        write_status(state);
+        return;
+    }
+    scan_playlists(state);
+    switch_viewed_playlist(library, ripper, state, iname);
+
+    job = (ScanJob *)calloc(1, sizeof(*job));
+    if (!job) { snprintf(state->status, sizeof(state->status), "Scan failed: out of memory."); write_status(state); return; }
+    job->state = state;
+    job->kind = kind;
+    if (user) snprintf(job->user, sizeof(job->user), "%s", user);
+    if (host) snprintf(job->host, sizeof(job->host), "%s", host);
+    snprintf(job->dir, sizeof(job->dir), "%s", dir);
+    snprintf(job->incoming_path, sizeof(job->incoming_path), "%s", ipath);
+
+    snprintf(state->scan_incoming, sizeof(state->scan_incoming), "%s", iname);
+    snprintf(state->scan_target, sizeof(state->scan_target), "%s", real_target);
+    state->scan_count = 0;
+    state->scan_cancel = 0;
+    state->scan_active = 1;
+    if (pthread_create(&state->scan_thread, NULL, scan_worker, job) == 0) {
+        state->scan_thread_valid = 1;
+        snprintf(state->status, sizeof(state->status), "Scanning %.180s ...", dir);
+    } else {
+        state->scan_active = 0;
+        free(job);
+        snprintf(state->status, sizeof(state->status), "Scan failed: could not start the scan thread.");
+    }
+    write_status(state);
+}
+
+/* `scan_local <enc-target> <enc-dir>` /
+ * `scan_ssh|scan_network <enc-target> <enc-user> <enc-host> <enc-dir>` */
+static void handle_scan(LibraryHandler **library, MusicRipper *ripper, AppState *state,
+                        const char *args, LibrarySourceKind kind) {
+    const char *p = args;
+    char target[LIBRARY_NAME_MAX], user[128] = "", host[128] = "", dir[1024];
+    next_encoded_token(&p, target, sizeof(target));
+    if (kind != LIBRARY_SOURCE_LOCAL) {
+        next_encoded_token(&p, user, sizeof(user));
+        next_encoded_token(&p, host, sizeof(host));
+    }
+    next_encoded_token(&p, dir, sizeof(dir));
+    if (!*target) { snprintf(state->status, sizeof(state->status), "Scan failed: missing target playlist."); write_status(state); return; }
+    start_scan(library, ripper, state, kind, target,
+               *user ? user : NULL, *host ? host : NULL, dir);
+}
+
+/* `accept_incoming <idx> [idx...]` moves those staged tracks into the target
+ * playlist and drops them from the staging list; `decline_incoming ...` just
+ * drops them. Both operate on the currently-viewed "INCOMING >> <target> <<".
+ * When the staging list ends up empty it is deleted and the view returns to
+ * the target. */
+static void handle_accept_decline(LibraryHandler **library, MusicRipper *ripper, AppState *state,
+                                  const char *idx_list, int accept) {
+    char target[LIBRARY_NAME_MAX];
+    char ipath[LIBRARY_PATH_MAX], tpath[LIBRARY_PATH_MAX];
+    size_t idxs[256];
+    int n = 0, i, moved = 0;
+    const char *p = idx_list;
+
+    if (!incoming_target_of(state->viewed_playlist, target, sizeof(target))) {
+        snprintf(state->status, sizeof(state->status), "Not reviewing an incoming playlist.");
+        write_status(state);
+        return;
+    }
+    while (*p && n < (int)(sizeof(idxs) / sizeof(idxs[0]))) {
+        char *end;
+        while (*p == ' ') p++;
+        if (!isdigit((unsigned char)*p)) { if (*p) p++; continue; }
+        idxs[n++] = (size_t)strtoul(p, &end, 10);
+        p = end;
+    }
+    if (n == 0) { snprintf(state->status, sizeof(state->status), "No tracks given."); write_status(state); return; }
+    /* Descending order so a removal never shifts an index still to process. */
+    for (i = 1; i < n; i++) {
+        size_t key = idxs[i];
+        int j = i;
+        while (j > 0 && idxs[j - 1] < key) { idxs[j] = idxs[j - 1]; j--; }
+        idxs[j] = key;
+    }
+    { int w = 0; for (i = 0; i < n; i++) if (i == 0 || idxs[i] != idxs[i - 1]) idxs[w++] = idxs[i]; n = w; }
+
+    playlist_file_path(state, state->viewed_playlist, ipath, sizeof(ipath));
+    playlist_file_path(state, target, tpath, sizeof(tpath));
+
+    for (i = 0; i < n; i++) {
+        LibraryTrack t = {0};
+        char err[128];
+        if (library_handler_track_at(*library, idxs[i], &t, err, sizeof(err)) != 1) {
+            library_handler_track_destroy(&t);
+            continue;
+        }
+        if (accept) {
+            LibrarySongQuery q = { .title = t.title, .artist = t.artist, .album = t.album };
+            size_t j;
+            for (j = 0; j < t.source_count; j++)
+                library_handler_add_source(tpath, &q, &t.sources[j], err, sizeof(err));
+        }
+        if (library_handler_remove_track(ipath, idxs[i], err, sizeof(err)) == 1) moved++;
+        library_handler_track_destroy(&t);
+    }
+
+    cancel_fetch(state);
+    reload_viewed_playlist(library, ripper, state);
+    resync_play_lib(state);
+
+    if (library_handler_track_count(*library) == 0) {
+        unlink(ipath);
+        scan_playlists(state);
+        switch_viewed_playlist(library, ripper, state, target);
+        if (!strcmp(state->playing_playlist, target)) resync_play_lib(state);
+        if (accept)
+            snprintf(state->status, sizeof(state->status),
+                     "Accepted %d into \"%s\"; incoming list is clear.", moved, target);
+        else
+            snprintf(state->status, sizeof(state->status),
+                     "Declined %d; incoming list is clear.", moved);
+    } else if (accept) {
+        snprintf(state->status, sizeof(state->status), "Accepted %d into \"%s\".", moved, target);
+    } else {
+        snprintf(state->status, sizeof(state->status), "Declined %d.", moved);
+    }
+    write_status(state);
+}
+
 static void handle_control(const char *command, LibraryHandler **library, MusicRipper *ripper,
                            Assembler *assembler, AppState *state, const char *library_path) {
     /* Commands arrive as one line, e.g.: "play_pause", "next", "previous",
@@ -2362,6 +2672,10 @@ static void handle_control(const char *command, LibraryHandler **library, MusicR
         const char *n = command + 9; while (*n == ' ') n++;
         switch_viewed_playlist(library, ripper, state, n);
     }
+    else if (!strncmp(command, "accept_incoming ", 16))
+        handle_accept_decline(library, ripper, state, command + 16, 1);
+    else if (!strncmp(command, "decline_incoming ", 17))
+        handle_accept_decline(library, ripper, state, command + 17, 0);
     else if (!strncmp(command, "seek ", 5)) { long v = strtol(command + 5, NULL, 10); if (v < 0) v = 0; seek_ms(state, (Uint32)v); }
     else if (!strncmp(command, "autoplay ", 9)) {
         state->autoplay = (strncmp(command + 9, "off", 3) == 0) ? 0 : 1;
@@ -2516,6 +2830,12 @@ static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
                 handle_add_ssh_network_track(library, (MusicRipper *)ripper, library_path, state, cmd, LIBRARY_SOURCE_NETWORK);
             } else if (strncmp(cmd, "add_https ", 10) == 0) {
                 handle_add_https_track(library, (MusicRipper *)ripper, library_path, state, cmd);
+            } else if (strncmp(cmd, "scan_local ", 11) == 0) {
+                handle_scan(library, (MusicRipper *)ripper, state, cmd + 11, LIBRARY_SOURCE_LOCAL);
+            } else if (strncmp(cmd, "scan_ssh ", 9) == 0) {
+                handle_scan(library, (MusicRipper *)ripper, state, cmd + 9, LIBRARY_SOURCE_SSH);
+            } else if (strncmp(cmd, "scan_network ", 13) == 0) {
+                handle_scan(library, (MusicRipper *)ripper, state, cmd + 13, LIBRARY_SOURCE_NETWORK);
             } else {
                 control_decode(decoded, sizeof(decoded), cmd);
                 handle_control(decoded, library, (MusicRipper *)ripper, assembler, state, library_path);
@@ -2847,6 +3167,7 @@ int main(int argc, char **argv) {
     state.play_lib = library ? library_handler_open(state.library_path, error, sizeof(error)) : NULL;
     int running = 1;
     unsigned pos_tick = 0;
+    Uint32 last_scan_ms = 0;
     struct nk_font_atlas *font_atlas;
     ThemePalette palette;
     if (!library || !state.play_lib) { fprintf(stderr, "Cannot load %s: %s\n", state.library_path, error); return 1; }
@@ -2907,6 +3228,30 @@ int main(int argc, char **argv) {
     }
     while (running && !stop_requested) {
         poll_control(&library, &ripper, assembler, &state, state.library_path);
+
+        /* A background directory scan finished: join it, refresh the playlist
+         * list and re-read the staging playlist we are (probably) viewing. */
+        if (state.scan_thread_valid && !state.scan_active) {
+            pthread_join(state.scan_thread, NULL);
+            state.scan_thread_valid = 0;
+            scan_playlists(&state);
+            if (!strcmp(state.viewed_playlist, state.scan_incoming))
+                reload_viewed_playlist(&library, &ripper, &state);
+            if (state.scan_count > 0)
+                snprintf(state.status, sizeof(state.status),
+                         "Scan done: %d file(s) staged in \"%s\". Accept or decline them.",
+                         state.scan_count, state.scan_incoming);
+            else
+                snprintf(state.status, sizeof(state.status),
+                         "Scan found no audio files in that directory.");
+            write_status(&state);
+        }
+        if (state.scan_thread_valid && state.scan_active &&
+            (Uint32)(SDL_GetTicks() - last_scan_ms) >= 400) {
+            last_scan_ms = SDL_GetTicks();
+            snprintf(state.status, sizeof(state.status), "Scanning... %d file(s) so far.", state.scan_count);
+            write_status(&state);
+        }
 
         /* Keep SDL's audio queue refilled from the decoder's rolling window. */
         stream_audio(&state);
@@ -3094,6 +3439,11 @@ int main(int argc, char **argv) {
             nk_end(ctx);
             SDL_SetRenderDrawColor(renderer, palette.background.r, palette.background.g, palette.background.b, 255); SDL_RenderClear(renderer); nk_sdl_render(NK_ANTI_ALIASING_ON); SDL_RenderPresent(renderer);
         }
+    }
+    if (state.scan_thread_valid) {
+        state.scan_cancel = 1;
+        pthread_join(state.scan_thread, NULL);
+        state.scan_thread_valid = 0;
     }
     if (state.audio_device) state.position_ms = playback_ms(&state);
     write_resume(&state);   /* final resume point on a clean shutdown */
