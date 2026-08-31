@@ -125,6 +125,24 @@ BarWidget {
     property var queue: []
     property string librarySearch: ""
 
+    /* Multi-playlist library: every playlist stem in the library directory, the
+     * one currently shown (viewed) and the one playback is running over
+     * (playing). They differ when you browse playlist B while A keeps playing. */
+    property var playlists: []
+    property string viewedPlaylist: ""
+    property string playingPlaylist: ""
+    property bool addingPlaylist: false
+    /* The library list shows the playlist that playback is actually running
+     * over: only then do the "now playing" row and the queue strip apply. */
+    readonly property bool viewingPlayingList: root.viewedPlaylist === root.playingPlaylist
+
+    /* Linear interpolation between two colors, t in [0,1]. */
+    function blend(a, b, t) {
+        return Qt.rgba(a.r + (b.r - a.r) * t,
+                       a.g + (b.g - a.g) * t,
+                       a.b + (b.b - a.b) * t, 1);
+    }
+
     /* 1-based position of a library index in the play queue, or 0 if absent. */
     function queuePosition(index) {
         for (var i = 0; i < root.queue.length; i++)
@@ -331,6 +349,29 @@ BarWidget {
         root.pendingPlayIndex = i;
         root.sendControl("play " + i);
     }
+    /* Switch the library list to another playlist. Playback keeps running over
+     * whatever it was; it only moves if the user then picks a track here. */
+    function viewPlaylist(name) {
+        if (name === root.viewedPlaylist)
+            return;
+        root.actionsIndex = -1;
+        root.editVisible = false;
+        root.clearLibrarySearch();
+        root.sendControl("playlist " + name);
+    }
+    function beginAddPlaylist() {
+        root.addingPlaylist = true;
+    }
+    function commitAddPlaylist(name) {
+        var n = String(name).trim();
+        root.addingPlaylist = false;
+        if (n === "")
+            return;
+        root.sendControl("playlist_new " + n);
+    }
+    function cancelAddPlaylist() {
+        root.addingPlaylist = false;
+    }
     function toggleAutoplay() {
         root.autoplay = !root.autoplay;
         root.sendControl(root.autoplay ? "autoplay on" : "autoplay off");
@@ -515,6 +556,7 @@ BarWidget {
         root.editIndex = -1;
         root.closeAddForm();
         root.pendingPlayIndex = -1;
+        root.addingPlaylist = false;
         root.clearLibrarySearch();
     }
     function clearLibrarySearch() {
@@ -621,8 +663,19 @@ BarWidget {
         if (isPlayingNow && root.pendingPlayIndex >= 0 && idx === root.pendingPlayIndex) {
             root.pendingPlayIndex = -1;
         }
-        if (data.library)
-            root.libraryPath = String(data.library);
+        root.playlists = Array.isArray(data.playlists) ? data.playlists : [];
+        root.viewedPlaylist = typeof data.viewed_playlist === "string" ? data.viewed_playlist : "";
+        root.playingPlaylist = typeof data.playing_playlist === "string" ? data.playing_playlist : "";
+        if (data.library) {
+            var newLib = String(data.library);
+            if (newLib !== root.libraryPath) {
+                /* Playlist changed under us: drop stale per-list UI state. */
+                root.pendingPlayIndex = -1;
+                root.actionsIndex = -1;
+                root.editVisible = false;
+            }
+            root.libraryPath = newLib;
+        }
         root.lastSrvPos = srvPos;
         root.clampPosition();
     }
@@ -1256,13 +1309,143 @@ BarWidget {
                     width: parent.width
                     spacing: Style.space(4)
 
-                    Text {
-                        text: root.librarySearch.trim() === ""
-                            ? "Library"
-                            : "Library — " + root.filteredTracks.length + " of " + root.tracks.length
-                        color: Qt.darker(root.bar.foreground, 1.3)
-                        font.family: root.bar.fontFamily
-                        font.pixelSize: Style.font.caption
+                    /* "Library" label followed by a horizontally-scrolling strip
+                     * of playlist tabs. The viewed tab has an accent fill; a tab
+                     * that is playing while a different one is viewed gets a
+                     * half-accent fill so it reads as "still going". The framed
+                     * "+" opens an inline name field right in the strip. */
+                    Item {
+                        width: parent.width
+                        height: Math.max(playlistLabel.implicitHeight, Style.space(24))
+
+                        Text {
+                            id: playlistLabel
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: root.librarySearch.trim() === ""
+                                ? "Library"
+                                : "Library — " + root.filteredTracks.length + " of " + root.tracks.length
+                            color: Qt.darker(root.bar.foreground, 1.3)
+                            font.family: root.bar.fontFamily
+                            font.pixelSize: Style.font.caption
+                        }
+
+                        Flickable {
+                            id: playlistStrip
+                            anchors.left: playlistLabel.right
+                            anchors.leftMargin: Style.space(8)
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            height: Style.space(24)
+                            contentWidth: playlistRow.width
+                            contentHeight: height
+                            clip: true
+                            boundsBehavior: Flickable.StopAtBounds
+                            flickableDirection: Flickable.HorizontalFlick
+                            interactive: contentWidth > width
+
+                            Row {
+                                id: playlistRow
+                                height: parent.height
+                                spacing: Style.space(4)
+
+                                Repeater {
+                                    model: root.playlists
+
+                                    delegate: Rectangle {
+                                        id: ptab
+                                        required property var modelData
+                                        readonly property string pname: String(modelData)
+                                        readonly property bool isViewed: pname === root.viewedPlaylist
+                                        readonly property bool isPlaying: pname === root.playingPlaylist
+
+                                        height: playlistRow.height
+                                        width: ptabText.implicitWidth + Style.space(14)
+                                        radius: Style.spacing.labelGap
+                                        color: isViewed
+                                            ? Color.accent
+                                            : (isPlaying
+                                                ? root.blend(Color.accent, Color.popups.background, 0.5)
+                                                : "transparent")
+
+                                        Text {
+                                            id: ptabText
+                                            anchors.centerIn: parent
+                                            text: ptab.pname
+                                            textFormat: Text.PlainText
+                                            color: root.bar.foreground
+                                            font.family: root.bar.fontFamily
+                                            font.pixelSize: Style.font.caption
+                                            font.bold: ptab.isViewed || ptab.isPlaying
+                                        }
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            onClicked: root.viewPlaylist(ptab.pname)
+                                        }
+                                    }
+                                }
+
+                                Rectangle {
+                                    id: addPlaylistChip
+                                    height: playlistRow.height
+                                    width: root.addingPlaylist
+                                        ? Style.space(110)
+                                        : (addPlusText.implicitWidth + Style.space(14))
+                                    radius: Style.spacing.labelGap
+                                    color: "transparent"
+                                    border.width: Math.max(1, Style.space(1))
+                                    border.color: Color.accent
+
+                                    Text {
+                                        id: addPlusText
+                                        anchors.centerIn: parent
+                                        visible: !root.addingPlaylist
+                                        text: "+"
+                                        color: Color.accent
+                                        font.family: root.bar.fontFamily
+                                        font.pixelSize: Style.font.bodySmall
+                                        font.bold: true
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        enabled: !root.addingPlaylist
+                                        onClicked: root.beginAddPlaylist()
+                                    }
+                                    TextInput {
+                                        id: newPlaylistInput
+                                        anchors.fill: parent
+                                        anchors.leftMargin: Style.space(6)
+                                        anchors.rightMargin: Style.space(6)
+                                        visible: root.addingPlaylist
+                                        verticalAlignment: TextInput.AlignVCenter
+                                        color: root.bar.foreground
+                                        font.family: root.bar.fontFamily
+                                        font.pixelSize: Style.font.caption
+                                        clip: true
+                                        maximumLength: 64
+                                        /* Block caret in the accent colour: typing
+                                         * a name reads like a text editor. */
+                                        cursorDelegate: Rectangle {
+                                            width: Style.space(6)
+                                            color: Color.accent
+                                            visible: newPlaylistInput.cursorVisible
+                                        }
+                                        onVisibleChanged: {
+                                            if (visible) {
+                                                text = "";
+                                                forceActiveFocus();
+                                            }
+                                        }
+                                        onAccepted: root.commitAddPlaylist(text)
+                                        onActiveFocusChanged: {
+                                            if (!activeFocus && root.addingPlaylist)
+                                                root.commitAddPlaylist(text);
+                                        }
+                                        Keys.onEscapePressed: root.cancelAddPlaylist()
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     TextField {
@@ -1275,7 +1458,7 @@ BarWidget {
 
                     Item {
                         width: parent.width
-                        visible: root.queue.length > 0
+                        visible: root.queue.length > 0 && root.viewingPlayingList
                         implicitHeight: visible ? clearQueueBtn.height : 0
 
                         Text {
@@ -1304,7 +1487,7 @@ BarWidget {
 
                     Text {
                         width: parent.width
-                        visible: root.queue.length > 0
+                        visible: root.queue.length > 0 && root.viewingPlayingList
                         text: root.queueSummary
                         textFormat: Text.PlainText
                         color: Qt.darker(root.bar.foreground, 1.3)
@@ -1326,8 +1509,8 @@ BarWidget {
                         delegate: BorderSurface {
                             required property int index
                             required property var modelData
-                            readonly property bool isActive: modelData.index === root.selectedTrackIndex && root.hasTrack
-                            readonly property bool isCurrent: modelData.index === root.selectedTrackIndex
+                            readonly property bool isActive: modelData.index === root.selectedTrackIndex && root.hasTrack && root.viewingPlayingList
+                            readonly property bool isCurrent: modelData.index === root.selectedTrackIndex && root.viewingPlayingList
                             readonly property bool isPending: root.pendingPlayIndex === modelData.index
 
                             width: trackList.width
@@ -1400,7 +1583,7 @@ BarWidget {
                                 z: 2
 
                                 Text {
-                                    readonly property int queuePos: root.queuePosition(modelData.index)
+                                    readonly property int queuePos: root.viewingPlayingList ? root.queuePosition(modelData.index) : 0
                                     width: Style.space(24)
                                     text: queuePos > 0 ? "▸" + queuePos : String(modelData.index + 1)
                                     color: queuePos > 0 ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
@@ -1853,6 +2036,9 @@ BarWidget {
                             readonly property bool queued: root.queuePosition(root.actionsIndex) > 0
                             text: queued ? "Unqueue" : "Add to queue"
                             iconText: "\uf0cb"
+                            /* The queue indexes the playing playlist; hide it
+                             * while a different playlist is being browsed. */
+                            visible: root.viewingPlayingList
                             width: parent.width
                             height: Style.space(32)
                             iconSize: Style.font.icon
