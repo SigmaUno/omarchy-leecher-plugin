@@ -8,3 +8,12 @@
 # Locally built Leecher backend
 backend/app
 backend/library-handler
+
+# Local development helpers -- not shipped. install-backend.sh and
+# uninstall-backend.sh are the supported scripts; these just wrap a
+# deploy-to-live-config and a shell restart for iterating on the widget.
+copybarwidget.sh
+reset.sh
+
+# Scratch space for local testing (throwaway libraries, runtime dirs, ...)
+testing/
