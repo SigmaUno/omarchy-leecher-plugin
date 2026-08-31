@@ -111,6 +111,7 @@ BarWidget {
     property bool contextOpen: false
     property bool libraryOpen: false
     property bool audioOpen: false
+    property bool titleExpanded: false
     property bool hidden: false
     property bool hoverPeek: false
     property bool closed: false
@@ -538,6 +539,7 @@ BarWidget {
             root.baseTime = root.now();
             root.serverAdvancing = true;
             root.coverVersion++;
+            root.titleExpanded = false;
         } else if (playingChanged) {
             root.basePosition = root.currentPosition();
             root.baseTime = root.now();
@@ -761,17 +763,47 @@ BarWidget {
                     anchors.verticalCenter: parent.verticalCenter
 
                     Text {
+                        id: titleText
                         text: root.title || "No song loaded"
                         textFormat: Text.PlainText
                         color: root.bar.foreground
                         font.family: root.bar.fontFamily
                         font.pixelSize: Style.font.subtitle
                         font.bold: true
-                        /* Wrap the full title onto as many lines as it needs;
-                         * only ever break between words, never mid-word. */
+                        /* Word-wrap only (never mid-word). Three lines, then the
+                         * third is elided and a "see more" link expands it. */
                         width: parent.width
                         wrapMode: Text.WordWrap
-                        maximumLineCount: 4
+                        maximumLineCount: root.titleExpanded ? 99 : 3
+                        elide: root.titleExpanded ? Text.ElideNone : Text.ElideRight
+                    }
+
+                    Text {
+                        id: titleMore
+                        visible: titleText.truncated || root.titleExpanded
+                        text: root.titleExpanded ? "[see less]" : "[see more]"
+                        color: Color.accent
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.caption
+
+                        MouseArea {
+                            id: titleMoreMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.titleExpanded = !root.titleExpanded
+                        }
+
+                        /* Hover peek: the full title in a small font, at the
+                         * cursor. Only useful while still collapsed. */
+                        PanelToolTip {
+                            visible: titleMoreMouse.containsMouse && !root.titleExpanded
+                            delay: 150
+                            x: titleMoreMouse.mouseX + Style.space(8)
+                            y: titleMoreMouse.mouseY + Style.space(10)
+                            fontSize: Style.font.caption
+                            text: root.title
+                        }
                     }
                     Text {
                         text: root.artist
