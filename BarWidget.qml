@@ -199,6 +199,46 @@ BarWidget {
     /* Every transport/mode button in the popup is this exact square so the two
      * control rows read as one even grid -- no bespoke size for play/pause. */
     readonly property real controlButtonSize: Style.space(36)
+    /* One cell of a segmented control (used by the transport group and the
+     * mode group): centred glyph, its own hover / press highlight, tooltip. */
+    component ControlSeg: Item {
+        id: seg
+        property string glyph: ""
+        property bool active: false
+        property color idle: Qt.darker(root.bar.foreground, 1.6)
+        property string tip: ""
+        signal act()
+        height: parent ? parent.height : 0
+
+        Rectangle {
+            anchors.fill: parent
+            color: segMouse.pressed
+                ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.28)
+                : segHover.hovered
+                    ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16)
+                    : "transparent"
+        }
+        Text {
+            anchors.centerIn: parent
+            text: seg.glyph
+            color: seg.active ? Color.accent : seg.idle
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.icon
+        }
+        HoverHandler { id: segHover }
+        MouseArea {
+            id: segMouse
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: seg.act()
+        }
+        PanelToolTip {
+            visible: segHover.hovered && seg.tip !== ""
+            text: seg.tip
+        }
+    }
+
+
 
     /* Size the widget from the glyph's real ink width (glyphSlot) instead of a
      * fixed barSize: the old formula requested barSize for the icon slot but the
@@ -904,56 +944,65 @@ BarWidget {
                 }
             }
 
-            /* Every control except the volume row on one line: transport
-             * (prev / play / next / library) then modes (autoplay / shuffle /
-             * repeat / output). Eight 36px squares + 4px gaps fit the popup. */
+            /* One control line: the transport group (prev / play / next), the
+             * library toggle, the modes group (autoplay / shuffle / repeat) and
+             * the volume+output button. */
             Row {
                 anchors.horizontalCenter: parent.horizontalCenter
                 spacing: Style.space(4)
 
-                Button {
-                    iconText: "\uf048"
-                    foreground: root.bar.foreground
-                    width: root.controlButtonSize
+                /* Transport as one segmented control (prev / play-pause /
+                 * next): one border, each segment its own hover highlight. */
+                BorderSurface {
+                    id: transportGroup
+                    width: root.controlButtonSize * 3 + Style.space(4)
                     height: root.controlButtonSize
-                    iconSize: Style.font.icon
-                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
+                    radius: Style.cornerRadius
+                    clip: true
+                    color: Style.normalFillFor(root.bar.foreground, Color.accent)
                     borderSpec: root.transportButtonBorder
-                    horizontalPadding: Style.spacing.controlPaddingX
-                    verticalPadding: 0
-                    tooltipText: "Skip to start / back"
-                    onClicked: root.previous()
-                }
-                Button {
-                    iconText: root.playIcon
-                    foreground: root.bar.foreground
-                    width: root.controlButtonSize
-                    height: root.controlButtonSize
-                    iconSize: Style.font.icon
-                    /* Same square as its neighbours -- no bespoke width or
-                     * larger glyph; the play/pause state carries the meaning.
-                     * (No `active`/`selected`: the kit's selected-fill is
-                     * stronger than its hover-fill, so it read as hovered at
-                     * rest and dimmed on actual hover.) */
-                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
-                    borderSpec: root.transportButtonBorder
-                    horizontalPadding: Style.spacing.controlPaddingX
-                    verticalPadding: 0
-                    tooltipText: "Play / pause"
-                    onClicked: root.playPause()
-                }
-                Button {
-                    iconText: "\uf051"
-                    foreground: root.bar.foreground
-                    width: root.controlButtonSize
-                    height: root.controlButtonSize
-                    iconSize: Style.font.icon
-                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
-                    borderSpec: root.transportButtonBorder
-                    horizontalPadding: Style.spacing.controlPaddingX
-                    verticalPadding: 0
-                    tooltipText: "Skip forward"
-                    onClicked: root.next()
+
+                    Row {
+                        anchors.fill: parent
+                        anchors.margins: transportGroup.border.width
+                        readonly property real segW: (width - 2 * tdiv.implicitWidth) / 3
+
+                        ControlSeg {
+                            width: parent.segW
+                            glyph: "\uf048"
+                            idle: root.bar.foreground
+                            tip: "Previous track"
+                            onAct: root.previous()
+                        }
+                        Rectangle {
+                            id: tdiv
+                            implicitWidth: Math.max(1, Style.space(1))
+                            width: implicitWidth
+                            height: parent.height
+                            color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.16)
+                        }
+                        ControlSeg {
+                            width: parent.segW
+                            glyph: root.playIcon
+                            active: root.playing
+                            idle: root.bar.foreground
+                            tip: "Play / pause"
+                            onAct: root.playPause()
+                        }
+                        Rectangle {
+                            implicitWidth: tdiv.implicitWidth
+                            width: implicitWidth
+                            height: parent.height
+                            color: tdiv.color
+                        }
+                        ControlSeg {
+                            width: parent.segW
+                            glyph: "\uf051"
+                            idle: root.bar.foreground
+                            tip: "Next track"
+                            onAct: root.next()
+                        }
+                    }
                 }
                 Button {
                     iconText: "\uf01d"
@@ -990,49 +1039,13 @@ BarWidget {
                     color: Style.normalFillFor(root.bar.foreground, Color.accent)
                     borderSpec: root.transportButtonBorder
 
-                    component ModeSeg: Item {
-                        id: seg
-                        property string glyph: ""
-                        property bool active: false
-                        property string tip: ""
-                        signal act()
-                        height: parent ? parent.height : 0
-
-                        Rectangle {
-                            anchors.fill: parent
-                            color: segMouse.pressed
-                                ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.28)
-                                : segHover.hovered
-                                    ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16)
-                                    : "transparent"
-                        }
-                        Text {
-                            anchors.centerIn: parent
-                            text: seg.glyph
-                            color: seg.active ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
-                            font.family: root.bar.fontFamily
-                            font.pixelSize: Style.font.icon
-                        }
-                        HoverHandler { id: segHover }
-                        MouseArea {
-                            id: segMouse
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: seg.act()
-                        }
-                        PanelToolTip {
-                            visible: segHover.hovered && seg.tip !== ""
-                            text: seg.tip
-                        }
-                    }
-
                     Row {
                         anchors.fill: parent
                         anchors.margins: modeGroup.border.width
 
                         readonly property real segW: (width - 2 * divider.implicitWidth) / 3
 
-                        ModeSeg {
+                        ControlSeg {
                             width: parent.segW
                             glyph: root.autoplay ? "\uf01e" : "\uf00d"
                             active: root.autoplay
@@ -1046,7 +1059,7 @@ BarWidget {
                             height: parent.height
                             color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.16)
                         }
-                        ModeSeg {
+                        ControlSeg {
                             width: parent.segW
                             glyph: "\uf074"
                             active: root.shuffle
@@ -1059,7 +1072,7 @@ BarWidget {
                             height: parent.height
                             color: divider.color
                         }
-                        ModeSeg {
+                        ControlSeg {
                             width: parent.segW
                             glyph: "\uf021"
                             active: root.repeatOne
