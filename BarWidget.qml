@@ -1423,15 +1423,39 @@ BarWidget {
                                         elide: Text.ElideRight
                                         width: parent.width
                                     }
-                                    Text {
-                                        text: modelData.artist
-                                        textFormat: Text.PlainText
-                                        color: Qt.darker(root.bar.foreground, 1.5)
-                                        font.family: root.bar.fontFamily
-                                        font.pixelSize: Style.font.caption
-                                        elide: Text.ElideRight
+                                    /* Secondary line: "Artist | Album" -- the
+                                     * pipe sits at the row's midpoint and both
+                                     * fields are left-aligned in their half, so
+                                     * the separator lines up down the list. */
+                                    Row {
                                         width: parent.width
-                                        visible: text !== ""
+                                        visible: modelData.artist !== "" || modelData.album !== ""
+
+                                        Text {
+                                            width: (parent.width - metaPipe.width) / 2
+                                            text: modelData.artist
+                                            textFormat: Text.PlainText
+                                            color: Qt.darker(root.bar.foreground, 1.5)
+                                            font.family: root.bar.fontFamily
+                                            font.pixelSize: Style.font.caption
+                                            elide: Text.ElideRight
+                                        }
+                                        Text {
+                                            id: metaPipe
+                                            text: " | "
+                                            color: Qt.darker(root.bar.foreground, 1.8)
+                                            font.family: root.bar.fontFamily
+                                            font.pixelSize: Style.font.caption
+                                        }
+                                        Text {
+                                            width: (parent.width - metaPipe.width) / 2
+                                            text: modelData.album
+                                            textFormat: Text.PlainText
+                                            color: Qt.darker(root.bar.foreground, 1.5)
+                                            font.family: root.bar.fontFamily
+                                            font.pixelSize: Style.font.caption
+                                            elide: Text.ElideRight
+                                        }
                                     }
                                 }
 
