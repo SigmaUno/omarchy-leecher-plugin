@@ -450,16 +450,62 @@ static void test_scan_and_known_playlists(void) {
     rmdir(dir);
 }
 
-static void test_source_equal(void) {
+static void test_source_key(void) {
     LibrarySource a = { .kind = LIBRARY_SOURCE_LOCAL, .path = (char *)"/m/x.flac" };
     LibrarySource b = { .kind = LIBRARY_SOURCE_LOCAL, .path = (char *)"/m/x.flac" };
     LibrarySource c = { .kind = LIBRARY_SOURCE_LOCAL, .path = (char *)"/m/y.flac" };
     LibrarySource d = { .kind = LIBRARY_SOURCE_HTTPS, .url = (char *)"https://h/x" };
-    LibrarySource e = { .kind = LIBRARY_SOURCE_HTTPS, .url = (char *)"https://h/x" };
-    CHECK(source_equal(&a, &b));
-    CHECK(!source_equal(&a, &c));   /* different path */
-    CHECK(!source_equal(&a, &d));   /* different kind */
-    CHECK(source_equal(&d, &e));
+    char ka[128], kb[128], kc[128], kd[128];
+    source_key(&a, ka, sizeof(ka));
+    source_key(&b, kb, sizeof(kb));
+    source_key(&c, kc, sizeof(kc));
+    source_key(&d, kd, sizeof(kd));
+    CHECK_STR(ka, kb);              /* identical source -> identical key */
+    CHECK(strcmp(ka, kc) != 0);     /* different path */
+    CHECK(strcmp(ka, kd) != 0);     /* different kind */
+}
+
+/* Building "*" from two playlists that share a track keeps one copy of the
+ * shared source, and unions the rest. */
+static void test_rebuild_star_playlist(void) {
+    char dir[] = "/tmp/leecher-star.XXXXXX";
+    AppState s = {0};
+    LibraryHandler *star;
+    assert(mkdtemp(dir));
+    snprintf(s.library_dir, sizeof(s.library_dir), "%s", dir);
+
+    { char p[600]; snprintf(p, sizeof(p), "%s/home.json", dir);
+      write_file(p, "{\"version\":1,\"tracks\":["
+        "{\"title\":\"Shared\",\"artist\":\"A\",\"album\":\"X\",\"sources\":[{\"kind\":\"local\",\"PATH\":\"/m/s.flac\"}]},"
+        "{\"title\":\"Only Home\",\"artist\":\"A\",\"album\":\"X\",\"sources\":[{\"kind\":\"local\",\"PATH\":\"/m/h.flac\"}]}]}"); }
+    { char p[600]; snprintf(p, sizeof(p), "%s/mix.json", dir);
+      write_file(p, "{\"version\":1,\"tracks\":["
+        "{\"title\":\"Shared\",\"artist\":\"A\",\"album\":\"X\",\"sources\":[{\"kind\":\"local\",\"PATH\":\"/m/s.flac\"}]},"
+        "{\"title\":\"Only Mix\",\"artist\":\"A\",\"album\":\"X\",\"sources\":[{\"kind\":\"https\",\"URL\":\"https://h/m\"}]}]}"); }
+    { char p[600]; snprintf(p, sizeof(p), "%s/%s.json", dir, STAR_PLAYLIST); write_file(p, EMPTY_LIBRARY_JSON); }
+    scan_playlists(&s);
+
+    rebuild_star_playlist(&s);
+
+    { char p[600]; snprintf(p, sizeof(p), "%s/%s.json", dir, STAR_PLAYLIST);
+      star = library_handler_open(p, NULL, 0); }
+    CHECK(star != NULL);
+    if (star) {
+        size_t n = library_handler_track_count(star), i, total_sources = 0;
+        CHECK_EQ_SIZE(n, 3);   /* Shared, Only Home, Only Mix */
+        for (i = 0; i < n; i++) {
+            LibraryTrack t = {0};
+            if (library_handler_track_at(star, i, &t, NULL, 0) == 1) total_sources += t.source_count;
+            library_handler_track_destroy(&t);
+        }
+        CHECK_EQ_SIZE(total_sources, 3);   /* the shared source is not doubled */
+        library_handler_close(star);
+    }
+
+    { char p[600]; snprintf(p, sizeof(p), "%s/home.json", dir); unlink(p); }
+    { char p[600]; snprintf(p, sizeof(p), "%s/mix.json", dir); unlink(p); }
+    { char p[600]; snprintf(p, sizeof(p), "%s/%s.json", dir, STAR_PLAYLIST); unlink(p); }
+    rmdir(dir);
 }
 
 static void test_resolve_library_dir_migrates(void) {
@@ -614,7 +660,8 @@ int main(void) {
         { "resume_roundtrip",    test_resume_roundtrip },
         { "valid_playlist_name", test_valid_playlist_name },
         { "scan_known_playlists", test_scan_and_known_playlists },
-        { "source_equal",        test_source_equal },
+        { "source_key",          test_source_key },
+        { "rebuild_star_playlist", test_rebuild_star_playlist },
         { "resolve_library_dir", test_resolve_library_dir_migrates },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {

@@ -315,17 +315,25 @@ wait_for '.viewed_playlist == "roadtrip"' "back to viewing roadtrip"
 send "add_local $work/rt/track0.wav"
 wait_for '.status | test("[Ii]mport")' "track added to roadtrip"
 
-# the auto-collect * playlist mirrors every add
+# "*" is lazy: adding to roadtrip without viewing "*" leaves it untouched.
 star="$libdir/*.json"
+jq -e '[.tracks[]?.sources[]?.PATH] | index("'"$work/rt/track0.wav"'") == null' "$star" >/dev/null 2>&1 \
+    && pass "* is not touched by an add to another playlist" \
+    || { fail "* is not touched by an add to another playlist"; jq '[.tracks[]?.sources[]?.PATH]' "$star"; }
+# viewing "*" rebuilds it from the union of the other playlists
+send "add_local $work/rt/track0.wav"   # same file, second add
+wait_for '.status | test("[Ii]mport")' "second add to roadtrip reported"
+send "playlist *"
+wait_for '.viewed_playlist == "*"' "switched to viewing *"
 jq -e '[.tracks[].sources[].PATH] | index("'"$work/rt/track0.wav"'") != null' "$star" >/dev/null 2>&1 \
-    && pass "add is mirrored into the * playlist" \
-    || { fail "add is mirrored into the * playlist"; jq '[.tracks[].sources[].PATH]' "$star"; }
-send "add_local $work/rt/track0.wav"   # same file again
-wait_for '.status | test("[Ii]mport")' "re-add of the same file reported"
+    && pass "viewing * collects the added track" \
+    || { fail "viewing * collects the added track"; jq '[.tracks[].sources[].PATH]' "$star"; }
 [ "$(jq '[.tracks[].sources[] | select(.PATH == "'"$work/rt/track0.wav"'")] | length' "$star")" = "1" ] \
-    && pass "* does not duplicate an already-collected source" \
-    || fail "* does not duplicate an already-collected source"
+    && pass "* de-duplicates a source added twice" \
+    || fail "* de-duplicates a source added twice"
 
+send "playlist roadtrip"
+wait_for '.viewed_playlist == "roadtrip"' "back to roadtrip once more"
 send "play 0"
 wait_for '.playing_playlist == "roadtrip" and .is_playing == true' \
     "playing a roadtrip track switches playback to roadtrip"

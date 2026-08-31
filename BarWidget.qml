@@ -121,6 +121,7 @@ BarWidget {
     property int lastCommandId: 0
     property int pendingCommandId: -1
     property bool commandAcked: true
+    property bool reloadOnAck: false
     property var tracks: []
     property var queue: []
     property string librarySearch: ""
@@ -350,13 +351,19 @@ BarWidget {
         root.sendControl("play " + i);
     }
     /* Switch the library list to another playlist. Playback keeps running over
-     * whatever it was; it only moves if the user then picks a track here. */
+     * whatever it was; it only moves if the user then picks a track here.
+     * Re-tapping "*" is allowed: the backend rebuilds it from the other
+     * playlists on every view, so it always shows what's been added since. */
     function viewPlaylist(name) {
-        if (name === root.viewedPlaylist)
+        if (name === root.viewedPlaylist && name !== "*")
             return;
         root.actionsIndex = -1;
         root.editVisible = false;
         root.clearLibrarySearch();
+        /* Re-read the track list once the backend acks the switch: for "*" the
+         * file is rebuilt under the same path, so a path-change reload alone
+         * would miss it. */
+        root.reloadOnAck = true;
         root.sendControl("playlist " + name);
     }
     function beginAddPlaylist() {
@@ -644,6 +651,10 @@ BarWidget {
             root.pendingCommandId >= 0 && Number(data.cmd_id) === root.pendingCommandId) {
             root.commandAcked = true;
             root.pendingCommandId = -1;
+            if (root.reloadOnAck) {
+                root.reloadOnAck = false;
+                Qt.callLater(root.loadLibrary);
+            }
         }
         if (root.pendingCommandId < 0) {
             root.autoplay = data.autoplay !== false;
