@@ -95,6 +95,8 @@ typedef struct {
     int pending_valid;
     size_t pending_index;
     int autoplay_advancing;
+    size_t play_queue[64];   /* ad-hoc "play next" order, consumed before library order */
+    int play_queue_len;
 } AppState;
 
 /* Joins any in-flight background fetch thread before the library handler it
@@ -257,18 +259,26 @@ static void write_status(const AppState *state) {
          *cover = json_escape(state->cover_file[0] ? state->cover_file : NULL),
          *status = json_escape(state->status);
     char tmp[4096];
+    char queue[16 * 64 + 4];  /* "[" + up to 64 "NNNNN," + "]" */
+    int qn = 0, qi;
     int n;
+    queue[qn++] = '[';
+    for (qi = 0; qi < state->play_queue_len && qn < (int)sizeof(queue) - 16; qi++)
+        qn += snprintf(queue + qn, sizeof(queue) - (size_t)qn, "%s%zu",
+                       qi ? "," : "", state->play_queue[qi]);
+    queue[qn++] = ']';
+    queue[qn] = '\0';
     n = snprintf(tmp, sizeof(tmp),
                  "{\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
                  "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s,"
-                 "\"shuffle\":%s,\"repeat_one\":%s,\"volume\":%d,\"muted\":%s,\"cover\":\"%s\","
+                 "\"shuffle\":%s,\"repeat_one\":%s,\"volume\":%d,\"muted\":%s,\"queue\":%s,\"cover\":\"%s\","
                  "\"status\":\"%s\",\"cmd_id\":%lu}\n",
                  title ? title : "", artist ? artist : "", album ? album : "",
                  state->position_ms, state->duration_ms,
                  state->is_playing ? "true" : "false", state->selected_track,
                  library ? library : "", state->autoplay ? "true" : "false",
                  state->shuffle ? "true" : "false", state->repeat_one ? "true" : "false",
-                 state->volume, state->muted ? "true" : "false",
+                 state->volume, state->muted ? "true" : "false", queue,
                  cover ? cover : "",
                  status ? status : "", state->last_cmd_id);
     free(title); free(artist); free(album); free(library); free(cover); free(status);
@@ -1404,13 +1414,39 @@ static size_t next_autoplay_index(const AppState *s, size_t count, size_t from, 
     return (from + 1) % count;
 }
 
+#define PLAY_QUEUE_CAP ((int)(sizeof(((AppState *)0)->play_queue) / sizeof(size_t)))
+
+static void play_queue_remove_at(AppState *s, int pos) {
+    if (pos < 0 || pos >= s->play_queue_len) return;
+    memmove(&s->play_queue[pos], &s->play_queue[pos + 1],
+            (size_t)(s->play_queue_len - pos - 1) * sizeof(size_t));
+    s->play_queue_len--;
+}
+
+static void play_queue_push(AppState *s, size_t idx) {
+    if (s->play_queue_len >= PLAY_QUEUE_CAP) return;
+    s->play_queue[s->play_queue_len++] = idx;
+}
+
+/* The next track to play: the queue head if it still points at a real track,
+ * otherwise the autoplay rule. repeat-one is handled earlier (seek in place),
+ * so an explicit queue always wins over shuffle/linear order. */
+static size_t take_next_index(AppState *s, size_t count, size_t from, int allow_repeat) {
+    while (s->play_queue_len > 0) {
+        size_t q = s->play_queue[0];
+        play_queue_remove_at(s, 0);
+        if (q < count) return q;   /* drop stale entries left by a shrunk library */
+    }
+    return next_autoplay_index(s, count, from, allow_repeat);
+}
+
 static void play_library_relative(const LibraryHandler *library, AppState *state, long delta) {
     size_t count = library ? library_handler_track_count(library) : 0;
     if (count == 0) { snprintf(state->status, sizeof(state->status), "Library is empty."); return; }
-    /* The forward button honours shuffle; back is always linear. */
-    if (delta > 0 && state->shuffle && count > 1) {
+    /* Forward honours the queue first, then shuffle; back is always linear. */
+    if (delta > 0 && (state->play_queue_len > 0 || (state->shuffle && count > 1))) {
         state->autoplay_advancing = 0;
-        request_play(library, state, next_autoplay_index(state, count, state->selected_track, 0));
+        request_play(library, state, take_next_index(state, count, state->selected_track, 0));
         return;
     }
     long cur = (long)state->selected_track;
@@ -1638,6 +1674,16 @@ static void handle_remove_track(LibraryHandler **library, MusicRipper *ripper, c
         state->position_ms = 0;
         state->title[0] = '\0';
     }
+    /* Keep the play queue pointing at the right rows: drop the removed track,
+     * shift entries that sat above it down by one. */
+    {
+        int i = 0;
+        while (i < state->play_queue_len) {
+            if (state->play_queue[i] == idx) { play_queue_remove_at(state, i); continue; }
+            if (state->play_queue[i] > idx) state->play_queue[i]--;
+            i++;
+        }
+    }
     snprintf(state->status, sizeof(state->status), "Removed track %zu.", idx);
     write_status(state);
 }
@@ -1847,6 +1893,34 @@ static void handle_control(const char *command, LibraryHandler **library, MusicR
         state->muted = (strncmp(command + 5, "on", 2) == 0) ? 1 : 0;
         reapply_output_gain(state);
         snprintf(state->status, sizeof(state->status), state->muted ? "Muted." : "Unmuted.");
+        write_status(state);
+    }
+    else if (!strncmp(command, "queue_clear", 11)) {
+        state->play_queue_len = 0;
+        snprintf(state->status, sizeof(state->status), "Play queue cleared.");
+        write_status(state);
+    }
+    else if (!strncmp(command, "queue ", 6)) {
+        size_t count = *library ? library_handler_track_count(*library) : 0;
+        size_t idx = (size_t)strtoul(command + 6, NULL, 10);
+        if (idx >= count) {
+            snprintf(state->status, sizeof(state->status), "Cannot queue track %zu.", idx + 1);
+        } else if (state->play_queue_len >= PLAY_QUEUE_CAP) {
+            snprintf(state->status, sizeof(state->status), "Play queue is full (%d).", PLAY_QUEUE_CAP);
+        } else {
+            play_queue_push(state, idx);
+            snprintf(state->status, sizeof(state->status), "Queued (%d in queue).", state->play_queue_len);
+        }
+        write_status(state);
+    }
+    else if (!strncmp(command, "unqueue ", 8)) {
+        /* Remove the first queued occurrence of a library index. */
+        size_t idx = (size_t)strtoul(command + 8, NULL, 10);
+        int i;
+        for (i = 0; i < state->play_queue_len; i++) {
+            if (state->play_queue[i] == idx) { play_queue_remove_at(state, i); break; }
+        }
+        snprintf(state->status, sizeof(state->status), "Play queue: %d.", state->play_queue_len);
         write_status(state);
     }
     else if (!strncmp(command, "set_title ", 10)) handle_set_field(library, ripper, library_path, state, "set_title ", "title", command);
@@ -2280,7 +2354,7 @@ int main(int argc, char **argv) {
                 size_t count = library_handler_track_count(library);
                 state.immediate_pending = 0;
                 if (state.autoplay && state.autoplay_advancing && count > 1) {
-                    size_t nxt = next_autoplay_index(&state, count, state.immediate_index, 0);
+                    size_t nxt = take_next_index(&state, count, state.immediate_index, 0);
                     announce_fetch_failure(&state, library, state.immediate_index, 1);
                     request_play(library, &state, nxt);
                 } else {
@@ -2294,22 +2368,21 @@ int main(int argc, char **argv) {
         if (state.autoplay && !state.repeat_one && !state.immediate_pending && !state.pending_valid &&
             state.audio_device && state.duration_ms > 0 && state.is_playing) {
             size_t count = library_handler_track_count(library);
-            if (count > 0) {
-                size_t next = next_autoplay_index(&state, count, state.selected_track, 0);
-                Uint32 p = playback_ms(&state);
-                Uint32 trigger = state.duration_ms > 30000 ? state.duration_ms - 20000 : state.duration_ms / 2;
-                if (p >= trigger && !state.pending_valid) {
-                    fetch_lock(&state);
-                    int already = state.fetch_active && state.fetch_index == next && !state.fetch_ready;
-                    int cached = state.fetch_ready && state.fetch_index == next;
-                    fetch_unlock(&state);
-                    if (!already && !cached) {
-                        state.pending_valid = 1;
-                        state.pending_index = next;
-                        state.autoplay_advancing = 1;
-                        start_fetch(library, &state, next);
-                    }
-                }
+            Uint32 p = playback_ms(&state);
+            Uint32 trigger = state.duration_ms > 30000 ? state.duration_ms - 20000 : state.duration_ms / 2;
+            /* take_next_index() pops the queue, so only call it once we have
+             * actually decided to prefetch -- not every frame. */
+            if (count > 0 && p >= trigger) {
+                size_t next = take_next_index(&state, count, state.selected_track, 0);
+                fetch_lock(&state);
+                int already = state.fetch_active && state.fetch_index == next && !state.fetch_ready;
+                int cached = state.fetch_ready && state.fetch_index == next;
+                fetch_unlock(&state);
+                state.pending_valid = 1;
+                state.pending_index = next;
+                state.autoplay_advancing = 1;
+                if (!already && !cached)
+                    start_fetch(library, &state, next);
             }
         }
 
@@ -2330,7 +2403,7 @@ int main(int argc, char **argv) {
                 announce_fetch_failure(&state, library, idx, 1);
                 state.pending_valid = 0;
                 if (count > 1) {
-                    size_t nxt = next_autoplay_index(&state, count, idx, 0);
+                    size_t nxt = take_next_index(&state, count, idx, 0);
                     request_play(library, &state, nxt);
                 }
             }
@@ -2390,7 +2463,7 @@ int main(int argc, char **argv) {
                         else if (!active) start_fetch(library, &state, idx);
                     } else if (state.autoplay) {
                         size_t count = library_handler_track_count(library);
-                        size_t next = count ? next_autoplay_index(&state, count, state.selected_track, 1)
+                        size_t next = count ? take_next_index(&state, count, state.selected_track, 1)
                                             : state.selected_track;
                         state.pending_valid = 1;
                         state.pending_index = next;

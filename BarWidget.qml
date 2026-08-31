@@ -118,7 +118,29 @@ BarWidget {
     property int pendingCommandId: -1
     property bool commandAcked: true
     property var tracks: []
+    property var queue: []
     property string librarySearch: ""
+
+    /* 1-based position of a library index in the play queue, or 0 if absent. */
+    function queuePosition(index) {
+        for (var i = 0; i < root.queue.length; i++)
+            if (root.queue[i] === index)
+                return i + 1;
+        return 0;
+    }
+
+    /* The queued track titles, in order, for the "Up next" strip. */
+    readonly property string queueSummary: {
+        var out = [];
+        for (var i = 0; i < root.queue.length; i++) {
+            var qi = root.queue[i];
+            var name = "#" + (qi + 1);
+            for (var j = 0; j < root.tracks.length; j++)
+                if (root.tracks[j].index === qi) { name = root.tracks[j].title; break; }
+            out.push(name);
+        }
+        return out.join("  ·  ");
+    }
 
     /* Client-side library filter: case-insensitive substring over
      * title/artist/album. Each entry keeps its original `index` so playback,
@@ -281,6 +303,15 @@ BarWidget {
     function toggleMute() {
         root.muted = !root.muted;
         root.sendControl(root.muted ? "mute on" : "mute off");
+    }
+    function queueTrack(i) {
+        root.sendControl("queue " + i);
+    }
+    function unqueueTrack(i) {
+        root.sendControl("unqueue " + i);
+    }
+    function clearQueue() {
+        root.sendControl("queue_clear");
     }
     function startEdit(i) {
         for (var k = 0; k < root.tracks.length; k++) {
@@ -514,6 +545,7 @@ BarWidget {
         }
         root.statusText = data.status ? String(data.status) : "";
         root.hasTrack = root.title !== "";
+        root.queue = Array.isArray(data.queue) ? data.queue : [];
         root.coverSource = data.cover ? String(data.cover) : "";
         root.selectedTrackIndex = idx;
         if (isPlayingNow && root.pendingPlayIndex >= 0 && idx === root.pendingPlayIndex) {
@@ -1022,6 +1054,48 @@ BarWidget {
                         onTextChanged: root.librarySearch = text
                     }
 
+                    Item {
+                        width: parent.width
+                        visible: root.queue.length > 0
+                        implicitHeight: visible ? clearQueueBtn.height : 0
+
+                        Text {
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "Up next (" + root.queue.length + ")"
+                            color: Color.accent
+                            font.family: root.bar.fontFamily
+                            font.pixelSize: Style.font.caption
+                            font.bold: true
+                        }
+                        Button {
+                            id: clearQueueBtn
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "Clear"
+                            height: Style.space(26)
+                            iconSize: Style.font.caption
+                            foreground: root.bar.foreground
+                            verticalPadding: 0
+                            horizontalPadding: Style.spacing.controlPaddingX
+                            borderSpec: root.transportButtonBorder
+                            onClicked: root.clearQueue()
+                        }
+                    }
+
+                    Text {
+                        width: parent.width
+                        visible: root.queue.length > 0
+                        text: root.queueSummary
+                        textFormat: Text.PlainText
+                        color: Qt.darker(root.bar.foreground, 1.3)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.caption
+                        wrapMode: Text.WordWrap
+                        maximumLineCount: 2
+                        elide: Text.ElideRight
+                    }
+
                     ListView {
                         id: trackList
                         width: parent.width
@@ -1107,11 +1181,13 @@ BarWidget {
                                 z: 2
 
                                 Text {
+                                    readonly property int queuePos: root.queuePosition(modelData.index)
                                     width: Style.space(24)
-                                    text: String(modelData.index + 1)
-                                    color: Qt.darker(root.bar.foreground, 1.6)
+                                    text: queuePos > 0 ? "▸" + queuePos : String(modelData.index + 1)
+                                    color: queuePos > 0 ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
                                     font.family: root.bar.fontFamily
                                     font.pixelSize: Style.font.caption
+                                    font.bold: queuePos > 0
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
                                 Column {
@@ -1529,6 +1605,25 @@ BarWidget {
                             verticalPadding: 0
                             horizontalPadding: Style.spacing.controlPaddingX
                             onClicked: root.playIndex(root.actionsIndex)
+                        }
+                        Button {
+                            readonly property bool queued: root.queuePosition(root.actionsIndex) > 0
+                            text: queued ? "Unqueue" : "Add to queue"
+                            iconText: "\uf0cb"
+                            width: parent.width
+                            height: Style.space(32)
+                            iconSize: Style.font.icon
+                            foreground: queued ? Color.accent : root.bar.foreground
+                            verticalPadding: 0
+                            horizontalPadding: Style.spacing.controlPaddingX
+                            onClicked: {
+                                var idx = root.actionsIndex;
+                                root.actionsIndex = -1;
+                                if (queued)
+                                    root.unqueueTrack(idx);
+                                else
+                                    root.queueTrack(idx);
+                            }
                         }
                         Button {
                             text: "Edit info"
