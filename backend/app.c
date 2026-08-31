@@ -2487,6 +2487,15 @@ static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
                 if (end != line && *end == ' ') cmd = end + 1;
                 else id = 0;
             }
+            /* A client that didn't see the ack in time re-writes the same line
+             * (same id). Echo it again but don't run the command twice -- a
+             * resent `play_pause` would otherwise cancel itself out. */
+            if (id != 0 && id == state->last_cmd_id) {
+                fclose(file);
+                unlink(control_file);
+                write_status(state);
+                return;
+            }
             if (id != 0) state->last_cmd_id = id;
             /* set_fields, add_ssh, add_network, and add_https carry encoded
              * fields that must be split on the still-encoded line (values may
