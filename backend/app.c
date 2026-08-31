@@ -1532,6 +1532,18 @@ static void request_play(const LibraryHandler *library, AppState *s, size_t inde
     s->pending_valid = 0;
     s->immediate_pending = 1;
     s->immediate_index = index;
+    /* Immediate feedback: a remote (HTTPS/SSH) source can take seconds to
+     * start, so without this a skip / track click looks like it did nothing. */
+    {
+        LibraryTrack t = {0};
+        char e[128];
+        if (library_handler_track_at(library, index, &t, e, sizeof(e)) == 1 && t.title && t.title[0])
+            snprintf(s->status, sizeof(s->status), "Loading %.180s...", t.title);
+        else
+            snprintf(s->status, sizeof(s->status), "Loading track %zu...", index + 1);
+        library_handler_track_destroy(&t);
+        write_status(s);
+    }
     fetch_lock(s);
     int ready = s->fetch_ready && s->fetch_index == index;
     int active = s->fetch_active && s->fetch_index == index;
