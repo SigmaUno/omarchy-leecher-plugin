@@ -93,6 +93,8 @@ BarWidget {
     property bool autoplay: true
     property bool shuffle: false
     property bool repeatOne: false
+    property int volume: 100
+    property bool muted: false
     property string coverSource: ""
     property int coverVersion: 0
 
@@ -253,6 +255,15 @@ BarWidget {
     function toggleRepeatOne() {
         root.repeatOne = !root.repeatOne;
         root.sendControl(root.repeatOne ? "repeat one" : "repeat off");
+    }
+    function setVolume(v) {
+        var clamped = Math.max(0, Math.min(100, Math.round(v)));
+        root.volume = clamped;
+        root.sendControl("volume " + clamped);
+    }
+    function toggleMute() {
+        root.muted = !root.muted;
+        root.sendControl(root.muted ? "mute on" : "mute off");
     }
     function startEdit(i) {
         for (var k = 0; k < root.tracks.length; k++) {
@@ -474,6 +485,9 @@ BarWidget {
             root.autoplay = data.autoplay !== false;
             root.shuffle = data.shuffle === true;
             root.repeatOne = data.repeat_one === true;
+            root.muted = data.muted === true;
+            if (typeof data.volume === "number" && !volSlider.dragging)
+                root.volume = data.volume;
         }
         root.statusText = data.status ? String(data.status) : "";
         root.hasTrack = root.title !== "";
@@ -518,6 +532,16 @@ BarWidget {
         running: !root.closed
         repeat: true
         onTriggered: root.clampPosition()
+    }
+
+    /* Coalesce the flood of slider `moved` signals during a volume drag into
+     * about eight control writes a second so the backend is not re-queuing
+     * audio on every pixel. */
+    Timer {
+        id: volApply
+        interval: 120
+        repeat: false
+        onTriggered: root.setVolume(root.volume)
     }
 
     /* Watch status.json with an in-process file watcher instead of re-spawning
@@ -878,6 +902,63 @@ BarWidget {
                     verticalPadding: 0
                     tooltipText: root.repeatOne ? "Repeat one (turns off)" : "Repeat off (repeats current track)"
                     onClicked: root.toggleRepeatOne()
+                }
+            }
+
+            Row {
+                width: parent.width
+                spacing: Style.space(8)
+
+                Button {
+                    iconText: (root.muted || root.volume === 0) ? "\uf026"
+                        : (root.volume < 50 ? "\uf027" : "\uf028")
+                    foreground: root.muted ? Qt.darker(root.bar.foreground, 1.8) : root.bar.foreground
+                    width: Style.space(36)
+                    height: Style.space(36)
+                    iconSize: Style.font.icon
+                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
+                    borderSpec: root.transportButtonBorder
+                    horizontalPadding: Style.spacing.controlPaddingX
+                    verticalPadding: 0
+                    tooltipText: root.muted ? "Muted (click to unmute)" : "Mute"
+                    onClicked: root.toggleMute()
+                }
+
+                PanelSlider {
+                    id: volSlider
+                    width: parent.width - Style.space(36) - Style.space(40) - Style.space(16)
+                    height: root.barSize
+                    bar: root.bar
+                    anchors.verticalCenter: parent.verticalCenter
+                    minimum: 0
+                    maximum: 100
+                    step: 1
+                    value: root.volume
+                    enabled: !root.muted
+                    trackHeight: Math.max(Style.space(6), Math.round(Style.spacing.controlHeight * 0.18))
+                    knobSize: Math.max(Style.space(18), Math.round(Style.spacing.controlHeight * 0.48))
+                    trackColor: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.28)
+                    fillColor: Color.accent
+                    knobColor: root.bar.foreground
+                    onMoved: function (v) {
+                        root.volume = Math.round(v);
+                        volApply.restart();
+                    }
+                    onReleased: function (v) {
+                        volApply.stop();
+                        root.setVolume(v);
+                    }
+                }
+
+                Text {
+                    text: (root.muted ? 0 : root.volume) + "%"
+                    color: Qt.darker(root.bar.foreground, 1.3)
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    width: Style.space(40)
+                    horizontalAlignment: Text.AlignRight
+                    verticalAlignment: Text.AlignVCenter
+                    anchors.verticalCenter: parent.verticalCenter
                 }
             }
 

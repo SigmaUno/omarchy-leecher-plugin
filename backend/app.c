@@ -74,6 +74,8 @@ typedef struct {
     int autoplay;
     int shuffle;      /* autoplay/next picks a random track instead of the next */
     int repeat_one;   /* autoplay replays the current track instead of advancing */
+    int volume;       /* software output gain, 0..100 */
+    int muted;        /* force silence without losing the volume setting */
     MusicRipperTransports transports;
     pthread_mutex_t fetch_mutex;
     volatile int fetch_cancel;
@@ -259,13 +261,14 @@ static void write_status(const AppState *state) {
     n = snprintf(tmp, sizeof(tmp),
                  "{\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
                  "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s,"
-                 "\"shuffle\":%s,\"repeat_one\":%s,\"cover\":\"%s\","
+                 "\"shuffle\":%s,\"repeat_one\":%s,\"volume\":%d,\"muted\":%s,\"cover\":\"%s\","
                  "\"status\":\"%s\",\"cmd_id\":%lu}\n",
                  title ? title : "", artist ? artist : "", album ? album : "",
                  state->position_ms, state->duration_ms,
                  state->is_playing ? "true" : "false", state->selected_track,
                  library ? library : "", state->autoplay ? "true" : "false",
                  state->shuffle ? "true" : "false", state->repeat_one ? "true" : "false",
+                 state->volume, state->muted ? "true" : "false",
                  cover ? cover : "",
                  status ? status : "", state->last_cmd_id);
     free(title); free(artist); free(album); free(library); free(cover); free(status);
@@ -1452,12 +1455,36 @@ static void stream_audio(AppState *s) {
         if (chunk_limit > STREAM_QUEUE_FRAMES) chunk_limit = STREAM_QUEUE_FRAMES;
         long long got = decoder_read_frames(s->decoder, buf, chunk_limit);
         if (got <= 0) { s->stream_eof = 1; break; }
+        /* Software gain: the OS mixer is not a given on every target desktop,
+         * so scale the PCM here. Attenuation only (0..100), so no clipping. */
+        {
+            int gain = s->muted ? 0 : s->volume;
+            if (gain != 100) {
+                long long n = got * channels, i;
+                for (i = 0; i < n; i++) buf[i] = (short)((int)buf[i] * gain / 100);
+            }
+        }
         if (SDL_QueueAudio(s->audio_device, buf, (Uint32)((size_t)got * (size_t)channels * sizeof(short))) != 0) {
             s->stream_eof = 1;
             break;
         }
         s->audio_queued_frame += (Uint64)got;
     }
+}
+
+/* Volume/mute changes only affect PCM queued after them, so already-buffered
+ * audio (up to ~0.75s) would keep playing at the old level. Drop the queue and
+ * re-decode from the current play position so the change is heard at once. */
+static void reapply_output_gain(AppState *s) {
+    if (!s->audio_device || !s->decoder || !s->stream_open || s->audio_channels <= 0) return;
+    Uint32 queued = SDL_GetQueuedAudioSize(s->audio_device);
+    Uint64 fiq = queued / ((Uint32)s->audio_channels * 2u);
+    Uint64 frame = (s->audio_queued_frame > fiq) ? s->audio_queued_frame - fiq : 0;
+    if (decoder_seek(s->decoder, (long long)frame) < 0) return;
+    SDL_ClearQueuedAudio(s->audio_device);
+    s->audio_queued_frame = frame;
+    s->stream_eof = 0;
+    stream_audio(s);
 }
 
 static void seek_ms(AppState *s, Uint32 ms) {
@@ -1807,6 +1834,21 @@ static void handle_control(const char *command, LibraryHandler **library, MusicR
         snprintf(state->status, sizeof(state->status), state->repeat_one ? "Repeat one." : "Repeat off.");
         write_status(state);
     }
+    else if (!strncmp(command, "volume ", 7)) {
+        long v = strtol(command + 7, NULL, 10);
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        state->volume = (int)v;
+        reapply_output_gain(state);
+        snprintf(state->status, sizeof(state->status), "Volume %d%%.", state->volume);
+        write_status(state);
+    }
+    else if (!strncmp(command, "mute ", 5)) {
+        state->muted = (strncmp(command + 5, "on", 2) == 0) ? 1 : 0;
+        reapply_output_gain(state);
+        snprintf(state->status, sizeof(state->status), state->muted ? "Muted." : "Unmuted.");
+        write_status(state);
+    }
     else if (!strncmp(command, "set_title ", 10)) handle_set_field(library, ripper, library_path, state, "set_title ", "title", command);
     else if (!strncmp(command, "set_artist ", 11)) handle_set_field(library, ripper, library_path, state, "set_artist ", "artist", command);
     else if (!strncmp(command, "set_album ", 10)) handle_set_field(library, ripper, library_path, state, "set_album ", "album", command);
@@ -2154,6 +2196,7 @@ int main(int argc, char **argv) {
     AppState state = {0};
     state.method = SOURCE_LOCAL;
     state.autoplay = 1;
+    state.volume = 100;
     srand((unsigned)(time(NULL) ^ ((long)getpid() << 8)));  /* shuffle next-track picks */
     state.fetch_index = (size_t)-1;
     state.immediate_index = (size_t)-1;
