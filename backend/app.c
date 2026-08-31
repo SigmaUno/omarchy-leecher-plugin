@@ -72,6 +72,8 @@ typedef struct {
     char library_path[512];
     char cover_file[512];
     int autoplay;
+    int shuffle;      /* autoplay/next picks a random track instead of the next */
+    int repeat_one;   /* autoplay replays the current track instead of advancing */
     MusicRipperTransports transports;
     pthread_mutex_t fetch_mutex;
     volatile int fetch_cancel;
@@ -256,12 +258,14 @@ static void write_status(const AppState *state) {
     int n;
     n = snprintf(tmp, sizeof(tmp),
                  "{\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
-                 "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s,\"cover\":\"%s\","
+                 "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s,"
+                 "\"shuffle\":%s,\"repeat_one\":%s,\"cover\":\"%s\","
                  "\"status\":\"%s\",\"cmd_id\":%lu}\n",
                  title ? title : "", artist ? artist : "", album ? album : "",
                  state->position_ms, state->duration_ms,
                  state->is_playing ? "true" : "false", state->selected_track,
                  library ? library : "", state->autoplay ? "true" : "false",
+                 state->shuffle ? "true" : "false", state->repeat_one ? "true" : "false",
                  cover ? cover : "",
                  status ? status : "", state->last_cmd_id);
     free(title); free(artist); free(album); free(library); free(cover); free(status);
@@ -1383,9 +1387,29 @@ static void play_library_index(const LibraryHandler *library, AppState *state, s
     request_play(library, state, index);
 }
 
+/* The track autoplay moves to from `from`. repeat-one stays put (only when
+ * `allow_repeat`, so a skip past a broken source still advances); shuffle picks
+ * a random other track; otherwise the next in library order. count > 0. */
+static size_t next_autoplay_index(const AppState *s, size_t count, size_t from, int allow_repeat) {
+    if (count <= 1) return from;
+    if (allow_repeat && s->repeat_one) return from;
+    if (s->shuffle) {
+        size_t r;
+        do { r = (size_t)rand() % count; } while (r == from);
+        return r;
+    }
+    return (from + 1) % count;
+}
+
 static void play_library_relative(const LibraryHandler *library, AppState *state, long delta) {
     size_t count = library ? library_handler_track_count(library) : 0;
     if (count == 0) { snprintf(state->status, sizeof(state->status), "Library is empty."); return; }
+    /* The forward button honours shuffle; back is always linear. */
+    if (delta > 0 && state->shuffle && count > 1) {
+        state->autoplay_advancing = 0;
+        request_play(library, state, next_autoplay_index(state, count, state->selected_track, 0));
+        return;
+    }
     long cur = (long)state->selected_track;
     long nxt = (cur + delta) % (long)count;
     if (nxt < 0) nxt += (long)count;
@@ -1771,6 +1795,16 @@ static void handle_control(const char *command, LibraryHandler **library, MusicR
     else if (!strncmp(command, "autoplay ", 9)) {
         state->autoplay = (strncmp(command + 9, "off", 3) == 0) ? 0 : 1;
         snprintf(state->status, sizeof(state->status), state->autoplay ? "Autoplay enabled." : "Autoplay disabled.");
+        write_status(state);
+    }
+    else if (!strncmp(command, "shuffle ", 8)) {
+        state->shuffle = (strncmp(command + 8, "off", 3) == 0) ? 0 : 1;
+        snprintf(state->status, sizeof(state->status), state->shuffle ? "Shuffle on." : "Shuffle off.");
+        write_status(state);
+    }
+    else if (!strncmp(command, "repeat ", 7)) {
+        state->repeat_one = (strncmp(command + 7, "one", 3) == 0) ? 1 : 0;
+        snprintf(state->status, sizeof(state->status), state->repeat_one ? "Repeat one." : "Repeat off.");
         write_status(state);
     }
     else if (!strncmp(command, "set_title ", 10)) handle_set_field(library, ripper, library_path, state, "set_title ", "title", command);
