@@ -416,6 +416,47 @@ static void test_valid_playlist_name(void) {
         long_name[64] = 'x';
         CHECK(!valid_playlist_name(long_name));   /* 65 */
     }
+    /* staging list names never pass -- users can't hand-create one */
+    CHECK(!valid_playlist_name("INCOMING >> home <<"));
+}
+
+static void test_incoming_names(void) {
+    char name[LIBRARY_NAME_MAX], target[LIBRARY_NAME_MAX];
+
+    incoming_name_for("home", name, sizeof(name));
+    CHECK_STR(name, "INCOMING >> home <<");
+    incoming_name_for("Road Trip", name, sizeof(name));
+    CHECK_STR(name, "INCOMING >> Road Trip <<");
+
+    CHECK(incoming_target_of("INCOMING >> home <<", target, sizeof(target)) == 1);
+    CHECK_STR(target, "home");
+    CHECK(incoming_target_of("INCOMING >> Road Trip <<", target, sizeof(target)) == 1);
+    CHECK_STR(target, "Road Trip");
+    CHECK(is_incoming_name("INCOMING >> x <<"));
+
+    CHECK(incoming_target_of("home", NULL, 0) == 0);
+    CHECK(incoming_target_of("INCOMING >> ", NULL, 0) == 0);       /* no suffix */
+    CHECK(incoming_target_of("INCOMING >>  <<", NULL, 0) == 0);    /* empty target */
+    CHECK(incoming_target_of("prefix INCOMING >> x <<", NULL, 0) == 0);
+    CHECK(!is_incoming_name("*"));
+}
+
+static void test_playlist_rank_order(void) {
+    /* qsort with playlist_cmp: home, regulars (alpha), staging, "*" */
+    char list[6][LIBRARY_NAME_MAX];
+    snprintf(list[0], sizeof(list[0]), "%s", "*");
+    snprintf(list[1], sizeof(list[1]), "%s", "INCOMING >> home <<");
+    snprintf(list[2], sizeof(list[2]), "%s", "zeppelin");
+    snprintf(list[3], sizeof(list[3]), "%s", "home");
+    snprintf(list[4], sizeof(list[4]), "%s", "Ambient");
+    snprintf(list[5], sizeof(list[5]), "%s", "INCOMING >> Ambient <<");
+    qsort(list, 6, sizeof(list[0]), playlist_cmp);
+    CHECK_STR(list[0], "home");
+    CHECK_STR(list[1], "Ambient");
+    CHECK_STR(list[2], "zeppelin");
+    CHECK_STR(list[3], "INCOMING >> Ambient <<");
+    CHECK_STR(list[4], "INCOMING >> home <<");
+    CHECK_STR(list[5], "*");
 }
 
 static void test_scan_and_known_playlists(void) {
@@ -661,6 +702,8 @@ int main(void) {
         { "valid_playlist_name", test_valid_playlist_name },
         { "scan_known_playlists", test_scan_and_known_playlists },
         { "source_key",          test_source_key },
+        { "incoming_names",      test_incoming_names },
+        { "playlist_rank_order", test_playlist_rank_order },
         { "rebuild_star_playlist", test_rebuild_star_playlist },
         { "resolve_library_dir", test_resolve_library_dir_migrates },
     };

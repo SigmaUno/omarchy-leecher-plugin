@@ -137,6 +137,24 @@ BarWidget {
      * over: only then do the "now playing" row and the queue strip apply. */
     readonly property bool viewingPlayingList: root.viewedPlaylist === root.playingPlaylist
 
+    /* A directory scan stages its finds in "INCOMING >> <target> <<" for review.
+     * incomingTarget is that <target> when such a playlist is being viewed. */
+    readonly property string incomingPrefix: "INCOMING >> "
+    readonly property string incomingSuffix: " <<"
+    function incomingTargetOf(name) {
+        var s = String(name || "");
+        if (s.length > root.incomingPrefix.length + root.incomingSuffix.length &&
+            s.indexOf(root.incomingPrefix) === 0 &&
+            s.lastIndexOf(root.incomingSuffix) === s.length - root.incomingSuffix.length)
+            return s.slice(root.incomingPrefix.length, s.length - root.incomingSuffix.length);
+        return "";
+    }
+    readonly property string incomingTarget: root.incomingTargetOf(root.viewedPlaylist)
+    readonly property bool viewingIncoming: root.incomingTarget !== ""
+    readonly property color incomingColor: Qt.rgba(0.85, 0.53, 0.15, 1)
+    property bool scanning: false
+    property int scanCount: 0
+
     /* Linear interpolation between two colors, t in [0,1]. */
     function blend(a, b, t) {
         return Qt.rgba(a.r + (b.r - a.r) * t,
@@ -191,6 +209,9 @@ BarWidget {
     property string addUser: ""
     property string addHost: ""
     property string addUrl: ""
+    /* "Scan directory for all music files": the path is treated as a folder and
+     * every audio file in it is staged for review instead of added directly. */
+    property bool addScan: false
     property string editTitle: ""
     property string editArtist: ""
     property string editAlbum: ""
@@ -460,6 +481,16 @@ BarWidget {
         root.editVisible = false;
         root.loadLibrary();
     }
+    /* The playlist a scan should stage into: the one being viewed, or, if
+     * that is itself a staging list, its underlying target. Falls back to
+     * "home" when viewing "*" or nothing. */
+    function scanTargetPlaylist() {
+        if (root.viewingIncoming)
+            return root.incomingTarget;
+        if (root.viewedPlaylist !== "" && root.viewedPlaylist !== "*")
+            return root.viewedPlaylist;
+        return "home";
+    }
     function addLocalTrack(path) {
         var trimmed = path.trim();
         if (trimmed === "") {
@@ -469,7 +500,10 @@ BarWidget {
         /* sendControl() encodes the complete line before it reaches the
          * backend, so spaces and special characters in a local path remain a
          * single safe command argument. */
-        root.sendControl("add_local " + trimmed);
+        if (root.addScan)
+            root.sendControlRaw("scan_local " + enc(root.scanTargetPlaylist()) + " " + enc(trimmed));
+        else
+            root.sendControl("add_local " + trimmed);
         root.addPath = "";
         root.addVisible = false;
     }
@@ -487,8 +521,26 @@ BarWidget {
                 : "Enter the network user, host/IP, and path first.";
             return;
         }
-        root.sendControlRaw("add_" + root.addType + " " + enc(u) + " " + enc(h) + " " + enc(p));
+        if (root.addScan)
+            root.sendControlRaw("scan_" + root.addType + " " + enc(root.scanTargetPlaylist()) +
+                                " " + enc(u) + " " + enc(h) + " " + enc(p));
+        else
+            root.sendControlRaw("add_" + root.addType + " " + enc(u) + " " + enc(h) + " " + enc(p));
         root.closeAddForm();
+    }
+    /* Move (accept) or discard (decline) staged tracks. `indices` is an array of
+     * library indices in the "INCOMING >> ... <<" list currently being viewed. */
+    function acceptIncoming(indices) {
+        if (indices.length > 0)
+            root.sendControl("accept_incoming " + indices.join(" "));
+    }
+    function declineIncoming(indices) {
+        if (indices.length > 0)
+            root.sendControl("decline_incoming " + indices.join(" "));
+    }
+    /* Indices of every row currently shown (after any filter), for shift-click. */
+    function shownIncomingIndices() {
+        return root.filteredTracks.map(function (t) { return t.index; });
     }
     function addHttpsTrack(url) {
         var trimmed = url.trim();
@@ -516,6 +568,7 @@ BarWidget {
         root.addUser = "";
         root.addHost = "";
         root.addUrl = "";
+        root.addScan = false;
         root.addVisible = false;
     }
     /* file:// URLs delivered by a drag-and-drop carry percent-encoded path
@@ -682,6 +735,8 @@ BarWidget {
         root.playlists = Array.isArray(data.playlists) ? data.playlists : [];
         root.viewedPlaylist = typeof data.viewed_playlist === "string" ? data.viewed_playlist : "";
         root.playingPlaylist = typeof data.playing_playlist === "string" ? data.playing_playlist : "";
+        root.scanning = data.scanning === true;
+        root.scanCount = typeof data.scan_count === "number" ? data.scan_count : 0;
         if (data.library) {
             var newLib = String(data.library);
             if (newLib !== root.libraryPath) {
@@ -1379,15 +1434,21 @@ BarWidget {
                                         readonly property string pname: String(modelData)
                                         readonly property bool isViewed: pname === root.viewedPlaylist
                                         readonly property bool isPlaying: pname === root.playingPlaylist
+                                        readonly property bool isIncoming: root.incomingTargetOf(pname) !== ""
+                                        /* A staging list is always drawn in orange -- accent when
+                                         * viewed, dimmer when not -- so it stands out as pending. */
+                                        readonly property color tabTint: isIncoming ? root.incomingColor : Color.accent
 
                                         height: playlistRow.height
                                         width: ptabText.implicitWidth + Style.space(14)
                                         radius: 0
                                         color: isViewed
-                                            ? Color.accent
-                                            : (isPlaying
-                                                ? root.blend(Color.accent, Color.popups.background, 0.5)
-                                                : "transparent")
+                                            ? tabTint
+                                            : (isIncoming
+                                                ? root.blend(tabTint, Color.popups.background, 0.35)
+                                                : (isPlaying
+                                                    ? root.blend(tabTint, Color.popups.background, 0.5)
+                                                    : "transparent"))
 
                                         Text {
                                             id: ptabText
@@ -1398,12 +1459,12 @@ BarWidget {
                                              * foreground reads as secondary. A filled tab is on
                                              * the accent (or half-accent) fill, so switch to the
                                              * popup's own dark colour for contrast against it. */
-                                            color: (ptab.isViewed || ptab.isPlaying)
+                                            color: (ptab.isViewed || ptab.isPlaying || ptab.isIncoming)
                                                 ? Color.popups.background
                                                 : Qt.darker(root.bar.foreground, 1.6)
                                             font.family: root.bar.fontFamily
                                             font.pixelSize: Style.font.caption
-                                            font.bold: ptab.isViewed || ptab.isPlaying
+                                            font.bold: ptab.isViewed || ptab.isPlaying || ptab.isIncoming
                                         }
                                         MouseArea {
                                             anchors.fill: parent
@@ -1635,6 +1696,16 @@ BarWidget {
                         elide: Text.ElideRight
                     }
 
+                    Text {
+                        width: parent.width
+                        visible: root.viewingIncoming && !root.editVisible
+                        text: "Shift-click to accept/decline all in search"
+                        color: Qt.darker(root.bar.foreground, 1.7)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.italic: true
+                    }
+
                     ListView {
                         id: trackList
                         width: parent.width
@@ -1734,6 +1805,7 @@ BarWidget {
                                     anchors.verticalCenter: parent.verticalCenter
                                     spacing: Style.space(1)
                                     width: parent.width - Style.space(24) - Style.space(24) - Style.space(16)
+                                        - (root.viewingIncoming ? Style.space(48) : 0)
                                     Text {
                                         text: modelData.title
                                         textFormat: Text.PlainText
@@ -1780,6 +1852,53 @@ BarWidget {
                                     }
                                 }
 
+                                /* Staging-list rows get accept (green tick) and
+                                 * decline (red cross). Shift-click applies to
+                                 * every row currently shown (after any filter). */
+                                Item {
+                                    width: Style.space(24)
+                                    height: parent.height
+                                    visible: root.viewingIncoming
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "\uf00c"
+                                        color: Qt.rgba(0.35, 0.75, 0.4, 1)
+                                        font.family: root.bar.fontFamily
+                                        font.pixelSize: Style.font.bodySmall
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        z: 3
+                                        onClicked: (mouse) => {
+                                            if (mouse.modifiers & Qt.ShiftModifier)
+                                                root.acceptIncoming(root.shownIncomingIndices());
+                                            else
+                                                root.acceptIncoming([modelData.index]);
+                                        }
+                                    }
+                                }
+                                Item {
+                                    width: Style.space(24)
+                                    height: parent.height
+                                    visible: root.viewingIncoming
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "\uf00d"
+                                        color: Qt.rgba(0.85, 0.35, 0.35, 1)
+                                        font.family: root.bar.fontFamily
+                                        font.pixelSize: Style.font.bodySmall
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        z: 3
+                                        onClicked: (mouse) => {
+                                            if (mouse.modifiers & Qt.ShiftModifier)
+                                                root.declineIncoming(root.shownIncomingIndices());
+                                            else
+                                                root.declineIncoming([modelData.index]);
+                                        }
+                                    }
+                                }
                                 Item {
                                     width: Style.space(24)
                                     height: parent.height
@@ -1813,6 +1932,7 @@ BarWidget {
                             MouseArea {
                                 anchors.fill: parent
                                 z: 1
+                                enabled: !root.viewingIncoming
                                 onClicked: root.playFromRow(modelData.index)
                             }
                         }
@@ -1887,13 +2007,56 @@ BarWidget {
                                 }
                             }
 
+                            /* "Scan directory for all music files" -- when on, the
+                             * path is a folder and every file in it is staged in an
+                             * "INCOMING >> <playlist> <<" list for review. */
+                            Item {
+                                id: scanCheckRow
+                                width: parent.width
+                                visible: root.addType !== "https"
+                                implicitHeight: Style.space(18)
+
+                                Rectangle {
+                                    id: scanBox
+                                    width: Style.space(16)
+                                    height: Style.space(16)
+                                    anchors.left: parent.left
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    radius: 0
+                                    color: root.addScan ? Color.accent : "transparent"
+                                    border.width: Math.max(1, Style.space(1))
+                                    border.color: root.addScan ? Color.accent : Qt.darker(root.bar.foreground, 1.4)
+                                    Text {
+                                        anchors.centerIn: parent
+                                        visible: root.addScan
+                                        text: "\uf00c"
+                                        color: Color.popups.background
+                                        font.family: root.bar.fontFamily
+                                        font.pixelSize: Style.font.caption
+                                    }
+                                }
+                                Text {
+                                    anchors.left: scanBox.right
+                                    anchors.leftMargin: Style.space(6)
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: "Scan directory for all music files"
+                                    color: root.bar.foreground
+                                    font.family: root.bar.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: root.addScan = !root.addScan
+                                }
+                            }
+
                             Column {
                                 width: parent.width
                                 spacing: Style.space(4)
                                 visible: root.addType === "local"
 
                                 Text {
-                                    text: "Path on this machine"
+                                    text: root.addScan ? "Folder on this machine" : "Path on this machine"
                                     color: root.bar.foreground
                                     font.family: root.bar.fontFamily
                                     font.pixelSize: Style.font.bodySmall
@@ -1903,7 +2066,7 @@ BarWidget {
                                     id: addLocalField
                                     width: parent.width
                                     text: root.addPath
-                                    placeholderText: "/home/me/Music/song.flac"
+                                    placeholderText: root.addScan ? "/home/me/Music" : "/home/me/Music/song.flac"
                                     foreground: root.bar.foreground
                                     onAccepted: {
                                         root.addPath = text;
@@ -1990,11 +2153,14 @@ BarWidget {
                             }
 
                             Text {
-                                text: root.addType === "local"
-                                    ? "Metadata is read from the file; missing tags use the file name."
-                                    : (root.addType === "https"
-                                        ? "The URL is streamed with curl; tags are read with ffprobe when possible."
-                                        : "The file is streamed over SSH; tags are read from the remote host when possible.")
+                                text: root.addScan
+                                    ? ("Every audio file in the folder is staged in \"INCOMING >> " +
+                                       root.scanTargetPlaylist() + " <<\" for you to accept or decline.")
+                                    : (root.addType === "local"
+                                        ? "Metadata is read from the file; missing tags use the file name."
+                                        : (root.addType === "https"
+                                            ? "The URL is streamed with curl; tags are read with ffprobe when possible."
+                                            : "The file is streamed over SSH; tags are read from the remote host when possible."))
                                 width: parent.width
                                 wrapMode: Text.WordWrap
                                 color: Qt.darker(root.bar.foreground, 1.5)
@@ -2061,6 +2227,7 @@ BarWidget {
                         Button {
                             text: "Play"
                             iconText: "\uf04b"
+                            visible: !root.viewingIncoming
                             width: parent.width
                             height: Style.space(32)
                             iconSize: Style.font.icon

@@ -377,6 +377,52 @@ send "play 2"
 wait_for '.playing_playlist == "home" and .track_index == 2' \
     "playing a home track switches playback back to home"
 
+# ---- directory scan -> INCOMING staging list -------------------------------
+mkdir -p "$work/scan/sub"                          # a subdir the scan must ignore
+: > "$work/scan/notes.txt"                         # a non-audio file to ignore
+python3 - "$work/scan" <<'PY'
+import sys, wave
+d = sys.argv[1]
+frames = b"\x00\x00" * (8000 * 3)
+for name in ("Zeta", "Eta", "Theta"):
+    with wave.open(f"{d}/{name}.wav", "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+        w.writeframes(frames)
+PY
+send "scan_local roadtrip $work/scan"
+poll_state '.scanning == true or (.status | test("Scan"))' 30 >/dev/null
+poll_state '.scanning == false and .viewed_playlist == "INCOMING >> roadtrip <<"' 100 \
+    && pass "scan stages into INCOMING >> roadtrip <<" \
+    || { fail "scan stages into INCOMING >> roadtrip <<"; jq '{scanning,scan_count,viewed_playlist,playlists,status}' "$D/status.json"; }
+inc="$libdir/INCOMING >> roadtrip <<.json"
+[ "$(jq '.tracks | length' "$inc" 2>/dev/null)" = "3" ] \
+    && pass "3 audio files staged (subdir and .txt ignored)" \
+    || { fail "3 audio files staged"; jq '.tracks | length' "$inc" 2>/dev/null; }
+jq -e '.playlists == ["home", "roadtrip", "INCOMING >> roadtrip <<", "*"]' "$D/status.json" >/dev/null 2>&1 \
+    && pass "staging tab sorts between the playlists and *" \
+    || { fail "staging tab order"; jq '.playlists' "$D/status.json"; }
+
+rt_before=$(jq '.tracks | length' "$libdir/roadtrip.json")
+send "accept_incoming 2"
+poll_state '.status | test("Accepted")' 40 >/dev/null
+[ "$(jq '.tracks | length' "$libdir/roadtrip.json")" = "$((rt_before + 1))" ] \
+    && pass "accept moves one track into the target" || fail "accept moves one track into the target"
+[ "$(jq '.tracks | length' "$inc")" = "2" ] \
+    && pass "accepted track leaves the staging list" || fail "accepted track leaves the staging list"
+
+send "decline_incoming 0"
+poll_state '.status | test("Declined")' 40 >/dev/null
+[ "$(jq '.tracks | length' "$inc")" = "1" ] \
+    && pass "decline drops a track from the staging list" || fail "decline drops from staging"
+[ "$(jq '.tracks | length' "$libdir/roadtrip.json")" = "$((rt_before + 1))" ] \
+    && pass "decline does not touch the target" || fail "decline does not touch the target"
+
+send "accept_incoming 0"
+poll_state '.viewed_playlist == "roadtrip"' 40 \
+    && pass "clearing the staging list deletes it and returns to the target" \
+    || { fail "clearing the staging list"; jq '{viewed_playlist,playlists}' "$D/status.json"; }
+[ -f "$inc" ] && fail "empty staging file removed" || pass "empty staging file removed"
+
 # --------------------------------------------------------------------------
 echo
 if [ "$fails" -eq 0 ]; then
