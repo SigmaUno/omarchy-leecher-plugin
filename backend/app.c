@@ -355,9 +355,14 @@ static void init_resume_path(const char *library_dir) {
 
 static const char EMPTY_LIBRARY_JSON[] = "{\n  \"version\": 1,\n  \"tracks\": []\n}\n";
 
+/* The auto-collecting playlist: every source added to any other playlist is
+ * also added here. Seeded at startup; users cannot create or name it. */
+#define STAR_PLAYLIST "*"
+
 /* A playlist name doubles as a filename component, so keep it to a safe set:
  * 1..64 chars of [A-Za-z0-9 _-], no leading/trailing space. This rules out
- * '/', '.' and '..' outright, so it can never escape library_dir. */
+ * '/', '.' and '..' outright, so it can never escape library_dir. The "*"
+ * playlist is reserved and seeded separately, so it never passes here. */
 static int valid_playlist_name(const char *name) {
     size_t n = name ? strlen(name) : 0, i;
     if (n == 0 || n > 64) return 0;
@@ -382,11 +387,14 @@ static int playlist_known(const AppState *s, const char *name) {
     return 0;
 }
 
-/* "home" always sorts first; the rest are case-insensitive alphabetical. */
+/* "home" sorts first, the auto-collect "*" playlist sorts last, everything
+ * between is case-insensitive alphabetical. */
 static int playlist_cmp(const void *a, const void *b) {
     const char *x = (const char *)a, *y = (const char *)b;
     int xh = !strcmp(x, "home"), yh = !strcmp(y, "home");
+    int xs = !strcmp(x, STAR_PLAYLIST), ys = !strcmp(y, STAR_PLAYLIST);
     if (xh != yh) return yh - xh;
+    if (xs != ys) return xs - ys;
     return strcasecmp(x, y);
 }
 
@@ -468,6 +476,11 @@ static void resolve_library_dir(const char *arg, AppState *s, char *legacy, size
         if (!(legacy[0] && copy_file(legacy, home)))
             atomic_write(home, EMPTY_LIBRARY_JSON, sizeof(EMPTY_LIBRARY_JSON) - 1);
     }
+    /* Ensure the auto-collect playlist exists (also on pre-existing installs). */
+    { char star[PATH_MAX];
+      snprintf(star, sizeof(star), "%s/%s.json", s->library_dir, STAR_PLAYLIST);
+      if (access(star, F_OK) != 0)
+          atomic_write(star, EMPTY_LIBRARY_JSON, sizeof(EMPTY_LIBRARY_JSON) - 1); }
     scan_playlists(s);
 }
 
@@ -1113,6 +1126,45 @@ static LibrarySongQuery build_song_query(AppState *state, const char *file_path,
                                 title, title_size, artist, artist_size, album, album_size);
 }
 
+static int source_field_eq(const char *a, const char *b) {
+    return strcmp(a ? a : "", b ? b : "") == 0;
+}
+
+/* Two sources refer to the same thing: same transport and same locator. */
+static int source_equal(const LibrarySource *a, const LibrarySource *b) {
+    return a->kind == b->kind &&
+           source_field_eq(a->path, b->path) && source_field_eq(a->url, b->url) &&
+           source_field_eq(a->username, b->username) && source_field_eq(a->ip, b->ip);
+}
+
+/* Mirror a freshly-added source into the auto-collect "*" playlist (file only,
+ * no in-memory handles). Skipped when "*" is the playlist it was just added to,
+ * and when that exact source is already collected there, so adding the same
+ * file to several playlists does not pile up duplicates. If "*" happens to be
+ * the one playing, its play_lib handle is refreshed on the next `playlist *`. */
+static void mirror_add_to_star(const AppState *s, const LibrarySongQuery *song,
+                               const LibrarySource *source) {
+    char star[LIBRARY_PATH_MAX], err[256];
+    LibraryHandler *h;
+    size_t count, i, j;
+    int already = 0;
+    if (!strcmp(s->viewed_playlist, STAR_PLAYLIST)) return;
+    playlist_file_path(s, STAR_PLAYLIST, star, sizeof(star));
+    h = library_handler_open(star, err, sizeof(err));
+    if (!h) return;
+    count = library_handler_track_count(h);
+    for (i = 0; i < count && !already; i++) {
+        LibraryTrack t = {0};
+        if (library_handler_track_at(h, i, &t, err, sizeof(err)) == 1)
+            for (j = 0; j < t.source_count; j++)
+                if (source_equal(&t.sources[j], source)) { already = 1; break; }
+        library_handler_track_destroy(&t);
+    }
+    library_handler_close(h);
+    if (!already)
+        library_handler_add_source(star, song, source, err, sizeof(err));
+}
+
 /* Adds a source for a single audio file to the library and reloads the in-memory
  * handler so the new entry is visible immediately. Returns 1 when a source was
  * saved (the track may be new or a merge into an existing one). */
@@ -1124,6 +1176,7 @@ static int import_single_source(const char *library_path, AppState *state,
         snprintf(state->status, sizeof(state->status), "Import failed for %.160s: %s", song->title, error);
         return 0;
     }
+    mirror_add_to_star(state, song, source);
     LibraryHandler *reloaded = library_handler_open(library_path, error, sizeof(error));
     if (reloaded) {
         cancel_fetch(state);
