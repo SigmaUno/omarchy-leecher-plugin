@@ -1071,7 +1071,7 @@ BarWidget {
 
                     Column {
                         width: parent.width
-                        spacing: Style.space(2)
+                        spacing: Style.space(4)
                         visible: root.outputDevices.length > 0
 
                         Text {
@@ -1081,14 +1081,24 @@ BarWidget {
                             font.pixelSize: Style.font.caption
                         }
 
-                        Repeater {
+                        ListView {
+                            id: outputList
+                            width: parent.width
+                            /* Show ~3 sinks then scroll, so a host with many
+                             * audio devices doesn't push the popup off-screen. */
+                            height: Math.min(Style.space(28) * 3 + Style.space(4), outputList.contentHeight)
+                            clip: true
+                            spacing: Style.space(2)
+                            interactive: contentHeight > height
+                            boundsBehavior: Flickable.StopAtBounds
                             model: [""].concat(root.outputDevices)
 
                             delegate: Button {
                                 required property var modelData
+                                required property int index
                                 readonly property string devName: String(modelData)
                                 readonly property bool current: root.outputDevice === devName
-                                width: parent.width
+                                width: outputList.width
                                 height: Style.space(28)
                                 leftAlign: true
                                 fontSize: Style.font.bodySmall
