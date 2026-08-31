@@ -943,44 +943,95 @@ BarWidget {
                     }
                 }
 
-                Button {
-                    iconText: root.autoplay ? "\uf01e" : "\uf00d"
-                    foreground: root.autoplay ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
-                    width: root.controlButtonSize
+                /* Playback modes as one segmented control: a single
+                 * border around all three toggles, each segment lighting up
+                 * on its own hover. Width = 3x a button + the two dividers. */
+                BorderSurface {
+                    id: modeGroup
+                    width: root.controlButtonSize * 3 + Style.space(4)
                     height: root.controlButtonSize
-                    iconSize: Style.font.icon
-                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
+                    radius: Style.cornerRadius
+                    clip: true
+                    color: Style.normalFillFor(root.bar.foreground, Color.accent)
                     borderSpec: root.transportButtonBorder
-                    horizontalPadding: Style.spacing.controlPaddingX
-                    verticalPadding: 0
-                    tooltipText: root.autoplay ? "Autoplay on (turns off)" : "Autoplay off (turns on)"
-                    onClicked: root.toggleAutoplay()
-                }
-                Button {
-                    iconText: "\uf074"
-                    foreground: root.shuffle ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
-                    width: root.controlButtonSize
-                    height: root.controlButtonSize
-                    iconSize: Style.font.icon
-                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
-                    borderSpec: root.transportButtonBorder
-                    horizontalPadding: Style.spacing.controlPaddingX
-                    verticalPadding: 0
-                    tooltipText: root.shuffle ? "Shuffle on (turns off)" : "Shuffle off (turns on)"
-                    onClicked: root.toggleShuffle()
-                }
-                Button {
-                    iconText: "\uf021"
-                    foreground: root.repeatOne ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
-                    width: root.controlButtonSize
-                    height: root.controlButtonSize
-                    iconSize: Style.font.icon
-                    background: Style.normalFillFor(root.bar.foreground, Color.accent)
-                    borderSpec: root.transportButtonBorder
-                    horizontalPadding: Style.spacing.controlPaddingX
-                    verticalPadding: 0
-                    tooltipText: root.repeatOne ? "Repeat one (turns off)" : "Repeat off (repeats current track)"
-                    onClicked: root.toggleRepeatOne()
+
+                    component ModeSeg: Item {
+                        id: seg
+                        property string glyph: ""
+                        property bool active: false
+                        property string tip: ""
+                        signal act()
+                        height: parent ? parent.height : 0
+
+                        Rectangle {
+                            anchors.fill: parent
+                            color: segMouse.pressed
+                                ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.28)
+                                : segHover.hovered
+                                    ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16)
+                                    : "transparent"
+                        }
+                        Text {
+                            anchors.centerIn: parent
+                            text: seg.glyph
+                            color: seg.active ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
+                            font.family: root.bar.fontFamily
+                            font.pixelSize: Style.font.icon
+                        }
+                        HoverHandler { id: segHover }
+                        MouseArea {
+                            id: segMouse
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: seg.act()
+                        }
+                        PanelToolTip {
+                            visible: segHover.hovered && seg.tip !== ""
+                            text: seg.tip
+                        }
+                    }
+
+                    Row {
+                        anchors.fill: parent
+                        anchors.margins: modeGroup.border.width
+
+                        readonly property real segW: (width - 2 * divider.implicitWidth) / 3
+
+                        ModeSeg {
+                            width: parent.segW
+                            glyph: root.autoplay ? "\uf01e" : "\uf00d"
+                            active: root.autoplay
+                            tip: root.autoplay ? "Autoplay on (turns off)" : "Autoplay off (turns on)"
+                            onAct: root.toggleAutoplay()
+                        }
+                        Rectangle {
+                            id: divider
+                            implicitWidth: Math.max(1, Style.space(1))
+                            width: implicitWidth
+                            height: parent.height
+                            color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.16)
+                        }
+                        ModeSeg {
+                            width: parent.segW
+                            glyph: "\uf074"
+                            active: root.shuffle
+                            tip: root.shuffle ? "Shuffle on (turns off)" : "Shuffle off (turns on)"
+                            onAct: root.toggleShuffle()
+                        }
+                        Rectangle {
+                            implicitWidth: divider.implicitWidth
+                            width: implicitWidth
+                            height: parent.height
+                            color: divider.color
+                        }
+                        ModeSeg {
+                            width: parent.segW
+                            glyph: "\uf021"
+                            active: root.repeatOne
+                            tip: root.repeatOne ? "Repeat one (turns off)" : "Repeat off (repeats current track)"
+                            onAct: root.toggleRepeatOne()
+                        }
+                    }
                 }
                 Button {
                     /* One entry point for volume + output; the panel below is
