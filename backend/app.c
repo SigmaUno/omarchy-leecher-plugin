@@ -2211,12 +2211,13 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Prefetch the next track shortly before the current one ends. */
-        if (state.autoplay && !state.immediate_pending && !state.pending_valid &&
+        /* Prefetch the next track shortly before the current one ends. Skipped
+         * under repeat-one: the track-end handler just seeks back to 0. */
+        if (state.autoplay && !state.repeat_one && !state.immediate_pending && !state.pending_valid &&
             state.audio_device && state.duration_ms > 0 && state.is_playing) {
             size_t count = library_handler_track_count(library);
             if (count > 0) {
-                size_t next = (state.selected_track + 1) % count;
+                size_t next = next_autoplay_index(&state, count, state.selected_track, 0);
                 Uint32 p = playback_ms(&state);
                 Uint32 trigger = state.duration_ms > 30000 ? state.duration_ms - 20000 : state.duration_ms / 2;
                 if (p >= trigger && !state.pending_valid) {
