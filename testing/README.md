@@ -11,9 +11,9 @@ Test suite for the Leecher Omarchy plugin.
 
 | Path | What |
 |---|---|
-| `unit/test_backend_logic.c` | Fast, dependency-free unit tests for the pure logic in `backend/app.c` — time-agnostic helpers: shuffle/queue next-track selection, the play queue, JSON escaping, SSH-name validation, encoded-token parsing. Compiled by `#include`-ing `app.c` with its `main` renamed, so it tests the real code with no refactor. |
-| `unit/test_widget_fmt.mjs` | Extracts the `fmt()` position formatter out of `BarWidget.qml` and checks it against known inputs (the `0:31`-for-a-5-minute-track regression). Needs `node`. |
-| `integration/test_controls.sh` | Black-box: builds and spawns the headless backend against a generated fixture library, drives it through the control file, and asserts on `status.json` transitions for every control command (play/pause, seek, next/prev, autoplay, shuffle, repeat, volume, mute, queue, output). |
+| `unit/test_backend_logic.c` | Fast unit tests for the backend: the pure logic in `backend/app.c` (shuffle/queue next-track selection, the play queue, JSON escaping, SSH-name validation, encoded-token / control decoding, the resume-state read+write), plus `assembler`, `decoder` (against an in-memory WAV) and `library_handler` (open / resolve / add / update / remove against a temp file). Compiled by `#include`-ing `app.c` with its `main` renamed, and linking the other backend `.c` files, so it tests the real code with no refactor. |
+| `unit/test_widget.mjs` | Extracts the pure helpers out of `BarWidget.qml` and checks them: `fmt()` (the `0:31`-for-a-5-minute-track regression), `enc()` (control-line injection guard) and `urlToPath()` (drag-drop file URLs). Needs `node`. |
+| `integration/test_controls.sh` | Black-box: builds and spawns the headless backend against a generated fixture library, drives it through the control file, and asserts on `status.json` transitions — every control command (play/pause, seek incl. clamps, next/prev incl. wrap, autoplay, shuffle, repeat, volume, mute, queue, output, set_fields, out-of-range play), end-of-track behaviour (autoplay advance / autoplay-off stop / repeat-one replay), a mid-playback library mutation (#11), and resume-across-restart. |
 | `integration/make_fixture.sh` | Generates a short silent WAV + a `library.json` pointing at it, into a throwaway dir. |
 | `run.sh` | Runs everything; non-zero exit on any failure. This is what CI invokes. |
 
