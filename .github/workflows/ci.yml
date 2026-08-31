@@ -17,7 +17,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libsdl2-dev libsndfile1-dev
+            build-essential pkg-config libsdl2-dev libsndfile1-dev jq
 
       - name: Build
         run: make -C backend app library-handler
@@ -64,6 +64,14 @@ jobs:
           else
             echo "app exited with $rc during startup" >&2
             exit "$rc"
+          fi
+
+      - name: Test suite (testing branch only)
+        run: |
+          if [ -x testing/run.sh ]; then
+            testing/run.sh
+          else
+            echo "no testing/ suite on this branch"
           fi
 
   widget:
