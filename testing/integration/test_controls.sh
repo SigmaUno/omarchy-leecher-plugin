@@ -64,10 +64,14 @@ send() {
 }
 
 # ---- launch --------------------------------------------------------------
-XDG_RUNTIME_DIR="$run" SDL_AUDIODRIVER=dummy SDL_VIDEODRIVER=dummy \
-    "$app" --headless "$lib" 2>"$work/app.log" &
-APP_PID=$!
+launch() {
+    XDG_RUNTIME_DIR="$run" SDL_AUDIODRIVER=dummy SDL_VIDEODRIVER=dummy \
+        "$app" --headless "$lib" </dev/null >/dev/null 2>>"$work/app.log" &
+    APP_PID=$!
+}
+stop_app() { kill -TERM "$APP_PID" 2>/dev/null; wait "$APP_PID" 2>/dev/null; }
 
+launch
 wait_for '.title != "" and .is_playing == true' "autoplay starts a track" || exit 1
 
 # ---- transport ---------------------------------------------------------------
@@ -187,6 +191,29 @@ q1=$(jq '.position_ms' "$D/status.json"); sleep 0.6
 q2=$(jq '.position_ms' "$D/status.json")
 [ "$q2" -gt "$q1" ] && pass "position keeps advancing after the mutation" \
     || fail "position keeps advancing after the mutation"
+
+# ---- resume the song + position across a restart ------------------------------
+send "play 1"
+wait_for '.track_index == 1' "on track 1 for the resume test"
+send "seek 9000"
+wait_for '.position_ms >= 8500' "seeked into track 1"
+send "play_pause"
+wait_for '.is_playing == false' "paused before restart"
+stop_app
+
+resume=$(dirname "$lib")/resume.json
+[ -f "$resume" ] && pass "resume.json was written" || fail "resume.json was written"
+jq -e '.track_index == 1 and .position_ms >= 8500 and .is_playing == false' "$resume" >/dev/null 2>&1 \
+    && pass "resume.json holds track / position / paused state" \
+    || { fail "resume.json holds track / position / paused state"; cat "$resume"; }
+
+launch
+wait_for '.track_index == 1 and .is_playing == false and .position_ms >= 8000 and .position_ms < 15000' \
+    "restart resumes the same track, position and paused state"
+before_pos=$(jq '.position_ms' "$D/status.json"); sleep 0.7
+wait_for '.is_playing == false' "resumed track stays paused"
+send "play_pause"
+wait_for '.is_playing == true and .position_ms >= '"$before_pos" "play resumes from the resumed point"
 
 # --------------------------------------------------------------------------
 echo

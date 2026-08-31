@@ -166,6 +166,49 @@ static void test_next_encoded_token(void) {
     CHECK_STR(tok, "");                               /* exhausted */
 }
 
+/* ------------------------------------------------------------- resume state */
+static void write_file(const char *path, const char *content) {
+    FILE *f = fopen(path, "w");
+    assert(f);
+    fputs(content, f);
+    fclose(f);
+}
+
+static void test_resume_roundtrip(void) {
+    char path[] = "/tmp/leecher-resume-test.XXXXXX";
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+    close(fd);
+    snprintf(resume_file, sizeof(resume_file), "%s", path);
+
+    size_t ti = 999;
+    Uint32 pos = 999;
+    int playing = -1;
+
+    /* what write_resume() actually emits */
+    write_file(path, "{\"track_index\":3,\"position_ms\":125000,\"is_playing\":true}\n");
+    CHECK(read_resume(&ti, &pos, &playing) == 1);
+    CHECK_EQ_SIZE(ti, 3);
+    CHECK(pos == 125000);
+    CHECK(playing == 1);
+
+    write_file(path, "{\"track_index\":0,\"position_ms\":0,\"is_playing\":false}\n");
+    CHECK(read_resume(&ti, &pos, &playing) == 1);
+    CHECK_EQ_SIZE(ti, 0);
+    CHECK(pos == 0);
+    CHECK(playing == 0);          /* the off-by-one that shipped once */
+
+    write_file(path, "garbage not json");
+    CHECK(read_resume(&ti, &pos, &playing) == 0);
+
+    write_file(path, "{\"position_ms\":10}");   /* no track_index */
+    CHECK(read_resume(&ti, &pos, &playing) == 0);
+
+    unlink(path);
+    resume_file[0] = '\0';
+    CHECK(read_resume(&ti, &pos, &playing) == 0);   /* no path -> no resume */
+}
+
 int main(void) {
     struct { const char *name; void (*fn)(void); } tests[] = {
         { "json_escape",         test_json_escape },
@@ -176,6 +219,7 @@ int main(void) {
         { "play_queue",          test_play_queue },
         { "take_next_index",     test_take_next_index },
         { "next_encoded_token",  test_next_encoded_token },
+        { "resume_roundtrip",    test_resume_roundtrip },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         int before = failures;
