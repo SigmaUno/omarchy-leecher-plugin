@@ -118,6 +118,23 @@ BarWidget {
     property int pendingCommandId: -1
     property bool commandAcked: true
     property var tracks: []
+    property string librarySearch: ""
+
+    /* Client-side library filter: case-insensitive substring over
+     * title/artist/album. Each entry keeps its original `index` so playback,
+     * edit and remove still address the right library row. */
+    readonly property var filteredTracks: {
+        var q = root.librarySearch.trim().toLowerCase();
+        if (q === "")
+            return root.tracks;
+        var out = [];
+        for (var i = 0; i < root.tracks.length; i++) {
+            var t = root.tracks[i];
+            if ((t.title + " " + t.artist + " " + t.album).toLowerCase().indexOf(q) !== -1)
+                out.push(t);
+        }
+        return out;
+    }
 
     property int actionsIndex: -1
     property var actionsAnchor: root
@@ -400,6 +417,12 @@ BarWidget {
         root.editIndex = -1;
         root.closeAddForm();
         root.pendingPlayIndex = -1;
+        root.clearLibrarySearch();
+    }
+    function clearLibrarySearch() {
+        root.librarySearch = "";
+        if (typeof librarySearchField !== "undefined")
+            librarySearchField.text = "";
     }
     /* Closing drops the widget to a collapsed sliver and halts all background
      * work (position timer + the two file watchers are bound to !closed); the
@@ -851,6 +874,7 @@ BarWidget {
                         if (!root.libraryOpen) {
                             root.actionsIndex = -1;
                             root.editVisible = false;
+                            root.clearLibrarySearch();
                         }
                         if (root.libraryOpen)
                             root.loadLibrary();
@@ -982,10 +1006,20 @@ BarWidget {
                     spacing: Style.space(4)
 
                     Text {
-                        text: "Library"
+                        text: root.librarySearch.trim() === ""
+                            ? "Library"
+                            : "Library — " + root.filteredTracks.length + " of " + root.tracks.length
                         color: Qt.darker(root.bar.foreground, 1.3)
                         font.family: root.bar.fontFamily
                         font.pixelSize: Style.font.caption
+                    }
+
+                    TextField {
+                        id: librarySearchField
+                        width: parent.width
+                        placeholderText: "Filter by title, artist or album"
+                        foreground: root.bar.foreground
+                        onTextChanged: root.librarySearch = text
                     }
 
                     ListView {
@@ -993,7 +1027,7 @@ BarWidget {
                         width: parent.width
                         height: Math.min(260, trackList.contentHeight)
                         clip: true
-                        model: root.tracks
+                        model: root.filteredTracks
                         boundsBehavior: Flickable.StopAtBounds
 
                         delegate: BorderSurface {
@@ -1244,6 +1278,17 @@ BarWidget {
                                 onClicked: root.playFromRow(modelData.index)
                             }
                         }
+                    }
+
+                    Text {
+                        width: parent.width
+                        visible: root.tracks.length > 0 && root.filteredTracks.length === 0
+                        text: "No tracks match “" + root.librarySearch.trim() + "”"
+                        color: Qt.darker(root.bar.foreground, 1.5)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.italic: true
+                        elide: Text.ElideRight
                     }
 
                     Row {
