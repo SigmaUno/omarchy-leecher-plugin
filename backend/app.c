@@ -37,6 +37,11 @@
 
 typedef enum { SOURCE_LOCAL, SOURCE_SSH, SOURCE_HTTPS, SOURCE_NETWORK } SourceMethod;
 
+#define LIBRARY_NAME_MAX      96    /* playlist stem, incl. NUL (names capped at 64) */
+#define LIBRARY_DIR_MAX       512   /* library directory path, incl. NUL */
+#define LIBRARY_PATH_MAX      640   /* "<dir>/<name>.json" always fits */
+#define LIBRARY_MAX_PLAYLISTS 64
+
 typedef struct {
     char title[128];
     char artist[128];
@@ -72,7 +77,13 @@ typedef struct {
     pid_t ssh_agent_pid;
     char ssh_agent_dir[PATH_MAX];
     char ssh_agent_socket[PATH_MAX];
-    char library_path[512];
+    char library_path[LIBRARY_PATH_MAX];  /* JSON file of the playlist VIEWED */
+    char library_dir[LIBRARY_DIR_MAX];    /* directory holding the playlist .json files */
+    char viewed_playlist[LIBRARY_NAME_MAX];  /* stem of the playlist shown in the widget */
+    char playing_playlist[LIBRARY_NAME_MAX]; /* stem of the playlist playback runs over */
+    char playlists[LIBRARY_MAX_PLAYLISTS][LIBRARY_NAME_MAX]; /* stems found in library_dir */
+    int playlist_count;
+    LibraryHandler *play_lib;     /* handle for playing_playlist (next/autoplay) */
     char cover_file[512];
     int autoplay;
     int shuffle;      /* autoplay/next picks a random track instead of the next */
@@ -111,6 +122,7 @@ typedef struct {
 static void cancel_fetch(AppState *s);
 static void stream_audio(AppState *s);
 static void join_fetch_thread(AppState *s);
+static void resync_play_lib(AppState *s);
 
 /* Per-user private IPC directory.  All status / control / cover / ssh-agent
  * files live here so that a multi-user host cannot read or clobber another
@@ -268,11 +280,16 @@ static void write_status(const AppState *state) {
          *cover = json_escape(state->cover_file[0] ? state->cover_file : NULL),
          *status = json_escape(state->status),
          *output = json_escape(state->audio_device_name[0] ? state->audio_device_name : NULL);
-    char tmp[8192];
+    char *dir = json_escape(state->library_dir[0] ? state->library_dir : NULL),
+         *viewed = json_escape(state->viewed_playlist),
+         *playing = json_escape(state->playing_playlist);
+    char tmp[16384];
     char queue[16 * 64 + 4];  /* "[" + up to 64 "NNNNN," + "]" */
     char outputs[2560];       /* enumerated output device names, JSON array */
+    char playlists[64 * 100 + 4];  /* enumerated playlist stems, JSON array */
     int qn = 0, qi;
     int on = 0, od, ocount;
+    int pn = 0, pi;
     int n;
     queue[qn++] = '[';
     for (qi = 0; qi < state->play_queue_len && qn < (int)sizeof(queue) - 16; qi++)
@@ -293,11 +310,21 @@ static void write_status(const AppState *state) {
     }
     outputs[on++] = ']';
     outputs[on] = '\0';
+    playlists[pn++] = '[';
+    for (pi = 0; pi < state->playlist_count && pn < (int)sizeof(playlists) - 200; pi++) {
+        char *pe = json_escape(state->playlists[pi]);
+        pn += snprintf(playlists + pn, sizeof(playlists) - (size_t)pn, "%s\"%s\"",
+                       pi ? "," : "", pe ? pe : "");
+        free(pe);
+    }
+    playlists[pn++] = ']';
+    playlists[pn] = '\0';
     n = snprintf(tmp, sizeof(tmp),
                  "{\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
                  "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s,"
                  "\"shuffle\":%s,\"repeat_one\":%s,\"volume\":%d,\"muted\":%s,\"queue\":%s,"
                  "\"output\":\"%s\",\"outputs\":%s,\"cover\":\"%s\","
+                 "\"library_dir\":\"%s\",\"playlists\":%s,\"viewed_playlist\":\"%s\",\"playing_playlist\":\"%s\","
                  "\"status\":\"%s\",\"cmd_id\":%lu}\n",
                  title ? title : "", artist ? artist : "", album ? album : "",
                  state->position_ms, state->duration_ms,
@@ -307,45 +334,168 @@ static void write_status(const AppState *state) {
                  state->volume, state->muted ? "true" : "false", queue,
                  output ? output : "", outputs,
                  cover ? cover : "",
+                 dir ? dir : "", playlists, viewed ? viewed : "", playing ? playing : "",
                  status ? status : "", state->last_cmd_id);
     free(title); free(artist); free(album); free(library); free(cover); free(status); free(output);
+    free(dir); free(viewed); free(playing);
     if (n < 0 || (size_t)n >= sizeof(tmp)) return; /* oversized; leave old status intact */
     atomic_write(status_file, tmp, (size_t)n);
 }
 
-/* Resume state persists across a backend restart, so it lives next to the
- * library file (a data-home path), not in the volatile IPC dir. */
-static char resume_file[512];
+/* Resume state persists across a backend restart, so it lives in the library
+ * directory (a data-home path), not in the volatile IPC dir. The leading dot
+ * keeps it from being picked up as a playlist by scan_playlists(). */
+static char resume_file[LIBRARY_DIR_MAX + 32];
 
-static void init_resume_path(const char *library_path) {
-    const char *slash = strrchr(library_path, '/');
-    long dlen = slash ? (long)(slash - library_path) : -1;
-    if (dlen >= 0 && dlen < (long)sizeof(resume_file) - 16)
-        snprintf(resume_file, sizeof(resume_file), "%.*s/resume.json", (int)dlen, library_path);
-    else
-        snprintf(resume_file, sizeof(resume_file), "resume.json");
+static void init_resume_path(const char *library_dir) {
+    snprintf(resume_file, sizeof(resume_file), "%s/.resume.json", library_dir);
+}
+
+/* ---- Multi-playlist library directory ---------------------------------- */
+
+static const char EMPTY_LIBRARY_JSON[] = "{\n  \"version\": 1,\n  \"tracks\": []\n}\n";
+
+/* A playlist name doubles as a filename component, so keep it to a safe set:
+ * 1..64 chars of [A-Za-z0-9 _-], no leading/trailing space. This rules out
+ * '/', '.' and '..' outright, so it can never escape library_dir. */
+static int valid_playlist_name(const char *name) {
+    size_t n = name ? strlen(name) : 0, i;
+    if (n == 0 || n > 64) return 0;
+    if (name[0] == ' ' || name[n - 1] == ' ') return 0;
+    for (i = 0; i < n; i++) {
+        char c = name[i];
+        if (!(isalnum((unsigned char)c) || c == ' ' || c == '_' || c == '-')) return 0;
+    }
+    return 1;
+}
+
+/* library_dir fits LIBRARY_DIR_MAX and name is a validated stem (<64 chars),
+ * so "<dir>/<name>.json" always fits an LIBRARY_PATH_MAX (or larger) buffer. */
+static void playlist_file_path(const AppState *s, const char *name, char *out, size_t out_size) {
+    snprintf(out, out_size, "%s/%s.json", s->library_dir, name);
+}
+
+static int playlist_known(const AppState *s, const char *name) {
+    int i;
+    for (i = 0; i < s->playlist_count; i++)
+        if (!strcmp(s->playlists[i], name)) return 1;
+    return 0;
+}
+
+/* "home" always sorts first; the rest are case-insensitive alphabetical. */
+static int playlist_cmp(const void *a, const void *b) {
+    const char *x = (const char *)a, *y = (const char *)b;
+    int xh = !strcmp(x, "home"), yh = !strcmp(y, "home");
+    if (xh != yh) return yh - xh;
+    return strcasecmp(x, y);
+}
+
+static int dir_has_playlist_json(const char *dir) {
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    int found = 0;
+    if (!d) return 0;
+    while ((e = readdir(d))) {
+        size_t n = strlen(e->d_name);
+        if (e->d_name[0] == '.') continue;
+        if (n > 5 && !strcmp(e->d_name + n - 5, ".json")) { found = 1; break; }
+    }
+    closedir(d);
+    return found;
+}
+
+static void scan_playlists(AppState *s) {
+    DIR *d = opendir(s->library_dir);
+    struct dirent *e;
+    s->playlist_count = 0;
+    if (!d) return;
+    while ((e = readdir(d)) && s->playlist_count < (int)(sizeof(s->playlists) / sizeof(s->playlists[0]))) {
+        size_t n = strlen(e->d_name);
+        if (e->d_name[0] == '.') continue;               /* skips .resume.json */
+        if (n <= 5 || strcmp(e->d_name + n - 5, ".json")) continue;
+        if (n - 5 >= sizeof(s->playlists[0])) continue;
+        snprintf(s->playlists[s->playlist_count], sizeof(s->playlists[0]),
+                 "%.*s", (int)(n - 5), e->d_name);
+        s->playlist_count++;
+    }
+    closedir(d);
+    qsort(s->playlists, (size_t)s->playlist_count, sizeof(s->playlists[0]), playlist_cmp);
+}
+
+static int copy_file(const char *from, const char *to) {
+    FILE *in = fopen(from, "rb"), *out;
+    char buf[8192];
+    size_t got;
+    int ok = 1;
+    if (!in) return 0;
+    out = fopen(to, "wb");
+    if (!out) { fclose(in); return 0; }
+    while ((got = fread(buf, 1, sizeof(buf), in)) > 0)
+        if (fwrite(buf, 1, got, out) != got) { ok = 0; break; }
+    if (fclose(out) != 0) ok = 0;
+    fclose(in);
+    if (!ok) unlink(to);
+    return ok;
+}
+
+/* Turn the backend argument into a library directory. Historically the arg was
+ * a `library.json` file; keep accepting that (its sibling `library/` becomes
+ * the directory and the file migrates to `home.json`). A path without a
+ * `.json` suffix is taken as the directory itself. */
+static void resolve_library_dir(const char *arg, AppState *s, char *legacy, size_t legacy_size) {
+    size_t n = strlen(arg);
+    legacy[0] = '\0';
+    if (n > 5 && !strcmp(arg + n - 5, ".json")) {
+        const char *slash = strrchr(arg, '/');
+        long dlen = slash ? (long)(slash - arg) : -1;
+        if (dlen >= 0 && dlen < (long)sizeof(s->library_dir) - 16)
+            snprintf(s->library_dir, sizeof(s->library_dir), "%.*s/library", (int)dlen, arg);
+        else
+            snprintf(s->library_dir, sizeof(s->library_dir), "library");
+        snprintf(legacy, legacy_size, "%s", arg);
+    } else {
+        snprintf(s->library_dir, sizeof(s->library_dir), "%.*s", (int)sizeof(s->library_dir) - 1, arg);
+    }
+    mkdir(s->library_dir, 0700);
+    { char abs[PATH_MAX];
+      if (realpath(s->library_dir, abs) && strlen(abs) < sizeof(s->library_dir))
+          snprintf(s->library_dir, sizeof(s->library_dir), "%s", abs); }
+    /* First run: bring an existing single-file library across, else seed an
+     * empty home.json so there is always at least one playlist. */
+    if (!dir_has_playlist_json(s->library_dir)) {
+        char home[PATH_MAX];
+        snprintf(home, sizeof(home), "%s/home.json", s->library_dir);
+        if (!(legacy[0] && copy_file(legacy, home)))
+            atomic_write(home, EMPTY_LIBRARY_JSON, sizeof(EMPTY_LIBRARY_JSON) - 1);
+    }
+    scan_playlists(s);
 }
 
 /* Remember the current track and position so a restarted backend can pick the
  * song back up where it left off. Throttled by the caller. */
 static void write_resume(const AppState *s) {
-    char tmp[192];
+    char tmp[320];
+    char *pl = json_escape(s->playing_playlist);
     int n;
-    if (!resume_file[0] || s->selected_track == (size_t)-1 || s->duration_ms == 0) return;
+    if (!resume_file[0] || s->selected_track == (size_t)-1 || s->duration_ms == 0) { free(pl); return; }
     n = snprintf(tmp, sizeof(tmp),
-                 "{\"track_index\":%zu,\"position_ms\":%u,\"is_playing\":%s}\n",
-                 s->selected_track, s->position_ms, s->is_playing ? "true" : "false");
+                 "{\"playlist\":\"%s\",\"track_index\":%zu,\"position_ms\":%u,\"is_playing\":%s}\n",
+                 pl ? pl : "", s->selected_track, s->position_ms, s->is_playing ? "true" : "false");
+    free(pl);
     if (n > 0 && (size_t)n < sizeof(tmp)) atomic_write(resume_file, tmp, (size_t)n);
 }
 
 /* Parse the resume file written above. Returns 1 and fills the outputs when it
- * holds a usable track_index + position_ms. */
-static int read_resume(size_t *track_index, Uint32 *position_ms, int *was_playing) {
-    char buf[256];
+ * holds a usable track_index + position_ms. `playlist` may be NULL; when given
+ * it receives the stem of the playlist that was playing (empty if unset). */
+static int read_resume(char *playlist, size_t playlist_size,
+                       size_t *track_index, Uint32 *position_ms, int *was_playing) {
+    char buf[512];
     FILE *f = resume_file[0] ? fopen(resume_file, "r") : NULL;
     size_t got;
     char *p;
     long ti = -1, pos = -1;
+    if (playlist && playlist_size) playlist[0] = '\0';
     if (!f) return 0;
     got = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
@@ -357,6 +507,12 @@ static int read_resume(size_t *track_index, Uint32 *position_ms, int *was_playin
     *position_ms = (Uint32)pos;
     p = strstr(buf, "\"is_playing\":");
     *was_playing = !(p && strncmp(p + 13, "false", 5) == 0);
+    if (playlist && playlist_size && (p = strstr(buf, "\"playlist\":\""))) {
+        p += 12;
+        size_t i = 0;
+        while (*p && *p != '"' && i + 1 < playlist_size) playlist[i++] = *p++;
+        playlist[i] = '\0';
+    }
     return 1;
 }
 
@@ -974,6 +1130,7 @@ static int import_single_source(const char *library_path, AppState *state,
         library_handler_close(*library);
         *library = reloaded;
         if (ripper) ripper->library = reloaded;
+        resync_play_lib(state);
     }
     return 1;
 }
@@ -1337,8 +1494,10 @@ static void join_fetch_thread(AppState *s) {
     s->fetch_thread_valid = 0;
 }
 
-/* Restart the worker (joining an in-flight one first) to fetch `index`. */
-static void start_fetch(const LibraryHandler *library, AppState *s, size_t index) {
+/* Restart the worker (joining an in-flight one first) to fetch `index` from the
+ * playlist playback is currently running over (s->play_lib). */
+static void start_fetch(AppState *s, size_t index) {
+    const LibraryHandler *library = s->play_lib;
     fetch_lock(s);
     if (s->fetch_thread_valid)
         join_fetch_thread(s);
@@ -1525,10 +1684,13 @@ static void commit_fetch(AppState *s, size_t idx) {
     write_resume(s);
 }
 
-/* Queue a track to play as soon as it is fetched (interrupts current). */
-static void request_play(const LibraryHandler *library, AppState *s, size_t index) {
+/* Queue a track to play as soon as it is fetched (interrupts current). Always
+ * addresses the playing playlist (s->play_lib); play_library_index() repoints
+ * that at the viewed playlist first when the user starts a track there. */
+static void request_play(AppState *s, size_t index) {
+    const LibraryHandler *library = s->play_lib;
     size_t count = library ? library_handler_track_count(library) : 0;
-    if (count == 0) { snprintf(s->status, sizeof(s->status), "Library is empty."); return; }
+    if (count == 0) { snprintf(s->status, sizeof(s->status), "Playlist is empty."); return; }
     s->pending_valid = 0;
     s->immediate_pending = 1;
     s->immediate_index = index;
@@ -1548,12 +1710,29 @@ static void request_play(const LibraryHandler *library, AppState *s, size_t inde
     int ready = s->fetch_ready && s->fetch_index == index;
     int active = s->fetch_active && s->fetch_index == index;
     fetch_unlock(s);
-    if (!ready && !active) start_fetch(library, s, index);
+    if (!ready && !active) start_fetch(s, index);
 }
 
-static void play_library_index(const LibraryHandler *library, AppState *state, size_t index) {
+/* Point the playback handle at the viewed playlist and adopt it as the one
+ * playing. A no-op when they already match. */
+static void adopt_viewed_as_playing(AppState *s) {
+    char err[128];
+    LibraryHandler *h;
+    if (!strcmp(s->viewed_playlist, s->playing_playlist)) return;
+    h = library_handler_open(s->library_path, err, sizeof(err));
+    if (!h) return;
+    library_handler_close(s->play_lib);
+    s->play_lib = h;
+    snprintf(s->playing_playlist, sizeof(s->playing_playlist), "%s", s->viewed_playlist);
+    s->play_queue_len = 0;   /* the queue indexed into the old playlist */
+}
+
+/* The user picked a track in the library list: switch playback to the playlist
+ * they are viewing (if different) and start that track. */
+static void play_library_index(AppState *state, size_t index) {
     state->autoplay_advancing = 0;
-    request_play(library, state, index);
+    adopt_viewed_as_playing(state);
+    request_play(state, index);
 }
 
 /* The track autoplay moves to from `from`. repeat-one stays put (only when
@@ -1596,20 +1775,20 @@ static size_t take_next_index(AppState *s, size_t count, size_t from, int allow_
     return next_autoplay_index(s, count, from, allow_repeat);
 }
 
-static void play_library_relative(const LibraryHandler *library, AppState *state, long delta) {
-    size_t count = library ? library_handler_track_count(library) : 0;
-    if (count == 0) { snprintf(state->status, sizeof(state->status), "Library is empty."); return; }
+static void play_library_relative(AppState *state, long delta) {
+    size_t count = state->play_lib ? library_handler_track_count(state->play_lib) : 0;
+    if (count == 0) { snprintf(state->status, sizeof(state->status), "Playlist is empty."); return; }
     /* Forward honours the queue first, then shuffle; back is always linear. */
     if (delta > 0 && (state->play_queue_len > 0 || (state->shuffle && count > 1))) {
         state->autoplay_advancing = 0;
-        request_play(library, state, take_next_index(state, count, state->selected_track, 0));
+        request_play(state, take_next_index(state, count, state->selected_track, 0));
         return;
     }
     long cur = (long)state->selected_track;
     long nxt = (cur + delta) % (long)count;
     if (nxt < 0) nxt += (long)count;
     state->autoplay_advancing = 0;
-    request_play(library, state, (size_t)nxt);
+    request_play(state, (size_t)nxt);
 }
 
 static void toggle_play_pause(AppState *state) {
@@ -1790,6 +1969,18 @@ static void announce_fetch_failure(AppState *s, const LibraryHandler *library,
     write_status(s);
 }
 
+/* After a mutation reloads the viewed playlist, mirror it into the playback
+ * handle when that is the same playlist, so next/autoplay see the same rows. */
+static void resync_play_lib(AppState *s) {
+    char err[128];
+    LibraryHandler *h;
+    if (strcmp(s->viewed_playlist, s->playing_playlist) != 0) return;
+    h = library_handler_open(s->library_path, err, sizeof(err));
+    if (!h) return;
+    library_handler_close(s->play_lib);
+    s->play_lib = h;
+}
+
 static void handle_set_field(LibraryHandler **library, MusicRipper *ripper, const char *library_path,
                              AppState *state, const char *prefix, const char *key, const char *command) {
     char *end;
@@ -1806,7 +1997,7 @@ static void handle_set_field(LibraryHandler **library, MusicRipper *ripper, cons
     }
     {
         LibraryHandler *reloaded = library_handler_open(library_path, reload, sizeof(reload));
-        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; }
+        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; resync_play_lib(state); }
         else snprintf(state->status, sizeof(state->status), "Updated, but reload failed: %s", reload);
     }
     snprintf(state->status, sizeof(state->status), "Updated %s for track %zu.", key, idx);
@@ -1825,7 +2016,7 @@ static void handle_remove_track(LibraryHandler **library, MusicRipper *ripper, c
     {
         char reload[256] = {0};
         LibraryHandler *reloaded = library_handler_open(library_path, reload, sizeof(reload));
-        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; }
+        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; resync_play_lib(state); }
         else snprintf(state->status, sizeof(state->status), "Removed, but reload failed: %s", reload);
     }
     if (idx == state->selected_track) {
@@ -1923,7 +2114,7 @@ static void handle_set_fields(LibraryHandler **library, MusicRipper *ripper,
     }
     {
         LibraryHandler *reloaded = library_handler_open(library_path, reload, sizeof(reload));
-        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; }
+        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; resync_play_lib(state); }
         else snprintf(state->status, sizeof(state->status), "Updated, but reload failed: %s", reload);
     }
     snprintf(state->status, sizeof(state->status), "Updated track %zu.", idx);
@@ -2014,6 +2205,62 @@ static void handle_add_https_track(LibraryHandler **library, MusicRipper *ripper
         snprintf(state->status, sizeof(state->status), "Imported https source %.120s", url);
 }
 
+/* Switch the VIEWED playlist: reopen the display/mutation handle at its file.
+ * Playback is untouched -- it keeps running over playing_playlist. */
+static void switch_viewed_playlist(LibraryHandler **library, MusicRipper *ripper,
+                                   AppState *state, const char *name) {
+    char path[LIBRARY_PATH_MAX], err[128];
+    LibraryHandler *h;
+    if (!playlist_known(state, name)) {
+        snprintf(state->status, sizeof(state->status), "No such playlist: %.80s", name);
+        write_status(state);
+        return;
+    }
+    if (!strcmp(name, state->viewed_playlist)) return;
+    playlist_file_path(state, name, path, sizeof(path));
+    h = library_handler_open(path, err, sizeof(err));
+    if (!h) {
+        snprintf(state->status, sizeof(state->status), "Cannot open playlist %.60s: %.80s", name, err);
+        write_status(state);
+        return;
+    }
+    library_handler_close(*library);
+    *library = h;
+    if (ripper) ripper->library = h;
+    snprintf(state->viewed_playlist, sizeof(state->viewed_playlist), "%s", name);
+    snprintf(state->library_path, sizeof(state->library_path), "%s", path);
+    snprintf(state->status, sizeof(state->status), "Viewing playlist \"%s\".", name);
+    write_status(state);
+}
+
+/* Create a new empty playlist file and switch to viewing it. */
+static void create_playlist(LibraryHandler **library, MusicRipper *ripper,
+                            AppState *state, const char *name) {
+    char path[LIBRARY_PATH_MAX];
+    if (!valid_playlist_name(name)) {
+        snprintf(state->status, sizeof(state->status),
+                 "Invalid playlist name (letters, digits, spaces, - and _; up to 64).");
+        write_status(state);
+        return;
+    }
+    if (playlist_known(state, name)) { switch_viewed_playlist(library, ripper, state, name); return; }
+    if (state->playlist_count >= (int)(sizeof(state->playlists) / sizeof(state->playlists[0]))) {
+        snprintf(state->status, sizeof(state->status), "Too many playlists.");
+        write_status(state);
+        return;
+    }
+    playlist_file_path(state, name, path, sizeof(path));
+    if (!atomic_write(path, EMPTY_LIBRARY_JSON, sizeof(EMPTY_LIBRARY_JSON) - 1)) {
+        snprintf(state->status, sizeof(state->status), "Could not create playlist \"%.60s\".", name);
+        write_status(state);
+        return;
+    }
+    scan_playlists(state);
+    switch_viewed_playlist(library, ripper, state, name);
+    snprintf(state->status, sizeof(state->status), "Created playlist \"%s\".", name);
+    write_status(state);
+}
+
 static void handle_control(const char *command, LibraryHandler **library, MusicRipper *ripper,
                            Assembler *assembler, AppState *state, const char *library_path) {
     /* Commands arrive as one line, e.g.: "play_pause", "next", "previous",
@@ -2024,9 +2271,17 @@ static void handle_control(const char *command, LibraryHandler **library, MusicR
     if (!command || !*command) return;
     (void)assembler;
     if (!strncmp(command, "play_pause", 10)) toggle_play_pause(state);
-    else if (!strncmp(command, "play ", 5)) play_library_index(*library, state, (size_t)strtoul(command + 5, NULL, 10));
-    else if (!strncmp(command, "next", 4)) play_library_relative(*library, state, +1);
-    else if (!strncmp(command, "previous", 8)) play_library_relative(*library, state, -1);
+    else if (!strncmp(command, "play ", 5)) play_library_index(state, (size_t)strtoul(command + 5, NULL, 10));
+    else if (!strncmp(command, "next", 4)) play_library_relative(state, +1);
+    else if (!strncmp(command, "previous", 8)) play_library_relative(state, -1);
+    else if (!strncmp(command, "playlist_new ", 13)) {
+        const char *n = command + 13; while (*n == ' ') n++;
+        create_playlist(library, ripper, state, n);
+    }
+    else if (!strncmp(command, "playlist ", 9)) {
+        const char *n = command + 9; while (*n == ' ') n++;
+        switch_viewed_playlist(library, ripper, state, n);
+    }
     else if (!strncmp(command, "seek ", 5)) { long v = strtol(command + 5, NULL, 10); if (v < 0) v = 0; seek_ms(state, (Uint32)v); }
     else if (!strncmp(command, "autoplay ", 9)) {
         state->autoplay = (strncmp(command + 9, "off", 3) == 0) ? 0 : 1;
@@ -2064,7 +2319,7 @@ static void handle_control(const char *command, LibraryHandler **library, MusicR
         write_status(state);
     }
     else if (!strncmp(command, "queue ", 6)) {
-        size_t count = *library ? library_handler_track_count(*library) : 0;
+        size_t count = state->play_lib ? library_handler_track_count(state->play_lib) : 0;
         size_t idx = (size_t)strtoul(command + 6, NULL, 10);
         if (idx >= count) {
             snprintf(state->status, sizeof(state->status), "Cannot queue track %zu.", idx + 1);
@@ -2190,7 +2445,7 @@ static void draw_library(struct nk_context *ctx, const LibraryHandler *library, 
         snprintf(label, sizeof(label), "%s  |  %s%s%s", track.title ? track.title : "Untitled", track.artist ? track.artist : "Unknown artist", track.album ? "  -  " : "", track.album ? track.album : "");
         nk_layout_row_dynamic(ctx, 34, 1);
         if (nk_button_label(ctx, label)) {
-            play_library_index(library, state, i);
+            play_library_index(state, i);
         }
         library_handler_track_destroy(&track);
     }
@@ -2250,7 +2505,7 @@ static void draw_scraper(struct nk_context *ctx, AppState *state, LibraryHandler
         char error[256] = {0};
         if (library_handler_add_source(library_path, &song, &source, error, sizeof(error)) == 1) {
             LibraryHandler *reloaded = library_handler_open(library_path, error, sizeof(error));
-            if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; snprintf(state->status, sizeof(state->status), "%s source saved to the library.", method_name(state->method)); }
+            if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; resync_play_lib(state); snprintf(state->status, sizeof(state->status), "%s source saved to the library.", method_name(state->method)); }
             else snprintf(state->status, sizeof(state->status), "Saved source, but reload failed: %s", error);
         } else snprintf(state->status, sizeof(state->status), "%s", error);
     }
@@ -2446,10 +2701,10 @@ static void apply_theme(struct nk_context *ctx, const ThemePalette *p, struct nk
 
 int main(int argc, char **argv) {
     int headless = argc > 1 && !strcmp(argv[1], "--headless");
-    const char *library_path = headless ? (argc > 2 ? argv[2] : "library.json")
-                                        : (argc > 1 ? argv[1] : "library.json");
+    const char *library_arg = headless ? (argc > 2 ? argv[2] : "library.json")
+                                       : (argc > 1 ? argv[1] : "library.json");
     char error[256] = {0};
-    LibraryHandler *library = library_handler_open(library_path, error, sizeof(error));
+    LibraryHandler *library = NULL;
     MusicRipper ripper = {0};
     Assembler *assembler;
     SDL_Window *window = NULL;
@@ -2468,17 +2723,30 @@ int main(int argc, char **argv) {
     signal(SIGTERM, request_stop);
     pthread_mutex_init(&state.fetch_mutex, NULL);
     init_ipc_dir();
+
+    /* Resolve the library directory (migrating a legacy single-file library the
+     * first time) and choose the playlist to open. The playlist that was
+     * playing at the last clean shutdown is restored from .resume.json. */
     {
-        char absolute[PATH_MAX];
-        if (realpath(library_path, absolute)) snprintf(state.library_path, sizeof(state.library_path), "%.*s", (int)sizeof(state.library_path) - 1, absolute);
-        else snprintf(state.library_path, sizeof(state.library_path), "%s", library_path);
+        char legacy[PATH_MAX];
+        char rpl[96];
+        size_t rt; Uint32 rpos; int rplay;
+        resolve_library_dir(library_arg, &state, legacy, sizeof(legacy));
+        init_resume_path(state.library_dir);
+        snprintf(state.viewed_playlist, sizeof(state.viewed_playlist), "%s",
+                 state.playlist_count > 0 ? state.playlists[0] : "home");
+        if (read_resume(rpl, sizeof(rpl), &rt, &rpos, &rplay) && rpl[0] && playlist_known(&state, rpl))
+            snprintf(state.viewed_playlist, sizeof(state.viewed_playlist), "%s", rpl);
+        snprintf(state.playing_playlist, sizeof(state.playing_playlist), "%s", state.viewed_playlist);
+        playlist_file_path(&state, state.viewed_playlist, state.library_path, sizeof(state.library_path));
     }
-    init_resume_path(state.library_path);
+    library = library_handler_open(state.library_path, error, sizeof(error));
+    state.play_lib = library ? library_handler_open(state.library_path, error, sizeof(error)) : NULL;
     int running = 1;
     unsigned pos_tick = 0;
     struct nk_font_atlas *font_atlas;
     ThemePalette palette;
-    if (!library) { fprintf(stderr, "Cannot load %s: %s\n", library_path, error); return 1; }
+    if (!library || !state.play_lib) { fprintf(stderr, "Cannot load %s: %s\n", state.library_path, error); return 1; }
     ripper.library = library;
     ripper.transports.ssh = stream_ssh;
     ripper.transports.https = stream_https;
@@ -2520,22 +2788,22 @@ int main(int argc, char **argv) {
      * the track + position from the last run when the resume file still points
      * at a real track; otherwise start from the top. */
     if (state.autoplay && !state.immediate_pending && !state.pending_valid && !state.audio_device && !state.autoplay_advancing) {
-        size_t count = library_handler_track_count(library);
+        size_t count = library_handler_track_count(state.play_lib);
         if (count > 0) {
             size_t start = 0, rt;
             Uint32 rpos;
             int rplay;
-            if (read_resume(&rt, &rpos, &rplay) && rt < count) {
+            if (read_resume(NULL, 0, &rt, &rpos, &rplay) && rt < count) {
                 start = rt;
                 state.resume_position_ms = rpos;
                 state.resume_paused = !rplay;
             }
             state.autoplay_advancing = 1;
-            request_play(library, &state, start);
+            request_play(&state, start);
         }
     }
     while (running && !stop_requested) {
-        poll_control(&library, &ripper, assembler, &state, library_path);
+        poll_control(&library, &ripper, assembler, &state, state.library_path);
 
         /* Keep SDL's audio queue refilled from the decoder's rolling window. */
         stream_audio(&state);
@@ -2549,14 +2817,14 @@ int main(int argc, char **argv) {
             if (ready) {
                 commit_fetch(&state, state.immediate_index);
             } else if (failed) {
-                size_t count = library_handler_track_count(library);
+                size_t count = library_handler_track_count(state.play_lib);
                 state.immediate_pending = 0;
                 if (state.autoplay && state.autoplay_advancing && count > 1) {
                     size_t nxt = take_next_index(&state, count, state.immediate_index, 0);
-                    announce_fetch_failure(&state, library, state.immediate_index, 1);
-                    request_play(library, &state, nxt);
+                    announce_fetch_failure(&state, state.play_lib, state.immediate_index, 1);
+                    request_play(&state, nxt);
                 } else {
-                    announce_fetch_failure(&state, library, state.immediate_index, 0);
+                    announce_fetch_failure(&state, state.play_lib, state.immediate_index, 0);
                 }
             }
         }
@@ -2565,7 +2833,7 @@ int main(int argc, char **argv) {
          * under repeat-one: the track-end handler just seeks back to 0. */
         if (state.autoplay && !state.repeat_one && !state.immediate_pending && !state.pending_valid &&
             state.audio_device && state.duration_ms > 0 && state.is_playing) {
-            size_t count = library_handler_track_count(library);
+            size_t count = library_handler_track_count(state.play_lib);
             Uint32 p = playback_ms(&state);
             Uint32 trigger = state.duration_ms > 30000 ? state.duration_ms - 20000 : state.duration_ms / 2;
             /* take_next_index() pops the queue, so only call it once we have
@@ -2580,7 +2848,7 @@ int main(int argc, char **argv) {
                 state.pending_index = next;
                 state.autoplay_advancing = 1;
                 if (!already && !cached)
-                    start_fetch(library, &state, next);
+                    start_fetch(&state, next);
             }
         }
 
@@ -2597,12 +2865,12 @@ int main(int argc, char **argv) {
             if (pending_ready) {
                 commit_fetch(&state, idx);
             } else if (pending_failed && state.autoplay && state.autoplay_advancing) {
-                size_t count = library_handler_track_count(library);
-                announce_fetch_failure(&state, library, idx, 1);
+                size_t count = library_handler_track_count(state.play_lib);
+                announce_fetch_failure(&state, state.play_lib, idx, 1);
                 state.pending_valid = 0;
                 if (count > 1) {
                     size_t nxt = take_next_index(&state, count, idx, 0);
-                    request_play(library, &state, nxt);
+                    request_play(&state, nxt);
                 }
             }
         }
@@ -2663,15 +2931,15 @@ int main(int argc, char **argv) {
                         int active = state.fetch_active && state.fetch_index == idx;
                         fetch_unlock(&state);
                         if (ready) commit_fetch(&state, idx);
-                        else if (!active) start_fetch(library, &state, idx);
+                        else if (!active) start_fetch(&state, idx);
                     } else if (state.autoplay) {
-                        size_t count = library_handler_track_count(library);
+                        size_t count = library_handler_track_count(state.play_lib);
                         size_t next = count ? take_next_index(&state, count, state.selected_track, 1)
                                             : state.selected_track;
                         state.pending_valid = 1;
                         state.pending_index = next;
                         state.autoplay_advancing = 1;
-                        start_fetch(library, &state, next);
+                        start_fetch(&state, next);
                     } else {
                         /* Autoplay off and nothing queued: the track is over.
                          * Publish is_playing=false -- the earlier write_status()
@@ -2699,7 +2967,7 @@ int main(int argc, char **argv) {
                 if (event.type == SDL_QUIT) { running = 0; }
                 else if (event.type == SDL_DROPFILE) {
                     if (event.drop.file) {
-                        handle_dropped_file(library_path, &state, event.drop.file, &library, &ripper);
+                        handle_dropped_file(state.library_path, &state, event.drop.file, &library, &ripper);
                         SDL_free(event.drop.file);
                     }
                     continue;
@@ -2717,7 +2985,7 @@ int main(int argc, char **argv) {
                     nk_layout_row_dynamic(ctx, 24, 1); nk_label(ctx, state.status[0] ? state.status : "Choose a library track or add a source route.", NK_TEXT_LEFT);
                     float body = (float)wh - 32 - 24 - 34;
                     if (body < 80) body = 80;
-                    nk_layout_row_dynamic(ctx, body, 2); draw_library(ctx, library, &state); draw_scraper(ctx, &state, &library, library_path, &ripper);
+                    nk_layout_row_dynamic(ctx, body, 2); draw_library(ctx, library, &state); draw_scraper(ctx, &state, &library, state.library_path, &ripper);
                 }
             }
             nk_end(ctx);
@@ -2733,6 +3001,6 @@ int main(int argc, char **argv) {
     pthread_mutex_destroy(&state.fetch_mutex);
     stop_ssh_agent(&state);
     if (!headless) { nk_sdl_shutdown(); SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window); }
-    SDL_Quit(); assembler_destroy(assembler); library_handler_close(library);
+    SDL_Quit(); assembler_destroy(assembler); library_handler_close(library); library_handler_close(state.play_lib);
     return 0;
 }

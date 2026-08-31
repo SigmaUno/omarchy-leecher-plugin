@@ -2,7 +2,7 @@
 set -eu
 
 # Stops and removes only the service and installed binaries. The music library
-# is intentionally preserved at $LEECHER_MEDIA_DIR/library.json for safety.
+# is intentionally preserved at $LEECHER_MEDIA_DIR/library/ for safety.
 
 data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}
 config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}

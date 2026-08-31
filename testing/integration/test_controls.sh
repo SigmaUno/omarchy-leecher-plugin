@@ -74,6 +74,16 @@ stop_app() { kill -TERM "$APP_PID" 2>/dev/null; wait "$APP_PID" 2>/dev/null; }
 launch
 wait_for '.title != "" and .is_playing == true' "autoplay starts a track" || exit 1
 
+# The fixture ships a single-file library.json; the backend migrates it into a
+# library/ directory as home.json. Everything below asserts against the real
+# viewed-playlist file the status reports.
+libfile=$(jq -r '.library' "$D/status.json")
+libdir=$(dirname "$libfile")
+jq -e '.playlists == ["home"] and .viewed_playlist == "home" and .playing_playlist == "home"' \
+    "$D/status.json" >/dev/null 2>&1 \
+    && pass "legacy library.json migrated to library/home.json" \
+    || { fail "legacy library.json migrated to library/home.json"; jq '{playlists,viewed_playlist,playing_playlist,library}' "$D/status.json"; }
+
 # ---- transport ---------------------------------------------------------------
 send "play_pause"
 wait_for '.is_playing == false' "play_pause pauses"
@@ -169,31 +179,31 @@ send "frobnicate"
 wait_for '.status | test("Unknown control command")' "unknown command reported"
 
 # ---- autoplay skips a broken source --------------------------------------
-python3 - "$work" <<'PY'
+python3 - "$libfile" "$work" <<'PY'
 import json, sys
-d = sys.argv[1]
-lib = json.load(open(f"{d}/lib/library.json"))
+f, d = sys.argv[1], sys.argv[2]
+lib = json.load(open(f))
 lib["tracks"].append({
     "title": "Broken", "artist": "x", "album": "y",
     "sources": [{"kind": "local", "PATH": f"{d}/does-not-exist.wav",
                  "USERNAME": None, "URL": None, "IP": None}],
 })
-json.dump(lib, open(f"{d}/lib/library.json", "w"))
+json.dump(lib, open(f, "w"))
 PY
-broken_idx=$(jq '.tracks | length - 1' "$work/lib/library.json")
+broken_idx=$(jq '.tracks | length - 1' "$libfile")
 send "play $broken_idx"
 wait_for '.status | test("Skipped|Could not play")' "broken source is reported, not silent"
 
 # ---- library mutation mid-playback keeps playing (#11) -------------------
 send "play 0"
 wait_for '.track_index == 0 and .is_playing == true' "back on a real track"
-before=$(jq '.tracks | length' "$work/lib/library.json")
+before=$(jq '.tracks | length' "$libfile")
 "$here/make_fixture.sh" "$work/extra" >/dev/null
 add=$work/extra/track0.wav
 send "add_local $add"
 wait_for '.is_playing == true' "playback survives a mid-playback add"
 wait_for '.status | test("[Ii]mport")' "add reported"
-after=$(jq '.tracks | length' "$work/lib/library.json")
+after=$(jq '.tracks | length' "$libfile")
 [ "$after" -gt "$before" ] && pass "added track landed in the library" \
     || fail "added track landed in the library"
 # position must still be advancing after the reload settles
@@ -206,9 +216,9 @@ q2=$(jq '.position_ms' "$D/status.json")
 send "set_fields 0 Renamed%20Track NewArtist NewAlbum"
 wait_for '.status | test("[Uu]pdate")' "set_fields reported"
 jq -e '.tracks[0].title == "Renamed Track" and .tracks[0].artist == "NewArtist"' \
-    "$work/lib/library.json" >/dev/null 2>&1 \
+    "$libfile" >/dev/null 2>&1 \
     && pass "set_fields wrote the new title/artist" \
-    || { fail "set_fields wrote the new title/artist"; jq '.tracks[0]' "$work/lib/library.json"; }
+    || { fail "set_fields wrote the new title/artist"; jq '.tracks[0]' "$libfile"; }
 
 # ---- behaviour at the end of a track -----------------------------------------
 # playing() asserts a track is actually committed (fetch done) so a follow-up
@@ -258,11 +268,11 @@ wait_for '.is_playing == false' "paused before restart"
 sleep 0.5   # let the pause + resume-file write settle before SIGTERM
 stop_app
 
-resume=$(dirname "$lib")/resume.json
+resume="$libdir/.resume.json"
 [ -f "$resume" ] && pass "resume.json was written" || fail "resume.json was written"
-jq -e '.track_index == 1 and .position_ms >= 8000 and .is_playing == false' "$resume" >/dev/null 2>&1 \
-    && pass "resume.json holds track / position / paused state" \
-    || { fail "resume.json holds track / position / paused state"; cat "$resume"; }
+jq -e '.playlist == "home" and .track_index == 1 and .position_ms >= 8000 and .is_playing == false' "$resume" >/dev/null 2>&1 \
+    && pass "resume.json holds playlist / track / position / paused state" \
+    || { fail "resume.json holds playlist / track / position / paused state"; cat "$resume"; }
 
 launch
 wait_for '.track_index == 1 and .is_playing == false and .position_ms >= 6000 and .position_ms < 18000' \
@@ -271,6 +281,45 @@ before_pos=$(jq '.position_ms' "$D/status.json"); sleep 0.7
 wait_for '.is_playing == false' "resumed track stays paused"
 send "play_pause"
 wait_for '.is_playing == true' "play resumes after the restart"
+
+# ---- multiple playlists -----------------------------------------------------
+send "play 0"
+wait_for '.track_index == 0 and .is_playing == true' "playing home track 0"
+
+send "playlist_new roadtrip"
+wait_for '.playlists | index("roadtrip") != null' "playlist_new creates a playlist"
+wait_for '.viewed_playlist == "roadtrip"' "new playlist becomes the viewed one"
+[ -f "$libdir/roadtrip.json" ] && pass "playlist file written to library/" \
+    || fail "playlist file written to library/"
+# playback keeps running over home while roadtrip is merely viewed
+jq -e '.playing_playlist == "home" and .title != ""' "$D/status.json" >/dev/null 2>&1 \
+    && pass "playback stays on home while viewing roadtrip" \
+    || { fail "playback stays on home while viewing roadtrip"; jq '{playing_playlist,viewed_playlist,title}' "$D/status.json"; }
+
+send "playlist_new bad/name"
+wait_for '.status | test("Invalid playlist name")' "an invalid playlist name is rejected"
+jq -e '.playlists | index("bad/name") == null' "$D/status.json" >/dev/null 2>&1 \
+    && pass "the rejected name creates no file" || fail "the rejected name creates no file"
+
+send "playlist nope"
+wait_for '.status | test("No such playlist")' "switching to a missing playlist is rejected"
+
+# add a track to roadtrip, then play it: playback must move to roadtrip
+send "playlist roadtrip"
+wait_for '.viewed_playlist == "roadtrip"' "back to viewing roadtrip"
+"$here/make_fixture.sh" "$work/rt" >/dev/null
+send "add_local $work/rt/track0.wav"
+wait_for '.status | test("[Ii]mport")' "track added to roadtrip"
+send "play 0"
+wait_for '.playing_playlist == "roadtrip" and .is_playing == true' \
+    "playing a roadtrip track switches playback to roadtrip"
+
+send "playlist home"
+wait_for '.viewed_playlist == "home" and .playing_playlist == "roadtrip"' \
+    "home can be viewed while roadtrip plays"
+send "play 2"
+wait_for '.playing_playlist == "home" and .track_index == 2' \
+    "playing a home track switches playback back to home"
 
 # --------------------------------------------------------------------------
 echo

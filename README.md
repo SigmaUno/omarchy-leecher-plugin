@@ -46,6 +46,10 @@ require `sudo`.
 - Use the library button in the panel to select, add, edit, or remove tracks.
   Choose **Add local song** and enter the full path to an audio file; its tags
   are imported automatically, with the filename used when tags are absent.
+- The panel holds multiple playlists. The strip next to "Library" lists each one;
+  click a tab to browse it, or the framed **+** to type a new playlist name
+  inline. Playing a track from a tab switches playback to that playlist; the tab
+  it left keeps a half-tint while it is still the one playing.
 - Right-click the widget to hide it or collapse it to a restorable handle.
 
 ## Remove
@@ -56,8 +60,10 @@ omarchy plugin remove leecher.media
 ```
 
 Removing the plugin does not remove your music library. The backend uninstall
-stops its user service and removes installed binaries, while preserving
-`$XDG_DATA_HOME/leecher-media/library.json`.
+stops its user service and removes installed binaries, while preserving your
+playlists in `$XDG_DATA_HOME/leecher-media/library/` (an existing single-file
+`library.json` from an older version is migrated to `library/home.json` on the
+first run).
 
 ## Privacy and security
 

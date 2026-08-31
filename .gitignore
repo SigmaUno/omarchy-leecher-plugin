@@ -9,15 +9,14 @@
 backend/app
 backend/library-handler
 
+# Playlist directory created when the backend runs from the checkout
+/backend/library/
+
 # Local development helpers -- not shipped. install-backend.sh and
 # uninstall-backend.sh are the supported scripts; these just wrap a
 # deploy-to-live-config and a shell restart for iterating on the widget.
 copybarwidget.sh
 reset.sh
 
-# The testing/ suite is tracked on the `testing` branch only and must not
-# reach `main`; only its build/run artifacts are ignored.
-testing/**/tmp/
-testing/**/*.o
-testing/**/build/
-testing/unit/test_backend_logic
+# Scratch space for local testing (throwaway libraries, runtime dirs, ...)
+testing/

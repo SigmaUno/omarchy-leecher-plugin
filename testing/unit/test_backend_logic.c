@@ -321,6 +321,7 @@ static void test_write_resume(void) {
     size_t ti = 0;
     Uint32 pos = 0;
     int playing = -1;
+    char pl[96] = "";
     assert(fd >= 0);
     close(fd);
     unlink(path);
@@ -329,21 +330,23 @@ static void test_write_resume(void) {
     s.selected_track = (size_t)-1;
     s.duration_ms = 0;
     write_resume(&s);
-    CHECK(fopen(path, "r") == NULL || read_resume(&ti, &pos, &playing) == 0);  /* nothing written */
+    CHECK(fopen(path, "r") == NULL || read_resume(pl, sizeof(pl), &ti, &pos, &playing) == 0);  /* nothing written */
 
+    snprintf(s.playing_playlist, sizeof(s.playing_playlist), "%s", "road trip");
     s.selected_track = 5;
     s.position_ms = 87654;
     s.duration_ms = 200000;
     s.is_playing = 0;
     write_resume(&s);
-    CHECK(read_resume(&ti, &pos, &playing) == 1);
+    CHECK(read_resume(pl, sizeof(pl), &ti, &pos, &playing) == 1);
     CHECK_EQ_SIZE(ti, 5);
     CHECK(pos == 87654);
     CHECK(playing == 0);
+    CHECK_STR(pl, "road trip");
 
     s.is_playing = 1;
     write_resume(&s);
-    CHECK(read_resume(&ti, &pos, &playing) == 1 && playing == 1);
+    CHECK(read_resume(pl, sizeof(pl), &ti, &pos, &playing) == 1 && playing == 1);
 
     unlink(path);
     resume_file[0] = '\0';
@@ -359,29 +362,113 @@ static void test_resume_roundtrip(void) {
     size_t ti = 999;
     Uint32 pos = 999;
     int playing = -1;
+    char pl[96] = "sentinel";
 
     /* what write_resume() actually emits */
-    write_file(path, "{\"track_index\":3,\"position_ms\":125000,\"is_playing\":true}\n");
-    CHECK(read_resume(&ti, &pos, &playing) == 1);
+    write_file(path, "{\"playlist\":\"home\",\"track_index\":3,\"position_ms\":125000,\"is_playing\":true}\n");
+    CHECK(read_resume(pl, sizeof(pl), &ti, &pos, &playing) == 1);
     CHECK_EQ_SIZE(ti, 3);
     CHECK(pos == 125000);
     CHECK(playing == 1);
+    CHECK_STR(pl, "home");
 
-    write_file(path, "{\"track_index\":0,\"position_ms\":0,\"is_playing\":false}\n");
-    CHECK(read_resume(&ti, &pos, &playing) == 1);
+    write_file(path, "{\"playlist\":\"chill\",\"track_index\":0,\"position_ms\":0,\"is_playing\":false}\n");
+    CHECK(read_resume(pl, sizeof(pl), &ti, &pos, &playing) == 1);
     CHECK_EQ_SIZE(ti, 0);
     CHECK(pos == 0);
     CHECK(playing == 0);          /* the off-by-one that shipped once */
+    CHECK_STR(pl, "chill");
+
+    /* a legacy file with no playlist field still parses; playlist comes back empty */
+    write_file(path, "{\"track_index\":1,\"position_ms\":5,\"is_playing\":true}\n");
+    CHECK(read_resume(pl, sizeof(pl), &ti, &pos, &playing) == 1 && pl[0] == '\0');
 
     write_file(path, "garbage not json");
-    CHECK(read_resume(&ti, &pos, &playing) == 0);
+    CHECK(read_resume(pl, sizeof(pl), &ti, &pos, &playing) == 0);
 
     write_file(path, "{\"position_ms\":10}");   /* no track_index */
-    CHECK(read_resume(&ti, &pos, &playing) == 0);
+    CHECK(read_resume(pl, sizeof(pl), &ti, &pos, &playing) == 0);
 
     unlink(path);
     resume_file[0] = '\0';
-    CHECK(read_resume(&ti, &pos, &playing) == 0);   /* no path -> no resume */
+    CHECK(read_resume(pl, sizeof(pl), &ti, &pos, &playing) == 0);   /* no path -> no resume */
+}
+
+/* ------------------------------------------------------------- playlists */
+
+static void test_valid_playlist_name(void) {
+    CHECK(valid_playlist_name("home"));
+    CHECK(valid_playlist_name("Road Trip 2"));
+    CHECK(valid_playlist_name("a-b_c"));
+    CHECK(!valid_playlist_name(""));
+    CHECK(!valid_playlist_name(" leading"));
+    CHECK(!valid_playlist_name("trailing "));
+    CHECK(!valid_playlist_name("bad/name"));
+    CHECK(!valid_playlist_name("dots.here"));
+    CHECK(!valid_playlist_name(".."));
+    CHECK(!valid_playlist_name("tab\there"));
+    {
+        char long_name[80];
+        memset(long_name, 'x', sizeof(long_name));
+        long_name[64] = '\0';
+        CHECK(valid_playlist_name(long_name));   /* exactly 64 */
+        long_name[65] = '\0';
+        long_name[64] = 'x';
+        CHECK(!valid_playlist_name(long_name));   /* 65 */
+    }
+}
+
+static void test_scan_and_known_playlists(void) {
+    char dir[] = "/tmp/leecher-pl.XXXXXX";
+    AppState s = {0};
+    assert(mkdtemp(dir));
+    snprintf(s.library_dir, sizeof(s.library_dir), "%s", dir);
+
+    { char p[600]; snprintf(p, sizeof(p), "%s/home.json", dir); write_file(p, EMPTY_LIBRARY_JSON); }
+    { char p[600]; snprintf(p, sizeof(p), "%s/chill.json", dir); write_file(p, EMPTY_LIBRARY_JSON); }
+    { char p[600]; snprintf(p, sizeof(p), "%s/Ambient.json", dir); write_file(p, EMPTY_LIBRARY_JSON); }
+    { char p[600]; snprintf(p, sizeof(p), "%s/.resume.json", dir); write_file(p, "{}"); }
+    { char p[600]; snprintf(p, sizeof(p), "%s/notes.txt", dir); write_file(p, "x"); }
+
+    scan_playlists(&s);
+    CHECK_EQ_SIZE((size_t)s.playlist_count, 3);   /* .resume.json and notes.txt skipped */
+    CHECK_STR(s.playlists[0], "home");             /* home always sorts first */
+    CHECK_STR(s.playlists[1], "Ambient");          /* then case-insensitive alpha */
+    CHECK_STR(s.playlists[2], "chill");
+    CHECK(playlist_known(&s, "chill"));
+    CHECK(!playlist_known(&s, "missing"));
+
+    { char p[600]; snprintf(p, sizeof(p), "%s/home.json", dir); unlink(p); }
+    { char p[600]; snprintf(p, sizeof(p), "%s/chill.json", dir); unlink(p); }
+    { char p[600]; snprintf(p, sizeof(p), "%s/Ambient.json", dir); unlink(p); }
+    { char p[600]; snprintf(p, sizeof(p), "%s/.resume.json", dir); unlink(p); }
+    { char p[600]; snprintf(p, sizeof(p), "%s/notes.txt", dir); unlink(p); }
+    rmdir(dir);
+}
+
+static void test_resolve_library_dir_migrates(void) {
+    char base[] = "/tmp/leecher-mig.XXXXXX";
+    AppState s = {0};
+    char legacy[PATH_MAX];
+    char arg[PATH_MAX], home[PATH_MAX];
+    FILE *f;
+    assert(mkdtemp(base));
+    snprintf(arg, sizeof(arg), "%s/library.json", base);
+    write_file(arg, "{\"version\":1,\"tracks\":[{\"title\":\"T\",\"artist\":\"A\",\"album\":\"B\",\"sources\":[]}]}\n");
+
+    resolve_library_dir(arg, &s, legacy, sizeof(legacy));
+
+    snprintf(home, sizeof(home), "%s/library/home.json", base);
+    f = fopen(home, "r");
+    CHECK(f != NULL);                       /* the legacy file was migrated in */
+    if (f) fclose(f);
+    CHECK_EQ_SIZE((size_t)s.playlist_count, 1);
+    CHECK_STR(s.playlists[0], "home");
+    CHECK(strstr(s.library_dir, "/library") != NULL);
+
+    unlink(arg); unlink(home);
+    { char d[PATH_MAX]; snprintf(d, sizeof(d), "%s/library", base); rmdir(d); }
+    rmdir(base);
 }
 
 /* -------------------------------------------------------- library_handler */
@@ -507,6 +594,9 @@ int main(void) {
         { "library_handler",     test_library_handler },
         { "write_resume",        test_write_resume },
         { "resume_roundtrip",    test_resume_roundtrip },
+        { "valid_playlist_name", test_valid_playlist_name },
+        { "scan_known_playlists", test_scan_and_known_playlists },
+        { "resolve_library_dir", test_resolve_library_dir_migrates },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         int before = failures;
