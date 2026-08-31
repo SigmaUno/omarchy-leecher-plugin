@@ -2154,6 +2154,7 @@ int main(int argc, char **argv) {
     AppState state = {0};
     state.method = SOURCE_LOCAL;
     state.autoplay = 1;
+    srand((unsigned)(time(NULL) ^ ((long)getpid() << 8)));  /* shuffle next-track picks */
     state.fetch_index = (size_t)-1;
     state.immediate_index = (size_t)-1;
     state.pending_index = (size_t)-1;
@@ -2236,7 +2237,7 @@ int main(int argc, char **argv) {
                 size_t count = library_handler_track_count(library);
                 state.immediate_pending = 0;
                 if (state.autoplay && state.autoplay_advancing && count > 1) {
-                    size_t nxt = (state.immediate_index + 1) % count;
+                    size_t nxt = next_autoplay_index(&state, count, state.immediate_index, 0);
                     announce_fetch_failure(&state, library, state.immediate_index, 1);
                     request_play(library, &state, nxt);
                 } else {
@@ -2286,7 +2287,7 @@ int main(int argc, char **argv) {
                 announce_fetch_failure(&state, library, idx, 1);
                 state.pending_valid = 0;
                 if (count > 1) {
-                    size_t nxt = (idx + 1) % count;
+                    size_t nxt = next_autoplay_index(&state, count, idx, 0);
                     request_play(library, &state, nxt);
                 }
             }
@@ -2325,27 +2326,37 @@ int main(int argc, char **argv) {
                 state.audio_retries = 0;
             }
             if (!state.track_ended && state.duration_ms > 0 && p >= state.duration_ms - 250u) {
-                state.track_ended = 1;
                 state.position_ms = state.duration_ms;
-                write_status(&state);
-                if (state.pending_valid) {
-                    size_t idx = state.pending_index;
-                    fetch_lock(&state);
-                    int ready = state.fetch_ready && state.fetch_index == idx;
-                    int active = state.fetch_active && state.fetch_index == idx;
-                    fetch_unlock(&state);
-                    if (ready) commit_fetch(&state, idx);
-                    else if (!active) start_fetch(library, &state, idx);
-                } else if (state.autoplay) {
-                    size_t count = library_handler_track_count(library);
-                    size_t next = count ? (state.selected_track + 1) % count : state.selected_track;
-                    state.pending_valid = 1;
-                    state.pending_index = next;
-                    state.autoplay_advancing = 1;
-                    start_fetch(library, &state, next);
+                if (state.autoplay && state.repeat_one && state.decoder && state.audio_device) {
+                    /* Replay in place: no fetch, just rewind the open decoder. */
+                    if (state.pending_valid) { cancel_fetch(&state); state.pending_valid = 0; }
+                    seek_ms(&state, 0);
+                    snprintf(state.status, sizeof(state.status), "Repeating: %s",
+                             state.title[0] ? state.title : "track");
+                    write_status(&state);
                 } else {
-                    state.is_playing = 0;
-                    SDL_PauseAudioDevice(state.audio_device, 1);
+                    state.track_ended = 1;
+                    write_status(&state);
+                    if (state.pending_valid) {
+                        size_t idx = state.pending_index;
+                        fetch_lock(&state);
+                        int ready = state.fetch_ready && state.fetch_index == idx;
+                        int active = state.fetch_active && state.fetch_index == idx;
+                        fetch_unlock(&state);
+                        if (ready) commit_fetch(&state, idx);
+                        else if (!active) start_fetch(library, &state, idx);
+                    } else if (state.autoplay) {
+                        size_t count = library_handler_track_count(library);
+                        size_t next = count ? next_autoplay_index(&state, count, state.selected_track, 1)
+                                            : state.selected_track;
+                        state.pending_valid = 1;
+                        state.pending_index = next;
+                        state.autoplay_advancing = 1;
+                        start_fetch(library, &state, next);
+                    } else {
+                        state.is_playing = 0;
+                        SDL_PauseAudioDevice(state.audio_device, 1);
+                    }
                 }
             }
         }
