@@ -737,6 +737,11 @@ BarWidget {
         var m = /^(.*\S)\s*\((\d{1,3})\)\s*$/.exec(String(title || ""));
         return m ? m[2] : "";
     }
+    /* Display form: the number keeps its parentheses, "(16)" not "16". */
+    function trackNumberLabel(title) {
+        var n = root.trackNumberOf(title);
+        return n === "" ? "" : "(" + n + ")";
+    }
     function titleWithoutNumber(title) {
         var s = String(title || "");
         var m = /^(.*\S)\s*\((\d{1,3})\)\s*$/.exec(s);
@@ -1114,7 +1119,7 @@ BarWidget {
                             id: nowTrackNumber
                             anchors.right: parent.right
                             anchors.top: parent.top
-                            text: root.trackNumberOf(root.title)
+                            text: root.trackNumberLabel(root.title)
                             visible: root.hasTrack && text !== ""
                             textFormat: Text.PlainText
                             color: Qt.darker(root.bar.foreground, 1.5)
@@ -2230,7 +2235,7 @@ BarWidget {
                                             id: rowTrackNumber
                                             anchors.right: parent.right
                                             anchors.verticalCenter: parent.verticalCenter
-                                            text: root.trackNumberOf(modelData.title)
+                                            text: root.trackNumberLabel(modelData.title)
                                             visible: text !== ""
                                             textFormat: Text.PlainText
                                             color: Qt.darker(root.bar.foreground, 1.6)

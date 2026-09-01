@@ -55,6 +55,9 @@ check("enc(unicode kept)", enc("café"), "café");
 // ---- track number split (right-aligned in the library and now-playing) ----
 const trackNumberOf = load("trackNumberOf");
 const titleWithoutNumber = load("titleWithoutNumber");
+// trackNumberLabel calls root.trackNumberOf, so hand the eval'd copy a root.
+const root = { trackNumberOf };
+const trackNumberLabel = load("trackNumberLabel");
 for (const [title, num, rest] of [
   ["Banana Co. (16)", "16", "Banana Co."],
   ["The Call Of Ktulu (08)", "08", "The Call Of Ktulu"],
@@ -69,6 +72,7 @@ for (const [title, num, rest] of [
   ["", "", ""],
 ]) {
   check(`trackNumberOf(${JSON.stringify(title)})`, trackNumberOf(title), num);
+  check(`trackNumberLabel(${JSON.stringify(title)})`, trackNumberLabel(title), num === "" ? "" : `(${num})`);
   check(`titleWithoutNumber(${JSON.stringify(title)})`, titleWithoutNumber(title), rest);
 }
 
