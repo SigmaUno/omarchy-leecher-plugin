@@ -67,6 +67,7 @@ BarWidget {
                             root.runtimeDirSafe = true;
                             root.restatNeeded = false;
                             root.refresh();
+                            root.pumpCommandQueue();
                         } else {
                             root.runtimeDirSafe = false;
                         }
@@ -119,8 +120,18 @@ BarWidget {
     property string statusText: ""
     property int lastCommandId: 0
     property int pendingCommandId: -1
-    property bool commandAcked: true
     property bool reloadOnAck: false
+    /* Outgoing control commands, oldest first. The backend reads one line per
+     * poll and a client write truncates the control file, so commands fired in
+     * a burst (dropping several files, fast clicks) used to clobber each other
+     * -- only the last survived. Send strictly one at a time and advance only
+     * when the backend echoes that command's id back as `cmd_id`. */
+    property var commandQueue: []
+    property int commandRetries: 0
+    /* First token of these is a "set to value" the backend applies idempotently,
+     * so a still-queued one is replaced in place rather than piling up during a
+     * volume/seek drag. */
+    readonly property var coalescableCommands: ["volume", "seek", "mute", "output", "autoplay", "shuffle", "repeat"]
     property var tracks: []
     property var queue: []
     property string librarySearch: ""
@@ -327,23 +338,64 @@ BarWidget {
         }
         return out;
     }
-    function sendControlRaw(cmdLine) {
+    function sendControlRaw(cmdLine, coalesceKey) {
         if (!root.runtimeDirSafe)
             return;
-        root.lastCommandId = (root.lastCommandId + 1) & 0x7fffffff;
-        root.pendingCommandId = root.lastCommandId;
-        root.commandAcked = false;
-        /* Quote the literal control path so a runtime dir with spaces still
-         * resolves to a single redirection target. `cmdLine` is either one
-         * already-encoded token (enc()) or a list of encoded tokens joined by
-         * literal spaces: the backend splits encoded tokens on spaces, so the
-         * separator must never itself be encoded. */
-        Quickshell.execDetached(["sh", "-c", "printf '%s\\n' '" + root.lastCommandId + " " + cmdLine + "' > \"" + root.controlFile + "\""]);
+        var entry = { line: cmdLine, reload: root.reloadOnAck, key: coalesceKey || "" };
+        root.reloadOnAck = false;
+        var q = root.commandQueue.slice();
+        /* Replace an equivalent command still waiting in the queue (never the
+         * in-flight head at q[0]) so a drag does not enqueue a run of stale
+         * "set to value" writes. */
+        var firstReplaceable = root.pendingCommandId >= 0 ? 1 : 0;
+        if (entry.key !== "" && root.coalescableCommands.indexOf(entry.key) !== -1) {
+            for (var i = q.length - 1; i >= firstReplaceable; i--) {
+                if (q[i].key === entry.key) {
+                    entry.reload = entry.reload || q[i].reload;
+                    q[i] = entry;
+                    root.commandQueue = q;
+                    root.pumpCommandQueue();
+                    return;
+                }
+            }
+        }
+        q.push(entry);
+        root.commandQueue = q;
+        root.pumpCommandQueue();
     }
     function sendControl(cmd) {
         /* Encode the payload so values (titles/artists/albums) can contain
          * newlines or shell-special characters without corrupting the line. */
-        root.sendControlRaw(enc(cmd));
+        root.sendControlRaw(enc(cmd), String(cmd).split(" ")[0]);
+    }
+    /* Fire the head of the queue if nothing is in flight. */
+    function pumpCommandQueue() {
+        if (root.pendingCommandId >= 0 || root.commandQueue.length === 0 || !root.runtimeDirSafe)
+            return;
+        root.lastCommandId = (root.lastCommandId + 1) & 0x7fffffff;
+        root.pendingCommandId = root.lastCommandId;
+        root.commandRetries = 0;
+        root.writeControlLine(root.pendingCommandId, root.commandQueue[0].line);
+        commandAckTimer.restart();
+    }
+    function writeControlLine(id, line) {
+        /* Quote the literal control path so a runtime dir with spaces still
+         * resolves to a single redirection target. `line` is either one
+         * already-encoded token (enc()) or encoded tokens joined by literal
+         * spaces the backend splits on -- the separator is never encoded. */
+        Quickshell.execDetached(["sh", "-c", "printf '%s\\n' '" + id + " " + line + "' > \"" + root.controlFile + "\""]);
+    }
+    /* The backend echoed the in-flight command's id: drop it and send the next. */
+    function onControlAck() {
+        commandAckTimer.stop();
+        root.pendingCommandId = -1;
+        root.commandRetries = 0;
+        var q = root.commandQueue.slice();
+        var done = q.shift();
+        root.commandQueue = q;
+        if (done && done.reload)
+            Qt.callLater(root.loadLibrary);
+        root.pumpCommandQueue();
     }
     /* Single-command multi-field edit: each value is percent-encoded with enc()
      * (no literal spaces/quotes/newlines remain), so the three values are joined
@@ -717,19 +769,15 @@ BarWidget {
         if (root.lastCommandId === 0 && typeof data.cmd_id === "number" && data.cmd_id > 0)
             root.lastCommandId = Number(data.cmd_id);
         /* Command acknowledgment: when the backend echoes the id we sent with a
-         * control write, a previously-issued command has been processed. Only
-         * then do we let the backend's autoplay value override an optimistic
-         * local toggle; otherwise the echo would wipe a not-yet-applied tweak. */
+         * control write, that command has been processed -- advance the queue.
+         * Only with nothing in flight do we let the backend's autoplay value
+         * override an optimistic local toggle; else the echo would wipe a
+         * not-yet-applied tweak. */
         if (data.cmd_id !== undefined && data.cmd_id !== null &&
             root.pendingCommandId >= 0 && Number(data.cmd_id) === root.pendingCommandId) {
-            root.commandAcked = true;
-            root.pendingCommandId = -1;
-            if (root.reloadOnAck) {
-                root.reloadOnAck = false;
-                Qt.callLater(root.loadLibrary);
-            }
+            root.onControlAck();
         }
-        if (root.pendingCommandId < 0) {
+        if (root.pendingCommandId < 0 && root.commandQueue.length === 0) {
             root.autoplay = data.autoplay !== false;
             root.shuffle = data.shuffle === true;
             root.repeatOne = data.repeat_one === true;
@@ -806,6 +854,34 @@ BarWidget {
         interval: 120
         repeat: false
         onTriggered: root.setVolume(root.volume)
+    }
+
+    /* Safety net for the command queue: a `cmd_id` echo the widget never saw
+     * would otherwise stall every later command. Re-send the head with the
+     * SAME id (the backend dedupes it if it already ran) a few times, then drop
+     * it and move on. In practice the backend keeps the last id in every status
+     * write, so this rarely fires. */
+    Timer {
+        id: commandAckTimer
+        interval: 1500
+        repeat: false
+        onTriggered: {
+            if (root.pendingCommandId < 0 || root.commandQueue.length === 0)
+                return;
+            if (root.commandRetries < 3 && root.runtimeDirSafe) {
+                root.commandRetries++;
+                root.writeControlLine(root.pendingCommandId, root.commandQueue[0].line);
+                commandAckTimer.restart();
+                return;
+            }
+            root.statusText = "A control command was not acknowledged.";
+            var q = root.commandQueue.slice();
+            q.shift();
+            root.commandQueue = q;
+            root.pendingCommandId = -1;
+            root.commandRetries = 0;
+            root.pumpCommandQueue();
+        }
     }
 
     /* Watch status.json with an in-process file watcher instead of re-spawning
@@ -2333,9 +2409,10 @@ BarWidget {
                     root.statusText = "Drop a local audio file to add it.";
                     return;
                 }
+                /* Each add is queued and sent one at a time; the per-command
+                 * reload-on-ack refreshes the list as each file lands. */
                 for (i = 0; i < paths.length; i++)
                     root.addLocalTrack(paths[i]);
-                root.loadLibrary();
             }
         }
     }
