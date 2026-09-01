@@ -58,9 +58,9 @@ SSH and network sources stream over a single multiplexed `ssh` connection per
 host (OpenSSH `ControlMaster`), so only the first track of a session pays the
 connection handshake; later tracks, their metadata, and their cover art reuse
 it. The control sockets live in `$XDG_RUNTIME_DIR/leecher/ssh/` and are removed
-on exit. Playback of a remote FLAC or WAV begins as soon as its header and a
-short buffer have arrived rather than after the whole file downloads; other
-formats still download fully before playback starts.
+on exit. Playback of a remote FLAC begins as soon as its header and a short
+buffer have arrived rather than after the whole file downloads; other formats
+still download fully before playback starts.
 
 ## Remove
 
