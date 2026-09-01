@@ -15,6 +15,8 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -352,6 +354,26 @@ static char *source_json(const LibrarySource *source) {
     if (!append_text(json, capacity, &length, "{\"kind\":") || !append_json_string(json, capacity, &length, kind) || !append_text(json, capacity, &length, ",\"PATH\":") || !append_json_value(json, capacity, &length, source->path) || !append_text(json, capacity, &length, ",\"USERNAME\":") || !append_json_value(json, capacity, &length, source->username) || !append_text(json, capacity, &length, ",\"URL\":") || !append_json_value(json, capacity, &length, source->url) || !append_text(json, capacity, &length, ",\"IP\":") || !append_json_value(json, capacity, &length, source->ip) || !append_text(json, capacity, &length, "}")) { free(json); return NULL; }
     return json;
 }
+/* Best-effort fsync of the directory holding `path`, so a rename(2) into it is
+ * durable across a power loss and not just a clean exit.  Mirrors the identical
+ * helper in app.c (kept separate so this file still builds standalone). */
+static void fsync_parent_dir(const char *path) {
+    char dir[PATH_MAX];
+    const char *slash = strrchr(path, '/');
+    int fd;
+    if (!slash) { dir[0] = '.'; dir[1] = '\0'; }
+    else if (slash == path) { dir[0] = '/'; dir[1] = '\0'; }
+    else {
+        size_t len = (size_t)(slash - path);
+        if (len >= sizeof(dir)) return;
+        memcpy(dir, path, len);
+        dir[len] = '\0';
+    }
+    fd = open(dir, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    fsync(fd);
+    close(fd);
+}
 static int write_atomic(const char *path, const char *data, size_t size) {
     size_t template_length = strlen(path) + 16;
     char *temporary_path = malloc(template_length);
@@ -370,6 +392,7 @@ static int write_atomic(const char *path, const char *data, size_t size) {
     if (!ok) { unlink(temporary_path); free(temporary_path); return 0; }
     ok = rename(temporary_path, path) == 0;
     if (!ok) unlink(temporary_path);
+    else fsync_parent_dir(path);
     free(temporary_path);
     return ok;
 }
