@@ -825,24 +825,16 @@ static char *remote_find_command(const char *path) {
  * argv element, so nothing local is interpreted. USERNAME/IP are validated so a
  * crafted value cannot become extra arguments. Returns the ssh exit status, or
  * -1 on validation/exec/setup failure. */
-/* Fill `out` (capacity >= 32) with an ssh argv: the hardening flags, the shared
- * connection-multiplexing options (ssh_opts), then `-- target remote_cmd`.
- * `stream_flags` adds the extra options the long-lived transfer/listing calls
- * use. Safe to call after fork (no allocation). out[count] is left NULL. */
-static void build_ssh_argv(const char *out[], int stream_flags,
-                           const char *target, const char *remote_cmd) {
+/* Fill `out` with an ssh argv: the connection-hardening flags, the shared
+ * multiplexing options (ssh_opts), then `-- target remote_cmd`. Needs capacity
+ * for 3 + SSH_HARDENING_OPTS_ARGV_COUNT + 6 + 4 == 27 elements. Safe to call
+ * after fork (no allocation). out[count] is left NULL. */
+static void build_ssh_argv(const char *out[], const char *target, const char *remote_cmd) {
+    static const char *const hardening[] = { SSH_HARDENING_OPTS_ARGV };
     size_t n = 0, opt_n = 0, i;
     const char *const *opts;
     out[n++] = "ssh"; out[n++] = "-F"; out[n++] = "/dev/null";
-    out[n++] = "-o"; out[n++] = "BatchMode=yes";
-    if (stream_flags) {
-        out[n++] = "-o"; out[n++] = "RequestTTY=no";
-        out[n++] = "-o"; out[n++] = "ClearAllForwardings=yes";
-        out[n++] = "-o"; out[n++] = "LogLevel=ERROR";
-        out[n++] = "-o"; out[n++] = "ConnectTimeout=8";
-    } else {
-        out[n++] = "-o"; out[n++] = "ConnectTimeout=5";
-    }
+    for (i = 0; i < sizeof(hardening) / sizeof(hardening[0]); i++) out[n++] = hardening[i];
     opts = ssh_opts_argv(&opt_n);
     for (i = 0; i < opt_n; i++) out[n++] = opts[i];
     out[n++] = "--"; out[n++] = target; out[n++] = remote_cmd;
@@ -864,7 +856,7 @@ static int run_ssh_to_file(const char *username, const char *ip,
     pid = fork();
     if (pid == 0) {
         const char *arguments[32];
-        build_ssh_argv(arguments, 0, target, remote_command);
+        build_ssh_argv(arguments, target, remote_command);
         if (dup2(fd, STDOUT_FILENO) < 0) _exit(127);
         if (dup2(fd, STDERR_FILENO) < 0) _exit(127);
         close(fd);
@@ -895,7 +887,7 @@ static int stream_ssh(const LibrarySource *source, MusicRipperWriteFn write,
     pid = fork();
     if (pid == 0) {
         const char *arguments[32];
-        build_ssh_argv(arguments, 1, target, command);
+        build_ssh_argv(arguments, target, command);
         close(pipe_fds[0]);
         if (dup2(pipe_fds[1], STDOUT_FILENO) < 0) _exit(127);
         close(pipe_fds[1]);
@@ -1711,7 +1703,7 @@ static void extract_source_cover(const LibrarySource *source, char *out, size_t 
         char *qcover = shell_quote_words(cover_file);
         if (!qcover) { free(qcmd); return; }
         int wrote = snprintf(command, sizeof(command),
-                     "ssh -F /dev/null -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR%s -- %s@%s %s 2>/dev/null | ffmpeg -v error -y -i - -an -map 0:v:0 -c:v copy -frames:v 1 %s 2>/dev/null",
+                     "ssh -F /dev/null" SSH_HARDENING_OPTS_STR "%s -- %s@%s %s 2>/dev/null | ffmpeg -v error -y -i - -an -map 0:v:0 -c:v copy -frames:v 1 %s 2>/dev/null",
                      ssh_opts_str(), source->username, source->ip, qcmd, qcover);
         free(qcmd);
         free(qcover);

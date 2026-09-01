@@ -8,6 +8,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "metadata.h"
+#include "ssh_opts.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -245,27 +246,21 @@ static int extract_ssh_metadata_with_tool(const char *username, const char *ip, 
         return -1;
     }
 
-    /* For mediainfo: use remote file directly (doesn't support stdin).
-     * For ffprobe: pipe through stdin (does support stdin) */
+    /* Both tools read the remote file by path over ssh (the "--" is theirs). */
     if (strcmp(tool, "mediainfo") == 0) {
         remote_cmd = remote_command_with_path(
             "mediainfo --Output='General;Title=%Title% \\nPerformer=%Performer% \\nAlbum=%Album%' -- ",
             filepath);
-        if (!remote_cmd) {
-            set_error(error, error_size, "Path too long");
-            return -1;
-        }
     } else if (strcmp(tool, "ffprobe") == 0) {
         remote_cmd = remote_command_with_path(
             "ffprobe -v error -show_entries format_tags -of default=noprint_wrappers=1 -- ",
             filepath);
-        if (!remote_cmd) {
-            set_error(error, error_size, "Path too long");
-            return -1;
-        }
     } else {
-        if (remote_cmd) free(remote_cmd);
         set_error(error, error_size, "Unknown metadata tool");
+        return -1;
+    }
+    if (!remote_cmd) {
+        set_error(error, error_size, "Path too long");
         return -1;
     }
 
@@ -276,16 +271,9 @@ static int extract_ssh_metadata_with_tool(const char *username, const char *ip, 
         return -1;
     }
 
-    if (strcmp(tool, "mediainfo") == 0) {
-        result = snprintf(command, sizeof(command),
-            "ssh -F /dev/null -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR%s -- %s@%s "
-            "%s 2>/dev/null",
-            ssh_opts, username, ip, quoted_remote_cmd);
-    } else {
-        result = snprintf(command, sizeof(command),
-            "ssh -F /dev/null -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR%s -- %s@%s %s 2>/dev/null",
-            ssh_opts, username, ip, quoted_remote_cmd);
-    }
+    result = snprintf(command, sizeof(command),
+        "ssh -F /dev/null" SSH_HARDENING_OPTS_STR "%s -- %s@%s %s 2>/dev/null",
+        ssh_opts, username, ip, quoted_remote_cmd);
     free(quoted_remote_cmd);
 
     if (result >= (int)sizeof(command)) {
@@ -370,7 +358,9 @@ int metadata_extract_from_url(const char *url, AudioMetadata *metadata, char *er
     memset(metadata, 0, sizeof(*metadata));
 
     command = local_command_with_path(
-        "ffprobe -v error -rw_timeout 10000000 -timeout 10000000 -show_entries format_tags -of default=noprint_wrappers=1 ",
+        /* 5s socket timeout: adding an https source runs this inline on the
+         * main loop, so a slow/unreachable URL must not stall the widget. */
+        "ffprobe -v error -rw_timeout 5000000 -timeout 5000000 -show_entries format_tags -of default=noprint_wrappers=1 ",
         url, " 2>/dev/null");
     if (!command) {
         set_error(error, error_size, "Command path too long");

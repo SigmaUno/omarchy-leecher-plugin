@@ -3,6 +3,24 @@
 
 #include <stddef.h>
 
+/* Connection-hardening options applied to every `ssh` the app spawns, so a
+ * dead or filtered host fails in ~5s (not the multi-minute kernel TCP timeout)
+ * and a mid-transfer network drop is noticed within ~15s. Two spellings:
+ *   SSH_HARDENING_OPTS_STR   -- one string for the popen()/snprintf builders
+ *                               (leads with a space, no trailing space)
+ *   SSH_HARDENING_OPTS_ARGV  -- "-o","K=V" pairs for the execvp() builders
+ *                               (SSH_HARDENING_OPTS_ARGV_COUNT elements) */
+#define SSH_HARDENING_OPTS_STR \
+    " -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes" \
+    " -o LogLevel=ERROR -o ConnectTimeout=5" \
+    " -o ServerAliveInterval=5 -o ServerAliveCountMax=3"
+#define SSH_HARDENING_OPTS_ARGV \
+    "-o", "BatchMode=yes", "-o", "RequestTTY=no", \
+    "-o", "ClearAllForwardings=yes", "-o", "LogLevel=ERROR", \
+    "-o", "ConnectTimeout=5", \
+    "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"
+#define SSH_HARDENING_OPTS_ARGV_COUNT 14
+
 /* Shared OpenSSH ControlMaster options so every `ssh` the app spawns (track
  * transfer, metadata, cover art, remote listing) reuses one multiplexed
  * connection per host instead of repeating the TCP + key-exchange + auth
