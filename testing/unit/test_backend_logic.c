@@ -268,17 +268,59 @@ static unsigned char *make_wav(int rate, int frames, size_t *out_len) {
     return w;
 }
 
+static void *sb_feeder(void *arg) {
+    StreamBuffer *sb = arg;
+    int i;
+    for (i = 0; i < 5; i++) stream_buffer_append(sb, (const unsigned char *)"0123456789", 10);
+    stream_buffer_set_complete(sb);
+    return NULL;
+}
+
+static void test_stream_buffer(void) {
+    StreamBuffer *sb = stream_buffer_create(0);
+    unsigned char buf[64];
+    pthread_t th;
+
+    CHECK(sb != NULL);
+    CHECK(stream_buffer_append(sb, (const unsigned char *)"abc", 3) == 1);
+    CHECK(stream_buffer_size(sb) == 3);
+    CHECK(!stream_buffer_is_complete(sb));
+    CHECK(stream_buffer_read_at(sb, buf, 3, 0) == 3);
+    CHECK(memcmp(buf, "abc", 3) == 0);
+    stream_buffer_set_complete(sb);
+    CHECK(stream_buffer_is_complete(sb));
+    CHECK(stream_buffer_read_at(sb, buf, 10, 1) == 2);   /* only "bc" left at the real end */
+    CHECK(stream_buffer_read_at(sb, buf, 10, 3) == 0);   /* at EOF */
+    stream_buffer_destroy(sb);
+
+    /* the cap is a hard ceiling: an append past it fails the buffer */
+    sb = stream_buffer_create(8);
+    CHECK(stream_buffer_append(sb, (const unsigned char *)"12345", 5) == 1);
+    CHECK(stream_buffer_append(sb, (const unsigned char *)"12345", 5) == 0);
+    CHECK(stream_buffer_is_failed(sb));
+    stream_buffer_destroy(sb);
+
+    /* a reader blocked at the frontier is released when another thread fills it */
+    sb = stream_buffer_create(0);
+    CHECK(pthread_create(&th, NULL, sb_feeder, sb) == 0);
+    CHECK(stream_buffer_read_at(sb, buf, 50, 0) == 50);
+    pthread_join(th, NULL);
+    CHECK(stream_buffer_wait_complete(sb) == 50);
+    stream_buffer_destroy(sb);
+}
+
 static void test_decoder(void) {
     size_t wlen;
     unsigned char *wav = make_wav(8000, 8000, &wlen);   /* 1 second */
-    Assembler *a = assembler_create(NULL);
+    StreamBuffer *sb = stream_buffer_create(0);
     DecoderSource *d = NULL;
     char err[256] = {0};
     short out[8192];
     long long n, pos, left;
 
-    CHECK(assembler_push(a, wav, wlen) == 1);
-    CHECK(decoder_open(a, &d, err, sizeof(err)) == 1);
+    CHECK(stream_buffer_append(sb, wav, wlen) == 1);
+    stream_buffer_set_complete(sb);
+    CHECK(decoder_open(sb, &d, err, sizeof(err)) == 1);
     CHECK(d != NULL);
     CHECK(decoder_rate(d) == 8000);
     CHECK(decoder_channels(d) == 1);
@@ -293,15 +335,32 @@ static void test_decoder(void) {
     CHECK(left == 4000);                                /* only 4000 frames after the seek */
     n = decoder_read_frames(d, out, 100);
     CHECK(n == 0);                                      /* EOF */
-    decoder_close(d);
-    assembler_destroy(a);
+    decoder_close(d);                                   /* frees the StreamBuffer */
     free(wav);
 
-    /* empty queue -> "no audio" (0), not a crash */
-    a = assembler_create(NULL);
+    /* empty stream -> "no audio" (0), not a crash; ownership stays with us */
+    sb = stream_buffer_create(0);
+    stream_buffer_set_complete(sb);
     d = NULL;
-    CHECK(decoder_open(a, &d, err, sizeof(err)) == 0);
-    assembler_destroy(a);
+    CHECK(decoder_open(sb, &d, err, sizeof(err)) == 0);
+    stream_buffer_destroy(sb);
+
+    /* opened while the transfer is still "in progress" (bytes all present but
+     * the buffer not yet marked complete): once it completes, a seek still
+     * works -- the decoder re-opens the handle internally to repair it. */
+    wav = make_wav(8000, 8000, &wlen);
+    sb = stream_buffer_create(0);
+    CHECK(stream_buffer_append(sb, wav, wlen) == 1);
+    d = NULL;
+    CHECK(decoder_open(sb, &d, err, sizeof(err)) == 1);   /* opened_partial: not complete yet */
+    CHECK(decoder_total_frames(d) == 8000);
+    stream_buffer_set_complete(sb);
+    CHECK(decoder_seek(d, 6000) == 6000);
+    left = 0;
+    while ((n = decoder_read_frames(d, out, 4096)) > 0) left += n;
+    CHECK(left == 2000);
+    decoder_close(d);
+    free(wav);
 }
 
 /* ------------------------------------------------------------- resume state */
@@ -695,6 +754,7 @@ int main(void) {
         { "take_next_index",     test_take_next_index },
         { "next_encoded_token",  test_next_encoded_token },
         { "assembler",           test_assembler },
+        { "stream_buffer",       test_stream_buffer },
         { "decoder",             test_decoder },
         { "library_handler",     test_library_handler },
         { "write_resume",        test_write_resume },

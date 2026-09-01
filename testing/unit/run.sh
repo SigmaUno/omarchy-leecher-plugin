@@ -12,6 +12,8 @@ $cc -std=c11 -Wall -Wextra -O2 -I"$here/../../backend" \
     "$here/../../backend/library_handler.c" \
     "$here/../../backend/music_ripper.c" \
     "$here/../../backend/assembler.c" \
+    "$here/../../backend/stream_buffer.c" \
+    "$here/../../backend/ssh_opts.c" \
     "$here/../../backend/decoder.c" \
     "$here/../../backend/metadata.c" \
     $(pkg-config --cflags --libs sdl2 sndfile) -pthread -lm \

@@ -9,6 +9,10 @@ typedef struct {
     char *album;
 } AudioMetadata;
 
+/* Sets extra `ssh` command-line options (used for SSH connection multiplexing)
+ * spliced into every remote metadata probe.  Pass NULL or "" to disable. */
+void metadata_set_ssh_opts(const char *opts);
+
 /* Extracts metadata from a local audio file.
  * Returns 1 on success, 0 if file not found, -1 on error.
  * The caller must free the returned struct fields with free(). */
