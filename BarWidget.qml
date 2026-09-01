@@ -249,6 +249,40 @@ BarWidget {
     /* Every transport/mode button in the popup is this exact square so the two
      * control rows read as one even grid -- no bespoke size for play/pause. */
     readonly property real controlButtonSize: Style.space(36)
+    /* Icon-only bulk action beside the library search field: accept or decline
+     * every staged row the filter is showing. Square and filled, with a tooltip
+     * standing in for the label it deliberately does not have. */
+    component BulkChip: Rectangle {
+        id: chip
+        property string glyph: ""
+        property string tip: ""
+        signal act()
+        height: Style.space(28)
+        width: height
+        radius: Style.cornerRadius
+
+        Text {
+            anchors.centerIn: parent
+            text: chip.glyph
+            textFormat: Text.PlainText
+            /* On a filled chip, the popup's own dark colour is what reads. */
+            color: Color.popups.background
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.weight: Font.Black
+        }
+        HoverHandler { id: chipHover }
+        MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: chip.act()
+        }
+        PanelToolTip {
+            visible: chipHover.hovered && chip.tip !== ""
+            text: chip.tip
+        }
+    }
+
     /* One cell of a segmented control (used by the transport group and the
      * mode group): centred glyph, its own hover / press highlight, tooltip. */
     component ControlSeg: Item {
@@ -605,7 +639,7 @@ BarWidget {
             root.sendControl("decline_incoming " + indices.join(" "));
         }
     }
-    /* Indices of every row currently shown (after any filter), for "Add all". */
+    /* Indices of every row currently shown (after any filter), for the bulk chips. */
     function shownIncomingIndices() {
         return root.filteredTracks.map(function (t) { return t.index; });
     }
@@ -1662,9 +1696,9 @@ BarWidget {
                         }
                     }
 
-                    /* Search field, with the bulk-accept action beside it while
-                     * a staging list is under review -- it replaces the old
-                     * shift-click gesture, which was undiscoverable. */
+                    /* Search field, with the bulk accept / decline actions beside
+                     * it while a staging list is under review -- they replace the
+                     * old shift-click gesture, which was undiscoverable. */
                     Item {
                         width: parent.width
                         visible: !root.editVisible
@@ -1680,35 +1714,30 @@ BarWidget {
                             onTextChanged: root.librarySearch = text
                         }
 
-                        Rectangle {
-                            id: addAllShown
+                        /* Same order as the per-row controls: add, then decline. */
+                        BulkChip {
+                            id: declineAllShown
                             anchors.right: parent.right
                             anchors.verticalCenter: parent.verticalCenter
                             /* Only while reviewing staged tracks, and only when
-                             * the filter actually leaves something to add. */
+                             * the filter actually leaves rows to act on. */
                             visible: root.viewingIncoming && root.filteredTracks.length > 0
-                            height: Style.space(28)
-                            width: addAllShownText.implicitWidth + Style.space(20)
-                            radius: Style.cornerRadius
-                            color: Color.accent
+                            color: Color.urgent
+                            glyph: "\uf00d"
+                            tip: "Decline every track shown"
+                            onAct: root.declineIncoming(root.shownIncomingIndices())
+                        }
 
-                            Text {
-                                id: addAllShownText
-                                anchors.centerIn: parent
-                                text: "\uf067  Add all"
-                                textFormat: Text.PlainText
-                                /* On the accent fill, so the popup's own dark
-                                 * colour is what reads against it. */
-                                color: Color.popups.background
-                                font.family: root.bar.fontFamily
-                                font.pixelSize: Style.font.bodySmall
-                                font.weight: Font.Black
-                            }
-                            MouseArea {
-                                anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: root.acceptIncoming(root.shownIncomingIndices())
-                            }
+                        BulkChip {
+                            id: addAllShown
+                            anchors.right: declineAllShown.left
+                            anchors.rightMargin: Style.space(4)
+                            anchors.verticalCenter: parent.verticalCenter
+                            visible: declineAllShown.visible
+                            color: Color.accent
+                            glyph: "\uf067"
+                            tip: "Add every track shown"
+                            onAct: root.acceptIncoming(root.shownIncomingIndices())
                         }
                     }
 
@@ -1988,9 +2017,9 @@ BarWidget {
                                 }
 
                                 /* Staging-list rows get accept (blue plus) and
-                                 * decline (red cross), one row per click. Bulk
-                                 * accept lives on the "Add all" button beside
-                                 * the search field. */
+                                 * decline (red cross), one row per click. The
+                                 * same pair sits beside the search field to act
+                                 * on every row the filter is showing. */
                                 Item {
                                     width: Style.space(24)
                                     height: parent.height
