@@ -169,7 +169,10 @@ static const char *ipc_path(char *buf, size_t size, const char *name) {
     return buf;
 }
 
-static void init_ipc_dir(void) {
+/* Returns 0 on success, -1 if no usable private IPC directory could be made
+ * (ipc_dir left empty). The caller must not continue: every IPC path would then
+ * resolve under "/" and silently fail to write. */
+static int init_ipc_dir(void) {
     const char *runtime = getenv("XDG_RUNTIME_DIR");
     struct stat st;
     char fallback[IPC_PATH_MAX];
@@ -207,9 +210,12 @@ static void init_ipc_dir(void) {
         else { perror("leecher: cannot create IPC directory"); ipc_dir[0] = '\0'; }
     }
 
+    if (!ipc_dir[0]) return -1;
+
     ipc_path(status_file, sizeof(status_file), "status.json");
     ipc_path(control_file, sizeof(control_file), "control");
     ipc_path(cover_file, sizeof(cover_file), "cover.jpg");
+    return 0;
 }
 
 /* Remove every committed cover file (cover-*.jpg, not the cover.jpg scratch)
@@ -3438,7 +3444,10 @@ int main(int argc, char **argv) {
     signal(SIGINT, request_stop);
     signal(SIGTERM, request_stop);
     pthread_mutex_init(&state.fetch_mutex, NULL);
-    init_ipc_dir();
+    if (init_ipc_dir() != 0) {
+        fprintf(stderr, "leecher: no writable private runtime directory; exiting\n");
+        return 1;
+    }
     ssh_opts_init(ipc_dir);              /* reuse one multiplexed ssh connection per host */
     metadata_set_ssh_opts(ssh_opts_str());
 
