@@ -263,10 +263,32 @@ static char *json_escape(const char *value) {
     return out;
 }
 
+/* Best-effort: flush the directory entry a create/rename produced, so the
+ * file's *name* survives a power loss, not just its already-fsync'd contents.
+ * (library_handler.c carries an identical copy for its standalone build.) */
+static void fsync_parent_dir(const char *path) {
+    char dir[PATH_MAX];
+    const char *slash = strrchr(path, '/');
+    int fd;
+    if (!slash) { dir[0] = '.'; dir[1] = '\0'; }
+    else if (slash == path) { dir[0] = '/'; dir[1] = '\0'; }
+    else {
+        size_t len = (size_t)(slash - path);
+        if (len >= sizeof(dir)) return;
+        memcpy(dir, path, len);
+        dir[len] = '\0';
+    }
+    fd = open(dir, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    fsync(fd);
+    close(fd);
+}
+
 /* Write a file atomically: write to a temp inode then rename(2) over the
  * target.  A concurrent reader (the widget cat's + parses this file every
  * second) sees either the old complete content or the new complete content,
- * never a partially-written buffer. */
+ * never a partially-written buffer.  The parent directory is fsync'd after the
+ * rename so the swap is durable across a power loss, not just a clean exit. */
 static int atomic_write(const char *path, const char *data, size_t size) {
     size_t template_length = strlen(path) + 16;
     char *temporary_path = malloc(template_length);
@@ -285,6 +307,7 @@ static int atomic_write(const char *path, const char *data, size_t size) {
     if (!ok) { unlink(temporary_path); free(temporary_path); return 0; }
     ok = rename(temporary_path, path) == 0;
     if (!ok) unlink(temporary_path);
+    else fsync_parent_dir(path);
     free(temporary_path);
     return ok;
 }
@@ -453,11 +476,17 @@ static int playlist_cmp(const void *a, const void *b) {
     return strcasecmp(x, y);
 }
 
-static int dir_has_playlist_json(const char *dir) {
+/* Probe the library directory:
+ *   -1  the directory could not be opened -- the caller must NOT treat this as
+ *       "empty", or it would re-seed home.json over playlists that are simply
+ *       not visible yet (e.g. the service started before $HOME was mounted);
+ *    0  readable, but holds no *.json playlist file;
+ *    1  readable and holds at least one *.json playlist. */
+static int library_dir_probe(const char *dir) {
     DIR *d = opendir(dir);
     struct dirent *e;
     int found = 0;
-    if (!d) return 0;
+    if (!d) return -1;
     while ((e = readdir(d))) {
         size_t n = strlen(e->d_name);
         if (e->d_name[0] == '.') continue;
@@ -470,8 +499,10 @@ static int dir_has_playlist_json(const char *dir) {
 static void scan_playlists(AppState *s) {
     DIR *d = opendir(s->library_dir);
     struct dirent *e;
-    s->playlist_count = 0;
+    /* A transient failure to read the directory must not blank the tab list --
+     * keep whatever was scanned last. */
     if (!d) return;
+    s->playlist_count = 0;
     while ((e = readdir(d)) && s->playlist_count < (int)(sizeof(s->playlists) / sizeof(s->playlists[0]))) {
         size_t n = strlen(e->d_name);
         if (e->d_name[0] == '.') continue;               /* skips .resume.json */
@@ -505,8 +536,9 @@ static int copy_file(const char *from, const char *to) {
  * a `library.json` file; keep accepting that (its sibling `library/` becomes
  * the directory and the file migrates to `home.json`). A path without a
  * `.json` suffix is taken as the directory itself. */
-static void resolve_library_dir(const char *arg, AppState *s, char *legacy, size_t legacy_size) {
+static int resolve_library_dir(const char *arg, AppState *s, char *legacy, size_t legacy_size) {
     size_t n = strlen(arg);
+    int probe;
     legacy[0] = '\0';
     if (n > 5 && !strcmp(arg + n - 5, ".json")) {
         const char *slash = strrchr(arg, '/');
@@ -523,13 +555,25 @@ static void resolve_library_dir(const char *arg, AppState *s, char *legacy, size
     { char abs[PATH_MAX];
       if (realpath(s->library_dir, abs) && strlen(abs) < sizeof(s->library_dir))
           snprintf(s->library_dir, sizeof(s->library_dir), "%s", abs); }
-    /* First run: bring an existing single-file library across, else seed an
-     * empty home.json so there is always at least one playlist. */
-    if (!dir_has_playlist_json(s->library_dir)) {
+    /* Refuse to start against an unreadable library directory: seeding here on
+     * a false "it's empty" would overwrite the user's playlists.  Restart=on-
+     * failure lets the service retry until the directory is really there. */
+    probe = library_dir_probe(s->library_dir);
+    if (probe < 0) {
+        fprintf(stderr, "leecher: cannot read library directory %s: %s\n",
+                s->library_dir, strerror(errno));
+        return -1;
+    }
+    /* First run only: bring an existing single-file library across, else seed an
+     * empty home.json so there is always at least one playlist.  Never touch an
+     * existing home.json. */
+    if (probe == 0) {
         char home[PATH_MAX];
         snprintf(home, sizeof(home), "%s/home.json", s->library_dir);
-        if (!(legacy[0] && copy_file(legacy, home)))
-            atomic_write(home, EMPTY_LIBRARY_JSON, sizeof(EMPTY_LIBRARY_JSON) - 1);
+        if (access(home, F_OK) != 0) {
+            if (!(legacy[0] && copy_file(legacy, home)))
+                atomic_write(home, EMPTY_LIBRARY_JSON, sizeof(EMPTY_LIBRARY_JSON) - 1);
+        }
     }
     /* Ensure the auto-collect playlist exists (also on pre-existing installs). */
     { char star[PATH_MAX];
@@ -537,6 +581,7 @@ static void resolve_library_dir(const char *arg, AppState *s, char *legacy, size
       if (access(star, F_OK) != 0)
           atomic_write(star, EMPTY_LIBRARY_JSON, sizeof(EMPTY_LIBRARY_JSON) - 1); }
     scan_playlists(s);
+    return 0;
 }
 
 /* Remember the current track and position so a restarted backend can pick the
@@ -1212,13 +1257,18 @@ static void source_key(const LibrarySource *s, char *out, size_t out_size) {
  * add to another playlist costs nothing until then. O(total sources) atomic
  * writes -- fine for the small curated libraries this serves. */
 static void rebuild_star_playlist(AppState *s) {
-    char star[LIBRARY_PATH_MAX], err[256];
+    char star[LIBRARY_PATH_MAX], staging[LIBRARY_PATH_MAX + 16], err[256];
     char (*seen)[1024] = NULL;
     size_t seen_len = 0, seen_cap = 0;
     int pi;
     playlist_file_path(s, STAR_PLAYLIST, star, sizeof(star));
+    /* Build the rebuilt "*" in a sibling file and swap it in with one rename at
+     * the very end.  The old code truncated "*" up front and appended a source
+     * at a time, so a rebuild interrupted by a restart (it runs on every start)
+     * left "*" empty or half-populated -- read as lost data. */
+    snprintf(staging, sizeof(staging), "%s.rebuild", star);
     /* Start from empty so a source deleted everywhere also leaves "*". */
-    if (!atomic_write(star, EMPTY_LIBRARY_JSON, sizeof(EMPTY_LIBRARY_JSON) - 1)) return;
+    if (!atomic_write(staging, EMPTY_LIBRARY_JSON, sizeof(EMPTY_LIBRARY_JSON) - 1)) return;
     for (pi = 0; pi < s->playlist_count; pi++) {
         char path[LIBRARY_PATH_MAX];
         LibraryHandler *h;
@@ -1253,7 +1303,7 @@ static void rebuild_star_playlist(AppState *s) {
                 snprintf(seen[seen_len++], sizeof(seen[0]), "%s", key);
                 {
                     LibrarySongQuery q = { .title = t.title, .artist = t.artist, .album = t.album };
-                    library_handler_add_source(star, &q, &t.sources[j], err, sizeof(err));
+                    library_handler_add_source(staging, &q, &t.sources[j], err, sizeof(err));
                 }
             }
             library_handler_track_destroy(&t);
@@ -1261,6 +1311,10 @@ static void rebuild_star_playlist(AppState *s) {
         library_handler_close(h);
     }
     free(seen);
+    /* Swap the finished rebuild in atomically; on failure the previous "*" is
+     * left untouched rather than replaced with a partial one. */
+    if (rename(staging, star) == 0) fsync_parent_dir(star);
+    else unlink(staging);
 }
 
 /* Adds a source for a single audio file to the library and reloads the in-memory
@@ -3392,7 +3446,8 @@ int main(int argc, char **argv) {
         char legacy[PATH_MAX];
         char rpl[96];
         size_t rt; Uint32 rpos; int rplay;
-        resolve_library_dir(library_arg, &state, legacy, sizeof(legacy));
+        if (resolve_library_dir(library_arg, &state, legacy, sizeof(legacy)) != 0)
+            return 1;
         init_resume_path(state.library_dir);
         rebuild_star_playlist(&state);   /* reconcile "*" with the other playlists */
         snprintf(state.viewed_playlist, sizeof(state.viewed_playlist), "%s",
