@@ -39,6 +39,21 @@ placed in the left bar section by default; move it later with Omarchy's bar
 controls if desired. The installer uses only user-owned locations and does not
 require `sudo`.
 
+## Update
+
+```sh
+./update.sh
+```
+
+Pulls `main`, rebuilds and reinstalls the backend, redeploys the widget, and
+restarts the shell so the new QML is loaded. Editing this checkout on its own
+changes nothing about the running plugin: the backend runs from a copy in
+`$XDG_DATA_HOME/leecher-media` and the widget from a copy in
+`$XDG_CONFIG_HOME/omarchy/plugins/leecher.media/`.
+
+Pass `--no-pull` to deploy the working tree as-is, or `--no-restart` to leave
+the shell running. The pull is refused if the checkout has uncommitted changes.
+
 ## Use
 
 - Click the bar widget to open the player panel.
