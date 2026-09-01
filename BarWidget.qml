@@ -1174,7 +1174,10 @@ BarWidget {
                     Image {
                         id: coverImg
                         anchors.fill: parent
-                        anchors.margins: Style.space(2)
+                        /* Negative by exactly the border width, so the art sits
+                         * over the frame rather than inside it -- covering the
+                         * ring and nothing more. */
+                        anchors.margins: -Math.max(1, Style.space(1))
                         /* The backend gives every committed cover a unique file
                          * name, so the path already changes per track. `cache:
                          * false` covers the one case a bare name can't -- a
@@ -1194,7 +1197,7 @@ BarWidget {
                      * track playing -- the cover is hung on that track. */
                     Rectangle {
                         anchors.fill: parent
-                        anchors.margins: Style.space(2)
+                        anchors.margins: -Math.max(1, Style.space(1))
                         radius: Math.max(Style.cornerRadius, Style.space(8))
                         z: 4
                         visible: root.hasTrack && (coverHoverArea.containsMouse || root.coverPickerOpen)

@@ -39,6 +39,11 @@
 
 typedef enum { SOURCE_LOCAL, SOURCE_SSH, SOURCE_HTTPS, SOURCE_NETWORK } SourceMethod;
 
+/* How much of a remote file to pull when looking for embedded art. Cover art
+ * sits in the header metadata, so this is generously past it while keeping the
+ * transfer to a couple of seconds instead of the whole track. */
+#define COVER_PREFIX_BYTES 4000000
+
 /* One hit from the cover-art search (iTunes Search API: anonymous, no key). */
 #define COVER_RESULT_MAX 8
 typedef struct {
@@ -1731,9 +1736,15 @@ static void extract_source_cover(const LibrarySource *source, char *out, size_t 
         if (!ssh_name_valid(source->username, 0) || !ssh_name_valid(source->ip, 1)) return;
         char *qpath = shell_quote_words(source->path);
         if (!qpath) return;
-        char *remote_cmd = malloc(strlen("cat ") + strlen(qpath) + 1);
+        /* Read only the head of the remote file, not all of it: cover art lives
+         * in the metadata before the audio (FLAC PICTURE block, ID3v2 APIC), so
+         * a bounded prefix carries it. `cat` of a 94 MB FLAC took over 30s and
+         * never finished inside the timeout below, which is why remote tracks
+         * never showed embedded art; a 4 MB prefix takes ~2.5s and yields the
+         * byte-identical image. */
+        char *remote_cmd = malloc(strlen("head -c 4000000 -- ") + strlen(qpath) + 1);
         if (!remote_cmd) { free(qpath); return; }
-        sprintf(remote_cmd, "cat %s", qpath);
+        sprintf(remote_cmd, "head -c %d -- %s", COVER_PREFIX_BYTES, qpath);
         free(qpath);
         char *qcmd = shell_quote_words(remote_cmd);
         free(remote_cmd);
@@ -1749,7 +1760,7 @@ static void extract_source_cover(const LibrarySource *source, char *out, size_t 
         if (wrote >= (int)sizeof(command))
             return;
         struct stat st;
-        if (run_command_timeout(command, 8000, cancel) == 0 && stat(cover_file, &st) == 0 && st.st_size > 0)
+        if (run_command_timeout(command, 20000, cancel) == 0 && stat(cover_file, &st) == 0 && st.st_size > 0)
             snprintf(out, out_size, "%s", cover_file);
         break;
     }
