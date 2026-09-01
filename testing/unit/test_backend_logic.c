@@ -44,7 +44,7 @@ static void test_json_escape(void) {
     s = json_escape(NULL);               CHECK_STR(s, "");                      free(s);
     /* bytes >= 0x20 (incl. UTF-8 continuation) pass through verbatim */
     s = json_escape("caf\xc3\xa9");      CHECK_STR(s, "caf\xc3\xa9");           free(s);
-    /* exercises the realloc growth path: many escapes in a long string */
+    /* long string, 2x expansion */
     {
         char big[600], want[3600];
         size_t i;
@@ -53,6 +53,17 @@ static void test_json_escape(void) {
         for (i = 0; i < sizeof(big) - 1; i++) { want[i * 2] = '\\'; want[i * 2 + 1] = '"'; }
         want[(sizeof(big) - 1) * 2] = '\0';
         s = json_escape(big); CHECK_STR(s, want); free(s);
+    }
+    /* worst case for the exact-sized allocation: every byte -> \uXXXX (6x) */
+    {
+        char big[512];
+        size_t i;
+        for (i = 0; i < sizeof(big) - 1; i++) big[i] = '\x1f';
+        big[sizeof(big) - 1] = '\0';
+        s = json_escape(big);
+        CHECK_EQ_SIZE(strlen(s), (sizeof(big) - 1) * 6);
+        for (i = 0; i < sizeof(big) - 1; i++) CHECK(memcmp(s + i * 6, "\\u001f", 6) == 0);
+        free(s);
     }
 }
 
