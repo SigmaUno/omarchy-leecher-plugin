@@ -42,7 +42,10 @@ typedef enum { SOURCE_LOCAL, SOURCE_SSH, SOURCE_HTTPS, SOURCE_NETWORK } SourceMe
 #define LIBRARY_NAME_MAX      96    /* playlist stem, incl. NUL (names capped at 64) */
 #define LIBRARY_DIR_MAX       512   /* library directory path, incl. NUL */
 #define LIBRARY_PATH_MAX      640   /* "<dir>/<name>.json" always fits */
-#define LIBRARY_MAX_PLAYLISTS 64
+/* Headroom well past any hand-curated set: this is also charged for "*" and for
+ * every "INCOMING >> ... <<" staging list, so a user who runs many directory
+ * scans should still never hit "Too many playlists" on a real one. */
+#define LIBRARY_MAX_PLAYLISTS 128
 
 typedef struct {
     char title[128];
@@ -323,10 +326,10 @@ static void write_status(const AppState *state) {
     char *dir = json_escape(state->library_dir[0] ? state->library_dir : NULL),
          *viewed = json_escape(state->viewed_playlist),
          *playing = json_escape(state->playing_playlist);
-    char tmp[16384];
+    char tmp[32768];  /* headroom for up to LIBRARY_MAX_PLAYLISTS stems + outputs */
     char queue[16 * 64 + 4];  /* "[" + up to 64 "NNNNN," + "]" */
     char outputs[2560];       /* enumerated output device names, JSON array */
-    char playlists[64 * 100 + 4];  /* enumerated playlist stems, JSON array */
+    char playlists[LIBRARY_MAX_PLAYLISTS * 100 + 4];  /* enumerated playlist stems, JSON array */
     int qn = 0, qi;
     int on = 0, od, ocount;
     int pn = 0, pi;

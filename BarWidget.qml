@@ -98,7 +98,6 @@ BarWidget {
     property string outputDevice: ""
     property var outputDevices: []
     property string coverSource: ""
-    property int coverVersion: 0
 
     property int basePosition: 0
     property real baseTime: 0
@@ -697,7 +696,6 @@ BarWidget {
             root.basePosition = srvPos;
             root.baseTime = root.now();
             root.serverAdvancing = true;
-            root.coverVersion++;
             root.titleExpanded = false;
         } else if (playingChanged) {
             root.basePosition = root.currentPosition();
@@ -1031,11 +1029,15 @@ BarWidget {
                         id: coverImg
                         anchors.fill: parent
                         anchors.margins: Style.space(2)
-                        /* Append a cache-busting nonce so QML re-fetches the file
-                         * when a track changes (the backend also gives each cover
-                         * a fresh filename, but this makes coverVersion meaningful
-                         * even if the path were reused). */
-                        source: root.coverSource !== "" ? ("file://" + root.coverSource + "?v=" + root.coverVersion) : ""
+                        /* The backend gives every committed cover a unique file
+                         * name, so the path already changes per track. `cache:
+                         * false` covers the one case a bare name can't -- a
+                         * backend restart resets the nonce, so cover-0-1.jpg can
+                         * be reused for different art -- without a `?v=` query
+                         * string, which Qt does not reliably strip from a
+                         * file:// URL. */
+                        source: root.coverSource !== "" ? ("file://" + root.coverSource) : ""
+                        cache: false
                         fillMode: Image.PreserveAspectCrop
                         asynchronous: true
                         clip: true
@@ -1317,10 +1319,17 @@ BarWidget {
                     Column {
                         width: parent.width
                         spacing: Style.space(4)
-                        visible: root.outputDevices.length > 0
+                        /* Always shown: the list model always carries "System
+                         * default", and the backend reports an empty `outputs`
+                         * array whenever SDL cannot enumerate sinks (it returns
+                         * -1/0 on the PipeWire path even when playback works) --
+                         * hiding the whole picker then left no way to fall back
+                         * to the default. */
 
                         Text {
-                            text: "Output"
+                            text: root.outputDevices.length > 0
+                                ? "Output"
+                                : "Output — no devices detected, using system default"
                             color: Qt.darker(root.bar.foreground, 1.3)
                             font.family: root.bar.fontFamily
                             font.pixelSize: Style.font.caption
@@ -1423,11 +1432,89 @@ BarWidget {
                             font.pixelSize: Style.font.caption
                         }
 
+                        Rectangle {
+                            id: addPlaylistChip
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            height: Style.space(24)
+                            /* Pinned here, outside the scrolling strip, so it
+                             * stays reachable no matter how many playlist tabs
+                             * there are -- it used to be the last child inside
+                             * the Flickable and scrolled off the right edge once
+                             * the tabs overflowed. */
+                            width: root.addingPlaylist
+                                ? Style.space(110)
+                                : (addPlusText.implicitWidth + Style.space(14))
+                            radius: 0
+                            color: "transparent"
+                            border.width: Math.max(1, Style.space(1))
+                            border.color: Color.accent
+
+                            Text {
+                                id: addPlusText
+                                anchors.centerIn: parent
+                                visible: !root.addingPlaylist
+                                text: "+"
+                                color: Color.accent
+                                font.family: root.bar.fontFamily
+                                font.pixelSize: Style.font.bodySmall
+                                font.bold: true
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                enabled: !root.addingPlaylist
+                                onClicked: root.beginAddPlaylist()
+                            }
+                            TextInput {
+                                id: newPlaylistInput
+                                anchors.fill: parent
+                                anchors.leftMargin: Style.space(6)
+                                anchors.rightMargin: Style.space(6)
+                                visible: root.addingPlaylist
+                                verticalAlignment: TextInput.AlignVCenter
+                                color: root.bar.foreground
+                                font.family: root.bar.fontFamily
+                                font.pixelSize: Style.font.caption
+                                clip: true
+                                maximumLength: 64
+                                /* Guards the blur-to-commit below: if the popup
+                                 * never actually handed the field keyboard focus,
+                                 * losing "focus" must not fire an empty commit
+                                 * that closes the box before the user can type. */
+                                property bool everFocused: false
+                                /* Block caret in the accent colour: typing
+                                 * a name reads like a text editor. */
+                                cursorDelegate: Rectangle {
+                                    width: Style.space(6)
+                                    color: Color.accent
+                                    visible: newPlaylistInput.cursorVisible
+                                }
+                                onVisibleChanged: {
+                                    if (visible) {
+                                        text = "";
+                                        everFocused = false;
+                                        /* Defer: the item isn't in the scene
+                                         * graph yet on the same frame it shows. */
+                                        Qt.callLater(newPlaylistInput.forceActiveFocus);
+                                    }
+                                }
+                                onAccepted: root.commitAddPlaylist(text)
+                                onActiveFocusChanged: {
+                                    if (activeFocus)
+                                        everFocused = true;
+                                    else if (root.addingPlaylist && everFocused)
+                                        root.commitAddPlaylist(text);
+                                }
+                                Keys.onEscapePressed: root.cancelAddPlaylist()
+                            }
+                        }
+
                         Flickable {
                             id: playlistStrip
                             anchors.left: playlistLabel.right
                             anchors.leftMargin: Style.space(8)
-                            anchors.right: parent.right
+                            anchors.right: addPlaylistChip.left
+                            anchors.rightMargin: Style.space(6)
                             anchors.verticalCenter: parent.verticalCenter
                             height: Style.space(24)
                             contentWidth: playlistRow.width
@@ -1487,68 +1574,6 @@ BarWidget {
                                             anchors.fill: parent
                                             onClicked: root.viewPlaylist(ptab.pname)
                                         }
-                                    }
-                                }
-
-                                Rectangle {
-                                    id: addPlaylistChip
-                                    height: playlistRow.height
-                                    width: root.addingPlaylist
-                                        ? Style.space(110)
-                                        : (addPlusText.implicitWidth + Style.space(14))
-                                    radius: 0
-                                    color: "transparent"
-                                    border.width: Math.max(1, Style.space(1))
-                                    border.color: Color.accent
-
-                                    Text {
-                                        id: addPlusText
-                                        anchors.centerIn: parent
-                                        visible: !root.addingPlaylist
-                                        text: "+"
-                                        color: Color.accent
-                                        font.family: root.bar.fontFamily
-                                        font.pixelSize: Style.font.bodySmall
-                                        font.bold: true
-                                    }
-                                    MouseArea {
-                                        anchors.fill: parent
-                                        enabled: !root.addingPlaylist
-                                        onClicked: root.beginAddPlaylist()
-                                    }
-                                    TextInput {
-                                        id: newPlaylistInput
-                                        anchors.fill: parent
-                                        anchors.leftMargin: Style.space(6)
-                                        anchors.rightMargin: Style.space(6)
-                                        visible: root.addingPlaylist
-                                        verticalAlignment: TextInput.AlignVCenter
-                                        color: root.bar.foreground
-                                        font.family: root.bar.fontFamily
-                                        font.pixelSize: Style.font.caption
-                                        clip: true
-                                        maximumLength: 64
-                                        /* Block caret in the accent colour: typing
-                                         * a name reads like a text editor. */
-                                        cursorDelegate: Rectangle {
-                                            width: Style.space(6)
-                                            color: Color.accent
-                                            visible: newPlaylistInput.cursorVisible
-                                        }
-                                        onVisibleChanged: {
-                                            if (visible) {
-                                                text = "";
-                                                /* Defer: the item isn't in the scene
-                                                 * graph yet on the same frame it shows. */
-                                                Qt.callLater(newPlaylistInput.forceActiveFocus);
-                                            }
-                                        }
-                                        onAccepted: root.commitAddPlaylist(text)
-                                        onActiveFocusChanged: {
-                                            if (!activeFocus && root.addingPlaylist)
-                                                root.commitAddPlaylist(text);
-                                        }
-                                        Keys.onEscapePressed: root.cancelAddPlaylist()
                                     }
                                 }
                             }
