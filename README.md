@@ -67,6 +67,24 @@ the shell running. The pull is refused if the checkout has uncommitted changes.
   it left keeps a half-tint while it is still the one playing.
 - Right-click the widget to hide it or collapse it to a restorable handle.
 
+## Retagging a scanned library
+
+A directory scan stages tracks quickly by taking the title from the file name
+and leaving the artist and album as placeholders -- it does not probe every file.
+If the files themselves are properly tagged, backfill the real metadata:
+
+```sh
+./scripts/retag-library.py                 # dry run, shows what would change
+systemctl --user stop leecher-media.service
+./scripts/retag-library.py --apply
+systemctl --user start leecher-media.service
+```
+
+Tags are read with `ffprobe` in a single ssh round trip per remote host, not one
+per file. Titles become `Title (NN)` using the track number; pass `--plain-title`
+for the bare tag title. A sloppy `Title` tag that repeats the file name, its
+extension, the track number or the artist is cleaned up, and re-running is safe.
+
 ## Remote playback
 
 SSH and network sources stream over a single multiplexed `ssh` connection per
