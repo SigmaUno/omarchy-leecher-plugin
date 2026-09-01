@@ -17,6 +17,3 @@ backend/library-handler
 # deploy-to-live-config and a shell restart for iterating on the widget.
 copybarwidget.sh
 reset.sh
-
-# Scratch space for local testing (throwaway libraries, runtime dirs, ...)
-testing/
