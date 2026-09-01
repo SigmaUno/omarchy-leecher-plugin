@@ -283,9 +283,11 @@ BarWidget {
     /* Size the widget from the glyph's real ink width (glyphSlot) instead of a
      * fixed barSize: the old formula requested barSize for the icon slot but the
      * icon is typically narrower, leaving an invisible strip of unused space on
-     * the right so the title sat off-centre with asymmetric padding. */
+     * the right so the title sat off-centre with asymmetric padding.  Collapsed,
+     * hug the glyph with a slim symmetric pad rather than a full barSize square
+     * so the widget takes as little room in the bar line as possible. */
     implicitWidth: root.collapsed
-        ? Math.max(root.barSize, Style.space(12) + glyphSlot.width)
+        ? Style.space(6) + glyphSlot.width + Style.space(4)
         : Style.space(24) + glyphSlot.width + Style.space(6) + root.labelMaxWidth + Style.space(18)
     implicitHeight: root.barSize
 
@@ -825,8 +827,8 @@ BarWidget {
         id: row
         anchors.left: parent.left
         anchors.right: parent.right
-        anchors.leftMargin: root.collapsed ? Style.space(12) : Style.space(24)
-        anchors.rightMargin: root.collapsed ? 0 : Style.space(18)
+        anchors.leftMargin: root.collapsed ? Style.space(6) : Style.space(24)
+        anchors.rightMargin: root.collapsed ? Style.space(4) : Style.space(18)
         anchors.verticalCenter: parent.verticalCenter
         spacing: root.collapsed ? 0 : Style.space(6)
 
