@@ -144,6 +144,21 @@ static void test_next_autoplay_index(void) {
         CHECK(n != 3);
     }
     CHECK_EQ_SIZE(next_autoplay_index(&s, 1, 0, 1), 0);        /* can't avoid self with 1 */
+    s.shuffle = 0;
+
+    /* A `from` no row answers to any more -- the SIZE_MAX sentinel left behind
+     * when the playing track was removed, or an index that outlived a shrunk
+     * library -- must step to the top. The early returns below would otherwise
+     * hand it straight back and request_play() be asked for an impossible row. */
+    CHECK_EQ_SIZE(next_autoplay_index(&s, 5, (size_t)-1, 1), 0);
+    CHECK_EQ_SIZE(next_autoplay_index(&s, 1, (size_t)-1, 1), 0);   /* the count <= 1 return */
+    CHECK_EQ_SIZE(next_autoplay_index(&s, 5, 9, 1), 0);            /* stale, library shrank */
+    s.repeat_one = 1;
+    CHECK_EQ_SIZE(next_autoplay_index(&s, 5, (size_t)-1, 1), 0);   /* the repeat-one return */
+    s.repeat_one = 0;
+    s.shuffle = 1;
+    CHECK_EQ_SIZE(next_autoplay_index(&s, 1, (size_t)-1, 1), 0);
+    s.shuffle = 0;
 }
 
 /* ------------------------------------------------- autoplay dead-playlist guard */
@@ -441,6 +456,25 @@ static void test_write_resume(void) {
     s.is_playing = 1;
     write_resume(&s);
     CHECK(read_resume(pl, sizeof(pl), &ti, &pos, &playing) == 1 && playing == 1);
+
+    /* "Nothing is playing" must not merely skip the write -- it has to retire a
+     * resume point already on disk. Left there, it names a row some other track
+     * has since slid into, and the next start picks that song up mid-way: the
+     * stop would last only until the next restart. */
+    s.selected_track = (size_t)-1;
+    write_resume(&s);
+    CHECK(access(path, F_OK) != 0);
+
+    /* A zero duration is a different thing entirely -- the ordinary state of a
+     * track that has not finished loading (the startup resume path) -- so it
+     * still only skips the write and leaves the file standing. */
+    s.selected_track = 5;
+    s.duration_ms = 200000;
+    write_resume(&s);
+    CHECK(access(path, F_OK) == 0);
+    s.duration_ms = 0;
+    write_resume(&s);
+    CHECK(access(path, F_OK) == 0);
 
     unlink(path);
     resume_file[0] = '\0';
@@ -814,6 +848,247 @@ static void test_library_handler(void) {
     unlink(path);
 }
 
+/* ------------------------------------------------- remove_track bookkeeping */
+static const char *THREE_TRACKS =
+    "{\"version\":1,\"tracks\":["
+    "{\"title\":\"Alpha\",\"artist\":\"A\",\"album\":\"One\","
+      "\"sources\":[{\"kind\":\"local\",\"PATH\":\"/m/a.flac\"}]},"
+    "{\"title\":\"Bravo\",\"artist\":\"B\",\"album\":\"Two\","
+      "\"sources\":[{\"kind\":\"local\",\"PATH\":\"/m/b.flac\"}]},"
+    "{\"title\":\"Charlie\",\"artist\":\"C\",\"album\":\"Three\","
+      "\"sources\":[{\"kind\":\"local\",\"PATH\":\"/m/c.flac\"}]}"
+    "]}";
+
+/* selected_track and the play queue are rows of the PLAYING playlist, but a
+ * delete arrives for the VIEWED one. Three things have to hold: a delete in
+ * another playlist leaves playback completely alone; a delete below the playing
+ * row slides that row down with the rest; deleting the playing row itself stops
+ * playback and leaves no row claiming to be playing. */
+static void test_remove_track_indices(void) {
+    char dir[] = "/tmp/leecher-rm.XXXXXX";
+    char home[600], other[600];
+    AppState s = {0};
+    LibraryHandler *library;
+    assert(mkdtemp(dir));
+    pthread_mutex_init(&s.fetch_mutex, NULL);
+    snprintf(s.library_dir, sizeof(s.library_dir), "%s", dir);
+    snprintf(home, sizeof(home), "%s/home.json", dir);
+    snprintf(other, sizeof(other), "%s/other.json", dir);
+    write_file(home, THREE_TRACKS);
+    write_file(other, THREE_TRACKS);
+    snprintf(s.playing_playlist, sizeof(s.playing_playlist), "%s", "home");
+    library = library_handler_open(other, NULL, 0);
+    s.play_lib = library_handler_open(home, NULL, 0);
+    assert(library && s.play_lib);
+
+    /* (1) viewing "other" while "home" plays: the delete must not move -- or
+     *     stop -- anything on the playback side. */
+    snprintf(s.viewed_playlist, sizeof(s.viewed_playlist), "%s", "other");
+    snprintf(s.library_path, sizeof(s.library_path), "%s", other);
+    s.selected_track = 1;
+    s.is_playing = 1;
+    s.duration_ms = 200000;
+    snprintf(s.title, sizeof(s.title), "%s", "Bravo");
+    s.play_queue_len = 1;
+    s.play_queue[0] = 2;
+    handle_remove_track(&library, other, &s, "remove 1");
+    CHECK_EQ_SIZE(lib_count(other), 2);        /* the delete itself happened */
+    CHECK_EQ_SIZE(s.selected_track, 1);
+    CHECK(s.is_playing == 1);
+    CHECK_STR(s.title, "Bravo");
+    CHECK_EQ_SIZE((size_t)s.play_queue_len, 1);
+    CHECK_EQ_SIZE(s.play_queue[0], 2);
+
+    /* (2) viewing the playing playlist: dropping row 0 slides row 2 to 1. */
+    library_handler_close(library);
+    library = library_handler_open(home, NULL, 0);
+    snprintf(s.viewed_playlist, sizeof(s.viewed_playlist), "%s", "home");
+    snprintf(s.library_path, sizeof(s.library_path), "%s", home);
+    s.selected_track = 2;
+    s.is_playing = 1;
+    s.play_queue_len = 2;
+    s.play_queue[0] = 0;   /* the row being removed: dropped */
+    s.play_queue[1] = 2;   /* above it: slides down to 1 */
+    handle_remove_track(&library, home, &s, "remove 0");
+    CHECK_EQ_SIZE(lib_count(home), 2);
+    CHECK_EQ_SIZE(s.selected_track, 1);
+    CHECK(s.is_playing == 1);
+    CHECK_EQ_SIZE((size_t)s.play_queue_len, 1);
+    CHECK_EQ_SIZE(s.play_queue[0], 1);
+
+    /* (3) removing the row that is playing: a real stop, and no row is the
+     *     playing row afterwards (a stale index would hand the next cover to
+     *     whichever track slid into the hole). The resume point goes with it --
+     *     left on disk it would resurrect the mix-up on the next start. */
+    snprintf(resume_file, sizeof(resume_file), "%s/.resume.json", dir);
+    write_file(resume_file,
+               "{\"playlist\":\"home\",\"track_index\":1,\"position_ms\":5000,\"is_playing\":true}\n");
+    s.selected_track = 1;
+    s.is_playing = 1;
+    s.stream_open = 1;
+    s.duration_ms = 200000;
+    s.position_ms = 5000;
+    snprintf(s.title, sizeof(s.title), "%s", "Charlie");
+    handle_remove_track(&library, home, &s, "remove 1");
+    CHECK_EQ_SIZE(lib_count(home), 1);
+    CHECK_EQ_SIZE(s.selected_track, (size_t)-1);
+    CHECK(s.is_playing == 0);
+    CHECK(s.stream_open == 0);
+    CHECK(s.duration_ms == 0);
+    CHECK(s.position_ms == 0);
+    CHECK_STR(s.title, "");
+    CHECK(access(resume_file, F_OK) != 0);
+    /* autoplay is off here, so the stop is the end of it */
+    CHECK(s.immediate_pending == 0);
+
+    /* (4) the same delete with autoplay on hands off to whichever track slid
+     *     into the deleted row instead of leaving the user in silence. */
+    library_handler_close(library);
+    write_file(home, THREE_TRACKS);
+    library = library_handler_open(home, NULL, 0);
+    library_handler_close(s.play_lib);
+    s.play_lib = library_handler_open(home, NULL, 0);
+    assert(library && s.play_lib);
+    s.autoplay = 1;
+    s.selected_track = 0;
+    s.is_playing = 1;
+    s.duration_ms = 200000;
+    handle_remove_track(&library, home, &s, "remove 0");
+    CHECK_EQ_SIZE(lib_count(home), 2);
+    CHECK(s.immediate_pending == 1);
+    CHECK_EQ_SIZE(s.immediate_index, 0);      /* "Bravo", which slid into row 0 */
+
+    /* ...and when the row that went was the last one, it wraps to the top
+     *    rather than asking for a row past the end. */
+    s.selected_track = 1;
+    s.is_playing = 1;
+    s.immediate_pending = 0;
+    handle_remove_track(&library, home, &s, "remove 1");
+    CHECK_EQ_SIZE(lib_count(home), 1);
+    CHECK(s.immediate_pending == 1);
+    CHECK_EQ_SIZE(s.immediate_index, 0);
+
+    resume_file[0] = '\0';
+    library_handler_close(library);
+    library_handler_close(s.play_lib);
+    pthread_mutex_destroy(&s.fetch_mutex);
+    unlink(home); unlink(other); rmdir(dir);
+}
+
+/* --------------------------------------------------- cover job vs. a remove */
+static const char *FOUR_TRACKS =
+    "{\"version\":1,\"tracks\":["
+    "{\"title\":\"Alpha\",\"sources\":[{\"kind\":\"local\",\"PATH\":\"/m/a.flac\"}]},"
+    "{\"title\":\"Bravo\",\"sources\":[{\"kind\":\"local\",\"PATH\":\"/m/b.flac\"}]},"
+    "{\"title\":\"Charlie\",\"sources\":[{\"kind\":\"local\",\"PATH\":\"/m/c.flac\"}]},"
+    "{\"title\":\"Delta\",\"sources\":[{\"kind\":\"local\",\"PATH\":\"/m/d.flac\"}]}"
+    "]}";
+
+static void *cover_job_noop(void *arg) { (void)arg; return NULL; }
+
+/* A cover fetch can run for tens of seconds, and it writes to the row number it
+ * was started with. If a remove shifts the rows underneath it and that index is
+ * left alone, the art lands on whichever track slid into the hole -- and takes
+ * that track's own cover down with it as the one being "replaced". */
+static void test_cover_job_survives_remove(void) {
+    char dir[] = "/tmp/leecher-rmcov.XXXXXX";
+    /* Built from `dir`, not covers_dir, and kept under CoverJob::stored's 512
+     * so the compiler can see neither snprintf below can truncate. */
+    char home[600], art[256];
+    AppState s = {0};
+    LibraryHandler *library;
+    LibraryTrack t = {0};
+    CoverJob *job;
+
+    assert(mkdtemp(dir));
+    pthread_mutex_init(&s.fetch_mutex, NULL);
+    snprintf(s.library_dir, sizeof(s.library_dir), "%s", dir);
+    snprintf(covers_dir, sizeof(covers_dir), "%s/covers", dir);
+    mkdir(covers_dir, 0700);
+    snprintf(home, sizeof(home), "%s/home.json", dir);
+    write_file(home, FOUR_TRACKS);
+    scan_playlists(&s);
+    snprintf(s.viewed_playlist, sizeof(s.viewed_playlist), "%s", "home");
+    snprintf(s.playing_playlist, sizeof(s.playing_playlist), "%s", "home");
+    snprintf(s.library_path, sizeof(s.library_path), "%s", home);
+    library = library_handler_open(home, NULL, 0);
+    s.play_lib = library_handler_open(home, NULL, 0);
+    assert(library && s.play_lib);
+
+    /* Playing "Charlie" at row 2; the user starts a cover fetch for it. */
+    s.selected_track = 2;
+    s.is_playing = 1;
+    s.duration_ms = 200000;
+    job = (CoverJob *)calloc(1, sizeof(*job));
+    assert(job);
+    job->state = &s;
+    job->apply = 1;
+    snprintf(job->playlist, sizeof(job->playlist), "%s", s.playing_playlist);
+    job->index = s.selected_track;            /* exactly what start_cover_job does */
+    snprintf(art, sizeof(art), "%s/covers/cover-test.jpg", dir);
+    write_file(art, "\xff\xd8\xff\xe0 stand-in for the downloaded image");
+    snprintf(job->stored, sizeof(job->stored), "%s", art);
+    snprintf(job->status, sizeof(job->status), "%s", "Cover updated.");
+    s.cover_job = job;
+    s.cover_thread_valid = 1;
+    assert(pthread_create(&s.cover_thread, NULL, cover_job_noop, NULL) == 0);
+
+    /* ...and deletes row 0 while the download is still in flight. */
+    handle_remove_track(&library, home, &s, "remove 0");
+    CHECK_EQ_SIZE(s.selected_track, 1);       /* Charlie followed its track down */
+    CHECK_EQ_SIZE(job->index, 1);             /* and so did the cover job */
+
+    finish_cover_job(&library, &s);           /* the download lands */
+    CHECK_EQ_SIZE(lib_count(home), 3);
+    CHECK(library_handler_track_at(library, 1, &t, NULL, 0) == 1);
+    CHECK_STR(t.title ? t.title : "", "Charlie");
+    CHECK_STR(t.cover ? t.cover : "", art);   /* the track it was fetched for */
+    library_handler_track_destroy(&t);
+    CHECK(library_handler_track_at(library, 2, &t, NULL, 0) == 1);
+    CHECK_STR(t.title ? t.title : "", "Delta");
+    CHECK_STR(t.cover ? t.cover : "", "");    /* the row the stale index named */
+    library_handler_track_destroy(&t);
+    CHECK_STR(s.cover_file, art);             /* now-playing art repainted */
+
+    /* When the removed row IS the job's row, the image is dropped rather than
+     * hung on the track that took its place. */
+    s.selected_track = 1;
+    s.is_playing = 1;
+    s.duration_ms = 200000;
+    job = (CoverJob *)calloc(1, sizeof(*job));
+    assert(job);
+    job->state = &s;
+    job->apply = 1;
+    snprintf(job->playlist, sizeof(job->playlist), "%s", "home");
+    job->index = 1;
+    snprintf(art, sizeof(art), "%s/covers/cover-test2.jpg", dir);
+    write_file(art, "\xff\xd8\xff\xe0 stand-in for the downloaded image");
+    snprintf(job->stored, sizeof(job->stored), "%s", art);
+    snprintf(job->status, sizeof(job->status), "%s", "Cover updated.");
+    s.cover_job = job;
+    s.cover_thread_valid = 1;
+    assert(pthread_create(&s.cover_thread, NULL, cover_job_noop, NULL) == 0);
+
+    handle_remove_track(&library, home, &s, "remove 1");
+    CHECK_EQ_SIZE(job->index, (size_t)-1);
+    finish_cover_job(&library, &s);
+    CHECK(access(art, F_OK) != 0);            /* the image was thrown away */
+    CHECK(library_handler_track_at(library, 1, &t, NULL, 0) == 1);
+    CHECK_STR(t.title ? t.title : "", "Delta");
+    CHECK_STR(t.cover ? t.cover : "", "");
+    library_handler_track_destroy(&t);
+
+    library_handler_close(library);
+    library_handler_close(s.play_lib);
+    pthread_mutex_destroy(&s.fetch_mutex);
+    unlink(home);
+    snprintf(art, sizeof(art), "%s/covers/cover-test.jpg", dir);  unlink(art);
+    snprintf(art, sizeof(art), "%s/covers/cover-test2.jpg", dir); unlink(art);
+    snprintf(art, sizeof(art), "%s/covers", dir);                 rmdir(art);
+    rmdir(dir);
+    covers_dir[0] = '\0';
+}
+
 int main(void) {
     struct { const char *name; void (*fn)(void); } tests[] = {
         { "json_escape",         test_json_escape },
@@ -839,6 +1114,8 @@ int main(void) {
         { "playlist_rank_order", test_playlist_rank_order },
         { "rebuild_star_playlist", test_rebuild_star_playlist },
         { "resolve_library_dir", test_resolve_library_dir_migrates },
+        { "remove_track_indices", test_remove_track_indices },
+        { "cover_job_survives_remove", test_cover_job_survives_remove },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         int before = failures;

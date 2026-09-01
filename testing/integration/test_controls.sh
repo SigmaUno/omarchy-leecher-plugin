@@ -466,6 +466,156 @@ else
     echo "  (ffmpeg not found -- skipping the cover checks)"
 fi
 
+# ---- removing a track keeps the playing row straight ----------------------
+# track_index and the queue name rows of the PLAYING playlist, while a remove
+# arrives for the VIEWED one. Deleting from another playlist must not disturb
+# playback; deleting below the playing row must slide that row down with it;
+# deleting the playing row must actually stop.
+send "autoplay off"
+wait_for '.autoplay == false' "autoplay held for the remove checks"
+
+send "playlist home"
+wait_for '.viewed_playlist == "home"' "viewing home for the remove checks"
+send "play 1"
+wait_for '.track_index == 1 and .is_playing == true and .playing_playlist == "home"' \
+    "playing home track 1"
+playing_title=$(jq -r '.title' "$D/status.json")
+
+# (1) a delete in a playlist that is not the one playing
+send "playlist roadtrip"
+wait_for '.viewed_playlist == "roadtrip" and .playing_playlist == "home"' \
+    "viewing roadtrip while home plays"
+rt_n=$(jq '.tracks | length' "$libdir/roadtrip.json")
+if [ "$rt_n" -gt 1 ]; then
+    send "remove 1"                      # same row number as the playing track
+    wait_for '.status | test("Removed track")' "remove from the viewed playlist reported"
+    [ "$(jq '.tracks | length' "$libdir/roadtrip.json")" = "$((rt_n - 1))" ] \
+        && pass "the row really left roadtrip" || fail "the row really left roadtrip"
+    jq -e --arg t "$playing_title" \
+        '.is_playing == true and .track_index == 1 and .playing_playlist == "home" and .title == $t' \
+        "$D/status.json" >/dev/null 2>&1 \
+        && pass "a delete in another playlist leaves playback alone" \
+        || { fail "a delete in another playlist leaves playback alone"
+             jq '{is_playing,track_index,playing_playlist,title}' "$D/status.json"; }
+else
+    echo "  (roadtrip too short -- skipping the cross-playlist remove check)"
+fi
+
+# (2) a delete below the playing row slides that row down
+send "playlist home"
+wait_for '.viewed_playlist == "home"' "back to viewing home"
+home_n=$(jq '.tracks | length' "$libdir/home.json")
+send "remove 0"
+wait_for '.status | test("Removed track")' "remove from the playing playlist reported"
+[ "$(jq '.tracks | length' "$libdir/home.json")" = "$((home_n - 1))" ] \
+    && pass "the row really left home" || fail "the row really left home"
+jq -e --arg t "$playing_title" '.is_playing == true and .track_index == 0 and .title == $t' \
+    "$D/status.json" >/dev/null 2>&1 \
+    && pass "the playing row follows its track down to index 0" \
+    || { fail "the playing row follows its track down to index 0"
+         jq '{is_playing,track_index,title}' "$D/status.json"; }
+
+# (3) deleting the row that is playing stops playback outright, and takes the
+#     resume point with it: left on disk it names a row the next track has since
+#     slid into, so the next start would pick that song up mid-way through --
+#     the very mix-up the stop just undid, surviving a restart.
+send "seek 3000"                        # a seek writes the resume point at once
+wait_for '.position_ms >= 2500' "seeked, so a resume point exists to be dropped"
+jq -e '.track_index == 0' "$resume" >/dev/null 2>&1 \
+    && pass "the resume point names the playing row before the remove" \
+    || { fail "the resume point names the playing row before the remove"
+         cat "$resume" 2>/dev/null; }
+send "remove 0"
+wait_for '.is_playing == false and .title == "" and .duration_ms == 0' \
+    "removing the playing track stops playback"
+wait_for '.track_index == -1' "no row is reported as the playing row"
+[ -f "$resume" ] \
+    && { fail "the resume point goes with the track it named"; cat "$resume"; } \
+    || pass "the resume point goes with the track it named"
+send "cover_apply /nonexistent/cover.jpg"
+wait_for '.status | test("No track is playing")' \
+    "no row claims to be playing afterwards (a cover has nowhere to land)"
+
+# (4) the same delete with autoplay ON hands off to whatever slid into the
+#     deleted row -- autoplay means keep the music going, not fall silent.
+#     On its own playlist of two known-good 30s files: home by now holds the
+#     deliberately-broken source, and landing on that proves nothing.
+send "autoplay on"
+wait_for '.autoplay == true' "autoplay restored after the remove checks"
+mkdir -p "$work/handoff"
+python3 - "$work/handoff" <<'PY'
+import sys, wave
+d = sys.argv[1]
+frames = b"\x00\x00" * (8000 * 30)
+for name in ("Mu", "Nu"):
+    with wave.open(f"{d}/{name}.wav", "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+        w.writeframes(frames)
+PY
+send "playlist_new handoff"
+wait_for '.viewed_playlist == "handoff"' "a playlist for the hand-off check"
+send "add_local $work/handoff/Mu.wav"
+send "add_local $work/handoff/Nu.wav"
+wait_for '.library | test("handoff")' "hand-off playlist is the viewed one"
+if [ "$(jq '.tracks | length' "$libdir/handoff.json")" = "2" ]; then
+    pass "two playable tracks staged for the hand-off check"
+    send "play 0"
+    wait_for '.track_index == 0 and .is_playing == true and .playing_playlist == "handoff"' \
+        "playing handoff row 0 under autoplay"
+    slid_in=$(jq -r '.tracks[1].title' "$libdir/handoff.json")   # the row that becomes 0
+    send "remove 0"
+    wait_for '.is_playing == true and .track_index == 0 and .title == "'"$slid_in"'"' \
+        "autoplay hands off to the track that slid into the deleted row" 150
+else
+    fail "two playable tracks staged for the hand-off check"
+    jq -c '[.tracks[].title]' "$libdir/handoff.json" 2>/dev/null
+fi
+
+# ---- accept/decline keeps the auditioned row straight ---------------------
+# Accept and decline drop rows from the staging list exactly the way `remove`
+# does, and auditioning a staged track before ruling on it is the whole point
+# of the review flow -- so the playing row has to move with it. 30s files: the
+# audition has to still be playing when the decline lands.
+mkdir -p "$work/scan2"
+python3 - "$work/scan2" <<'PY'
+import sys, wave
+d = sys.argv[1]
+frames = b"\x00\x00" * (8000 * 30)
+for name in ("Iota", "Kappa", "Lambda"):
+    with wave.open(f"{d}/{name}.wav", "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+        w.writeframes(frames)
+PY
+send "autoplay off"
+wait_for '.autoplay == false' "autoplay held for the audition checks"
+send "scan_local home $work/scan2"
+if poll_state '.scanning == false and .viewed_playlist == "INCOMING >> home <<"' 250; then
+    pass "second scan stages into INCOMING >> home <<"
+    send "play 2"
+    if poll_state '.track_index == 2 and .is_playing == true and .playing_playlist == "INCOMING >> home <<"' 150; then
+        pass "auditioning staged row 2"
+        audition=$(jq -r '.title' "$D/status.json")
+        send "decline_incoming 0"          # a row BELOW the one being auditioned
+        poll_state '.status | test("Declined")' 60 >/dev/null
+        wait_for '.is_playing == true and .track_index == 1 and .title == "'"$audition"'"' \
+            "the auditioned row follows its track down after a decline" 60
+        send "decline_incoming 1"          # now the audition's own row
+        wait_for '.is_playing == false and .track_index == -1' \
+            "declining the auditioned row itself stops playback" 60
+    else
+        fail "auditioning staged row 2"
+        jq '{track_index,is_playing,playing_playlist,status}' "$D/status.json"
+    fi
+    send "decline_incoming 0"              # clear what is left of the staging list
+    poll_state '.viewed_playlist == "home"' 60 >/dev/null \
+        && pass "clearing the second staging list returns to home" \
+        || { fail "clearing the second staging list returns to home"
+             jq '{viewed_playlist,playlists}' "$D/status.json"; }
+else
+    fail "second scan stages into INCOMING >> home <<"
+    jq '{scanning,viewed_playlist,playlists,status}' "$D/status.json"
+fi
+
 # --------------------------------------------------------------------------
 echo
 if [ "$fails" -eq 0 ]; then

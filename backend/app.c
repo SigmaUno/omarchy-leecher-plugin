@@ -420,7 +420,7 @@ static void write_status(const AppState *state) {
     covers[vn] = '\0';
     n = snprintf(tmp, sizeof(tmp),
                  "{\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
-                 "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s,"
+                 "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%lld,\"library\":\"%s\",\"autoplay\":%s,"
                  "\"shuffle\":%s,\"repeat_one\":%s,\"volume\":%d,\"muted\":%s,\"queue\":%s,"
                  "\"output\":\"%s\",\"outputs\":%s,\"cover\":\"%s\","
                  "\"library_dir\":\"%s\",\"playlists\":%s,\"viewed_playlist\":\"%s\",\"playing_playlist\":\"%s\","
@@ -429,7 +429,10 @@ static void write_status(const AppState *state) {
                  "\"status\":\"%s\",\"cmd_id\":%lu}\n",
                  title ? title : "", artist ? artist : "", album ? album : "",
                  state->position_ms, state->duration_ms,
-                 state->is_playing ? "true" : "false", state->selected_track,
+                 state->is_playing ? "true" : "false",
+                 /* signed on the wire: "nothing is playing" is -1, not a
+                  * 2^64-1 the widget's int property cannot represent */
+                 (long long)(ptrdiff_t)state->selected_track,
                  library ? library : "", state->autoplay ? "true" : "false",
                  state->shuffle ? "true" : "false", state->repeat_one ? "true" : "false",
                  state->volume, state->muted ? "true" : "false", queue,
@@ -676,7 +679,16 @@ static void write_resume(const AppState *s) {
     char tmp[320];
     char *pl = json_escape(s->playing_playlist);
     int n;
-    if (!resume_file[0] || s->selected_track == (size_t)-1 || s->duration_ms == 0) { free(pl); return; }
+    if (!resume_file[0]) { free(pl); return; }
+    /* Nothing is playing -- the track was removed out from under us. Drop the
+     * resume point rather than leave one naming a row another track has since
+     * slid into: the next start would pick that song up mid-way through, which
+     * is exactly the mix-up stop_playback just undid. Note this is only for the
+     * explicit "no row" sentinel; a zero duration is the ordinary state of a
+     * track that has not finished loading yet (the startup resume path), and
+     * unlinking there would throw the resume point away every restart. */
+    if (s->selected_track == (size_t)-1) { free(pl); unlink(resume_file); return; }
+    if (s->duration_ms == 0) { free(pl); return; }
     n = snprintf(tmp, sizeof(tmp),
                  "{\"playlist\":\"%s\",\"track_index\":%zu,\"position_ms\":%u,\"is_playing\":%s}\n",
                  pl ? pl : "", s->selected_track, s->position_ms, s->is_playing ? "true" : "false");
@@ -2534,6 +2546,12 @@ static void play_library_index(AppState *state, size_t index) {
  * `allow_repeat`, so a skip past a broken source still advances); shuffle picks
  * a random other track; otherwise the next in library order. count > 0. */
 static size_t next_autoplay_index(const AppState *s, size_t count, size_t from, int allow_repeat) {
+    /* `from` is the SIZE_MAX sentinel when nothing is playing (the row was
+     * removed), and can also be left over from a library that has since shrunk.
+     * There is no current row to step from or stay on, so start at the top --
+     * without this the early returns below hand that sentinel straight back and
+     * request_play() is asked for a row that cannot exist. */
+    if (from >= count) return 0;
     if (count <= 1) return from;
     if (allow_repeat && s->repeat_one) return from;
     if (s->shuffle) {
@@ -2577,6 +2595,15 @@ static void play_library_relative(AppState *state, long delta) {
     if (delta > 0 && (state->play_queue_len > 0 || (state->shuffle && count > 1))) {
         state->autoplay_advancing = 0;
         request_play(state, take_next_index(state, count, state->selected_track, 0));
+        return;
+    }
+    /* Nothing is playing (the row was removed), or the index outlived a shrunk
+     * library: step in from the edge. Casting the SIZE_MAX sentinel to long is
+     * implementation-defined, and the wrap it happens to produce on the usual
+     * targets lands "previous" on an arbitrary row rather than the last one. */
+    if (state->selected_track >= count) {
+        state->autoplay_advancing = 0;
+        request_play(state, delta > 0 ? 0 : count - 1);
         return;
     }
     long cur = (long)state->selected_track;
@@ -2789,6 +2816,101 @@ static void autoplay_halt_dead_playlist(AppState *s) {
     write_resume(s);
 }
 
+/* Tear playback down to "nothing is playing".
+ *
+ * Clearing the SDL queue is NOT a stop: stream_audio() runs every frame and
+ * refills that queue straight from the open decoder without ever looking at
+ * is_playing, so the audio simply comes back a frame later while the widget
+ * shows an empty now-playing. Drop the decoder and the transfer feeding it,
+ * close the device, and clear the track fields so the state matches. */
+static void stop_playback(AppState *s) {
+    cancel_fetch(s);
+    s->is_playing = 0;
+    s->stream_open = 0;
+    s->stream_eof = 0;
+    s->track_ended = 0;
+    s->autoplay_advancing = 0;
+    if (s->audio_device) {
+        SDL_PauseAudioDevice(s->audio_device, 1);
+        SDL_ClearQueuedAudio(s->audio_device);
+        SDL_CloseAudioDevice(s->audio_device);
+        s->audio_device = 0;
+    }
+    finish_play_xfer(s);            /* must precede decoder_close: it owns the buffer */
+    decoder_close(s->decoder);
+    s->decoder = NULL;
+    s->audio_queued_frame = 0;
+    s->audio_total_frames = 0;
+    s->position_ms = 0;
+    s->duration_ms = 0;
+    s->title[0] = '\0';
+    s->artist[0] = '\0';
+    s->album[0] = '\0';
+    s->cover_file[0] = '\0';
+    s->selected_track = (size_t)-1;   /* no row is the playing row any more */
+    /* Cover hits were searched for the track that just went away; the same
+     * reasoning as in commit_fetch(), which clears them on every track change. */
+    s->cover_result_count = 0;
+    s->cover_status[0] = '\0';
+    /* Retire the resume point too, or the stop only lasts until the next
+     * restart -- see write_resume(). */
+    write_resume(s);
+}
+
+/* A row has just left `playlist`; move any in-flight cover fetch's target with
+ * it. The job carries the row it was started for and finish_cover_job() writes
+ * to exactly that row, so a stale index hangs the art on whichever track slid
+ * into the hole -- and deletes that track's own cover as the one being
+ * "replaced". The SIZE_MAX sentinel marks the job's own track as gone;
+ * finish_cover_job() already reads any out-of-range index as "that track is
+ * gone" and drops the image. Safe to do mid-download: the cover thread only
+ * ever touches source/stored/status/results, never these two fields. */
+static void cover_job_note_removed_row(AppState *s, const char *playlist, size_t idx) {
+    CoverJob *job = s->cover_job;
+    if (!job || !job->apply || strcmp(job->playlist, playlist)) return;
+    if (job->index == idx) job->index = (size_t)-1;
+    else if (job->index != (size_t)-1 && job->index > idx) job->index--;
+}
+
+/* One row has just left the PLAYING playlist: slide selected_track and the play
+ * queue onto the new row numbering, or tear playback down when the row that
+ * went was the one playing. Returns 1 in that second case so the caller can
+ * decide what to do with the silence. Only call this when the removal really
+ * landed in the playing playlist -- the indices mean nothing otherwise. */
+static int note_removed_row(AppState *s, size_t idx) {
+    int i = 0, stopped = 0;
+    if (idx == s->selected_track) {
+        stop_playback(s);
+        stopped = 1;
+    } else if (s->selected_track != (size_t)-1 && idx < s->selected_track) {
+        /* Every row above the hole slid down by one; the playing row with it.
+         * Left stale, this index names the NEXT track: the widget highlights
+         * the wrong row, next/prev skips one, and a cover fetch hangs its art
+         * on a track nobody asked about. */
+        s->selected_track--;
+    }
+    /* Keep the play queue pointing at the right rows: drop the removed track,
+     * shift entries that sat above it down by one. */
+    while (i < s->play_queue_len) {
+        if (s->play_queue[i] == idx) { play_queue_remove_at(s, i); continue; }
+        if (s->play_queue[i] > idx) s->play_queue[i]--;
+        i++;
+    }
+    return stopped;
+}
+
+/* The playing row was just deleted. Autoplay means "keep the music going", so
+ * step onto whichever track slid into the hole (or wrap to the top when the
+ * end of the list went with it) instead of leaving the user in silence.
+ * `landing` is the removed row expressed in the post-removal numbering; the
+ * caller must have resynced play_lib first. */
+static void autoplay_after_removed_row(AppState *s, size_t landing) {
+    size_t count = s->play_lib ? library_handler_track_count(s->play_lib) : 0;
+    if (!s->autoplay || count == 0) return;
+    s->autoplay_advancing = 0;
+    request_play(s, landing < count ? landing : 0);
+}
+
 /* After a mutation reloads the viewed playlist, mirror it into the playback
  * handle when that is the same playlist, so next/autoplay see the same rows. */
 static void resync_play_lib(AppState *s) {
@@ -2839,22 +2961,16 @@ static void handle_remove_track(LibraryHandler **library, const char *library_pa
         if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; resync_play_lib(state); }
         else snprintf(state->status, sizeof(state->status), "Removed, but reload failed: %s", reload);
     }
-    if (idx == state->selected_track) {
-        state->is_playing = 0;
-        if (state->audio_device) SDL_ClearQueuedAudio(state->audio_device);
-        state->position_ms = 0;
-        state->title[0] = '\0';
-    }
-    /* Keep the play queue pointing at the right rows: drop the removed track,
-     * shift entries that sat above it down by one. */
-    {
-        int i = 0;
-        while (i < state->play_queue_len) {
-            if (state->play_queue[i] == idx) { play_queue_remove_at(state, i); continue; }
-            if (state->play_queue[i] > idx) state->play_queue[i]--;
-            i++;
-        }
-    }
+    /* An in-flight cover fetch names a row of the playlist it was started for,
+     * whether or not that playlist is the one playing. */
+    cover_job_note_removed_row(state, state->viewed_playlist, idx);
+    /* selected_track and the play queue are rows of the PLAYING playlist, while
+     * the delete landed in the VIEWED one (library_path). They only move when
+     * those are the same list -- deleting from another playlist must not touch,
+     * let alone stop, what is playing. */
+    if (!strcmp(state->viewed_playlist, state->playing_playlist) &&
+        note_removed_row(state, idx))
+        autoplay_after_removed_row(state, idx);
     snprintf(state->status, sizeof(state->status), "Removed track %zu.", idx);
     write_status(state);
 }
@@ -3491,6 +3607,8 @@ static void handle_accept_decline(LibraryHandler **library, AppState *state,
     char ipath[LIBRARY_PATH_MAX], tpath[LIBRARY_PATH_MAX];
     size_t idxs[256];
     int n = 0, i, moved = 0;
+    int playing_here = 0, stopped = 0;
+    size_t landing = 0;
     const char *p = idx_list;
 
     if (!incoming_target_of(state->viewed_playlist, target, sizeof(target))) {
@@ -3518,6 +3636,13 @@ static void handle_accept_decline(LibraryHandler **library, AppState *state,
     playlist_file_path(state, state->viewed_playlist, ipath, sizeof(ipath));
     playlist_file_path(state, target, tpath, sizeof(tpath));
 
+    /* Accepting or declining removes rows from the staging list exactly the way
+     * `remove` does, and auditioning a staged track before ruling on it is the
+     * whole point of the review flow -- so the same index bookkeeping applies.
+     * `playing_here` is fixed before the loop: stop_playback() would otherwise
+     * leave playing_playlist naming this list while selected_track says -1. */
+    playing_here = !strcmp(state->viewed_playlist, state->playing_playlist);
+
     for (i = 0; i < n; i++) {
         LibraryTrack t = {0};
         char err[128];
@@ -3532,13 +3657,27 @@ static void handle_accept_decline(LibraryHandler **library, AppState *state,
             for (j = 0; j < t.source_count; j++)
                 library_handler_add_source(tpath, &q, &t.sources[j], err, sizeof(err));
         }
-        if (library_handler_remove_track(ipath, idxs[i], err, sizeof(err)) == 1) moved++;
+        if (library_handler_remove_track(ipath, idxs[i], err, sizeof(err)) == 1) {
+            moved++;
+            cover_job_note_removed_row(state, state->viewed_playlist, idxs[i]);
+            /* The list is walked highest row first, so each index is still
+             * valid in the numbering left by the previous removal. Once
+             * playback has stopped, later removals below the hole drag the row
+             * that will slide into it down with them. */
+            if (playing_here) {
+                if (note_removed_row(state, idxs[i])) { stopped = 1; landing = idxs[i]; }
+                else if (stopped && idxs[i] < landing) landing--;
+            }
+        }
         library_handler_track_destroy(&t);
     }
 
     cancel_fetch(state);
     reload_viewed_playlist(library, state);
     resync_play_lib(state);
+    /* Before the status messages below, so "Accepted N into ..." is what the
+     * user is left reading rather than request_play()'s "Playing ...". */
+    if (stopped) autoplay_after_removed_row(state, landing);
 
     if (library_handler_track_count(*library) == 0) {
         unlink(ipath);
