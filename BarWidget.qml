@@ -464,11 +464,13 @@ BarWidget {
     function saveEdit() {
         if (root.editIndex < 0)
             return;
-        /* Apply all three fields in one atomic backend write. */
+        /* Apply all three fields in one atomic backend write, then re-read the
+         * list once the backend acks it: the file is rewritten in place
+         * (mkstemp + rename), which the FileView watch does not always catch. */
+        root.reloadOnAck = true;
         root.sendControlFields(root.editIndex, root.editTitle, root.editArtist, root.editAlbum);
         root.editVisible = false;
         root.editIndex = -1;
-        root.loadLibrary();
     }
     function cancelEdit() {
         root.editVisible = false;
@@ -476,10 +478,14 @@ BarWidget {
         root.actionsIndex = -1;
     }
     function removeTrack(i) {
+        /* Re-read the list once the backend acks the removal -- it rewrites the
+         * playlist file in place (mkstemp + rename), which the FileView watch
+         * does not always catch, so an immediate reload would just re-show the
+         * track that is still on disk. */
+        root.reloadOnAck = true;
         root.sendControl("remove " + i);
         root.actionsIndex = -1;
         root.editVisible = false;
-        root.loadLibrary();
     }
     /* The playlist a scan should stage into: the one being viewed, or, if
      * that is itself a staging list, its underlying target. Falls back to
@@ -500,10 +506,12 @@ BarWidget {
         /* sendControl() encodes the complete line before it reaches the
          * backend, so spaces and special characters in a local path remain a
          * single safe command argument. */
-        if (root.addScan)
+        if (root.addScan) {
             root.sendControlRaw("scan_local " + enc(root.scanTargetPlaylist()) + " " + enc(trimmed));
-        else
+        } else {
+            root.reloadOnAck = true;
             root.sendControl("add_local " + trimmed);
+        }
         root.addPath = "";
         root.addVisible = false;
     }
@@ -521,22 +529,28 @@ BarWidget {
                 : "Enter the network user, host/IP, and path first.";
             return;
         }
-        if (root.addScan)
+        if (root.addScan) {
             root.sendControlRaw("scan_" + root.addType + " " + enc(root.scanTargetPlaylist()) +
                                 " " + enc(u) + " " + enc(h) + " " + enc(p));
-        else
+        } else {
+            root.reloadOnAck = true;
             root.sendControlRaw("add_" + root.addType + " " + enc(u) + " " + enc(h) + " " + enc(p));
+        }
         root.closeAddForm();
     }
     /* Move (accept) or discard (decline) staged tracks. `indices` is an array of
      * library indices in the "INCOMING >> ... <<" list currently being viewed. */
     function acceptIncoming(indices) {
-        if (indices.length > 0)
+        if (indices.length > 0) {
+            root.reloadOnAck = true;
             root.sendControl("accept_incoming " + indices.join(" "));
+        }
     }
     function declineIncoming(indices) {
-        if (indices.length > 0)
+        if (indices.length > 0) {
+            root.reloadOnAck = true;
             root.sendControl("decline_incoming " + indices.join(" "));
+        }
     }
     /* Indices of every row currently shown (after any filter), for shift-click. */
     function shownIncomingIndices() {
@@ -552,6 +566,7 @@ BarWidget {
             root.statusText = "Only https:// URLs are supported.";
             return;
         }
+        root.reloadOnAck = true;
         root.sendControlRaw("add_https " + enc(trimmed));
         root.closeAddForm();
     }
