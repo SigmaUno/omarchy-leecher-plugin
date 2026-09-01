@@ -125,6 +125,9 @@ typedef struct {
     int pending_valid;
     size_t pending_index;
     int autoplay_advancing;
+    int autoplay_fail_streak;  /* consecutive autoplay fetches that failed with
+                                * no success in between; a full playlist's worth
+                                * means every source is dead -- stop, don't spin */
     size_t play_queue[64];   /* ad-hoc "play next" order, consumed before library order */
     int play_queue_len;
     /* Background directory scan -> "INCOMING >> <target> <<" staging playlist. */
@@ -2027,6 +2030,7 @@ static void commit_fetch(AppState *s, size_t idx) {
     s->selected_track = idx;
     s->pending_valid = 0;
     s->immediate_pending = 0;
+    s->autoplay_fail_streak = 0;   /* a track actually started */
     /* Fresh track: clear the stall/no-output detectors so the first buffer
      * fill is not mistaken for a stalled device. */
     s->position_stalls = 0;
@@ -2069,6 +2073,8 @@ static void request_play(AppState *s, size_t index) {
     const LibraryHandler *library = s->play_lib;
     size_t count = library ? library_handler_track_count(library) : 0;
     if (count == 0) { snprintf(s->status, sizeof(s->status), "Playlist is empty."); return; }
+    /* A user-initiated play (not an autoplay skip) starts a fresh streak. */
+    if (!s->autoplay_advancing) s->autoplay_fail_streak = 0;
     s->pending_valid = 0;
     s->immediate_pending = 1;
     s->immediate_index = index;
@@ -2345,6 +2351,31 @@ static void announce_fetch_failure(AppState *s, const LibraryHandler *library,
     fprintf(stderr, "leecher: %s\n", s->status);
     library_handler_track_destroy(&track);
     write_status(s);
+}
+
+/* Count an autoplay fetch failure; return 1 when a whole playlist's worth have
+ * failed back-to-back with no success in between (every source is dead, so
+ * advancing again would just spin). Reset by a successful commit_fetch() and by
+ * any user-initiated play. */
+static int autoplay_note_failure(AppState *s, size_t count) {
+    s->autoplay_fail_streak++;
+    return count > 0 && s->autoplay_fail_streak >= (int)count;
+}
+
+/* Autoplay has cycled the playlist without a single track starting: stop rather
+ * than keep hammering dead sources (locally this was a busy loop). */
+static void autoplay_halt_dead_playlist(AppState *s) {
+    s->autoplay_advancing = 0;
+    s->autoplay_fail_streak = 0;
+    s->immediate_pending = 0;
+    s->pending_valid = 0;
+    s->is_playing = 0;
+    if (s->audio_device) SDL_PauseAudioDevice(s->audio_device, 1);
+    snprintf(s->status, sizeof(s->status),
+             "Autoplay stopped: every source in \"%s\" failed to load.", s->playing_playlist);
+    fprintf(stderr, "leecher: %s\n", s->status);
+    write_status(s);
+    write_resume(s);
 }
 
 /* After a mutation reloads the viewed playlist, mirror it into the playback
@@ -3565,9 +3596,13 @@ int main(int argc, char **argv) {
                 size_t count = library_handler_track_count(state.play_lib);
                 state.immediate_pending = 0;
                 if (state.autoplay && state.autoplay_advancing && count > 1) {
-                    size_t nxt = take_next_index(&state, count, state.immediate_index, 0);
                     announce_fetch_failure(&state, state.play_lib, state.immediate_index, 1);
-                    request_play(&state, nxt);
+                    if (autoplay_note_failure(&state, count)) {
+                        autoplay_halt_dead_playlist(&state);
+                    } else {
+                        size_t nxt = take_next_index(&state, count, state.immediate_index, 0);
+                        request_play(&state, nxt);
+                    }
                 } else {
                     announce_fetch_failure(&state, state.play_lib, state.immediate_index, 0);
                 }
@@ -3614,8 +3649,12 @@ int main(int argc, char **argv) {
                 announce_fetch_failure(&state, state.play_lib, idx, 1);
                 state.pending_valid = 0;
                 if (count > 1) {
-                    size_t nxt = take_next_index(&state, count, idx, 0);
-                    request_play(&state, nxt);
+                    if (autoplay_note_failure(&state, count)) {
+                        autoplay_halt_dead_playlist(&state);
+                    } else {
+                        size_t nxt = take_next_index(&state, count, idx, 0);
+                        request_play(&state, nxt);
+                    }
                 }
             }
         }
