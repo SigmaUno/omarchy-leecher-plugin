@@ -128,23 +128,90 @@ static int object_value(const char *json, const jsmntok_t *tokens, int count, in
     }
     return -1;
 }
+/* Parse exactly 4 hex digits; -1 if any is not hex. */
+static int json_hex4(const char *s) {
+    int v = 0, k;
+    for (k = 0; k < 4; k++) {
+        char c = s[k], d;
+        if (c >= '0' && c <= '9') d = (char)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (char)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (char)(c - 'A' + 10);
+        else return -1;
+        v = (v << 4) | d;
+    }
+    return v;
+}
+/* Write `cp` as UTF-8 into `out` (>= 4 bytes); return the byte count. */
+static size_t utf8_encode(unsigned cp, char *out) {
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
 static char *token_string(const char *json, const jsmntok_t *token) {
     size_t in_len, out_len = 0, i;
+    const char *in;
     char *out;
     if (!token || token->type != JSMN_STRING) return NULL;
     in_len = (size_t)(token->end - token->start);
+    in = json + token->start;
+    /* No escape expands: \n..\/ shrink 2->1, \uXXXX shrinks 6->at most 3, a
+     * surrogate pair shrinks 12->4. So the raw length is always enough. */
     out = malloc(in_len + 1); if (!out) return NULL;
     for (i = 0; i < in_len; i++) {
-        char c = json[token->start + (int)i];
-        if (c == '\\' && i + 1 < in_len) {
-            c = json[token->start + (int)++i];
-            if (c == 'n') c = '\n'; else if (c == 'r') c = '\r'; else if (c == 't') c = '\t';
-            else if (c == 'b') c = '\b'; else if (c == 'f') c = '\f';
-            else if (c == 'u') { i += 4; c = '?'; }
+        char c = in[i];
+        if (c != '\\' || i + 1 >= in_len) { out[out_len++] = c; continue; }
+        char e = in[i + 1];
+        switch (e) {
+        case 'n': out[out_len++] = '\n'; i++; break;
+        case 'r': out[out_len++] = '\r'; i++; break;
+        case 't': out[out_len++] = '\t'; i++; break;
+        case 'b': out[out_len++] = '\b'; i++; break;
+        case 'f': out[out_len++] = '\f'; i++; break;
+        case '"': case '\\': case '/': out[out_len++] = e; i++; break;
+        case 'u': {
+            int hi;
+            unsigned cp;
+            if (i + 5 >= in_len || (hi = json_hex4(in + i + 2)) < 0) {
+                out[out_len++] = c;   /* truncated/garbled: keep it literal */
+                break;
+            }
+            cp = (unsigned)hi;
+            i += 5;
+            if (cp >= 0xD800 && cp <= 0xDBFF) {
+                /* High surrogate: needs a following \uDC00..\uDFFF. */
+                int lo;
+                if (i + 6 < in_len && in[i + 1] == '\\' && in[i + 2] == 'u' &&
+                    (lo = json_hex4(in + i + 3)) >= 0xDC00 && lo <= 0xDFFF) {
+                    cp = 0x10000u + ((cp - 0xD800u) << 10) + ((unsigned)lo - 0xDC00u);
+                    i += 6;
+                } else {
+                    cp = 0xFFFDu;   /* lone high surrogate */
+                }
+            } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                cp = 0xFFFDu;       /* lone low surrogate */
+            }
+            out_len += utf8_encode(cp, out + out_len);
+            break;
         }
-        out[out_len++] = c;
+        default: out[out_len++] = c; break;   /* unknown escape: keep backslash */
+        }
     }
-    out[out_len] = '\0'; return out;
+    out[out_len] = '\0';
+    return out;
 }
 static int string_score(const char *json, const jsmntok_t *token, const char *query) {
     char *value, *a, *b; int score = 0;
@@ -499,8 +566,19 @@ int library_handler_update_track(const char *library_path, size_t track_index,
             if (value_token >= 0) {
                 edits[how_many].slice = json_quote_alloc(fields[i]);
                 if (!edits[how_many].slice) { track_edits_free(edits, (int)how_many); library_handler_close(handler); set_error(error, error_size, "out of memory"); return -1; }
-                edits[how_many].start = handler->tokens[value_token].start - 1;
-                edits[how_many].end = handler->tokens[value_token].end + 1;
+                if (handler->tokens[value_token].type == JSMN_STRING) {
+                    /* jsmn's start/end bound the content; widen by one each way
+                     * to swallow the surrounding quotes. */
+                    edits[how_many].start = handler->tokens[value_token].start - 1;
+                    edits[how_many].end = handler->tokens[value_token].end + 1;
+                } else {
+                    /* A non-string value (e.g. `"album": null` in a hand-edited
+                     * file) has no quotes -- replace exactly the token, or the
+                     * +/-1 would eat the ':' and ',' around it and corrupt the
+                     * object. */
+                    edits[how_many].start = handler->tokens[value_token].start;
+                    edits[how_many].end = handler->tokens[value_token].end;
+                }
                 how_many++;
             } else {
                 /* Missing field: append `,"key":"value"` to the combined insertion block. */

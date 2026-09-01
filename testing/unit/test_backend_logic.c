@@ -673,6 +673,42 @@ static void lib_title(const char *path, size_t idx, char *out, size_t out_sz) {
     library_handler_close(h);
 }
 
+/* JSON the app itself never writes but a hand edit or another tool might:
+ * \uXXXX escapes (incl. surrogate pairs) and a null field value. */
+static void test_library_json_edge_cases(void) {
+    char path[] = "/tmp/leecher-lib-edge.XXXXXX";
+    int fd = mkstemp(path);
+    char err[256], title[256];
+    assert(fd >= 0);
+    close(fd);
+
+    /* \uXXXX decodes to real UTF-8, not '?' -- "café — 🎵" */
+    write_file(path,
+        "{\"version\":1,\"tracks\":[{"
+        "\"title\":\"caf\\u00e9 \\u2014 \\ud83c\\udfb5\",\"artist\":\"A\",\"album\":\"B\","
+        "\"sources\":[{\"kind\":\"local\",\"PATH\":\"/x.flac\",\"USERNAME\":null,\"URL\":null,\"IP\":null}]}]}");
+    lib_title(path, 0, title, sizeof(title));
+    CHECK_STR(title, "caf\xc3\xa9 \xe2\x80\x94 \xf0\x9f\x8e\xb5");
+
+    /* editing a track whose album is JSON null must not corrupt the object */
+    write_file(path,
+        "{\"version\":1,\"tracks\":[{"
+        "\"title\":\"T\",\"artist\":\"A\",\"album\":null,"
+        "\"sources\":[{\"kind\":\"local\",\"PATH\":\"/x.flac\",\"USERNAME\":null,\"URL\":null,\"IP\":null}]}]}");
+    CHECK(library_handler_update_track(path, 0, NULL, NULL, "Real Album", err, sizeof(err)) == 1);
+    CHECK(lib_count(path) == 1);   /* still valid JSON */
+    {
+        LibraryHandler *h = library_handler_open(path, err, sizeof(err));
+        LibraryTrack t = {0};
+        CHECK(h && library_handler_track_at(h, 0, &t, err, sizeof(err)) == 1);
+        CHECK(t.album && strcmp(t.album, "Real Album") == 0);
+        CHECK(t.title && strcmp(t.title, "T") == 0);   /* neighbour untouched */
+        library_handler_track_destroy(&t);
+        library_handler_close(h);
+    }
+    unlink(path);
+}
+
 static void test_library_handler(void) {
     char path[] = "/tmp/leecher-lib.XXXXXX";
     int fd = mkstemp(path);
@@ -768,6 +804,7 @@ int main(void) {
         { "stream_buffer",       test_stream_buffer },
         { "decoder",             test_decoder },
         { "library_handler",     test_library_handler },
+        { "library_json_edge_cases", test_library_json_edge_cases },
         { "write_resume",        test_write_resume },
         { "resume_roundtrip",    test_resume_roundtrip },
         { "valid_playlist_name", test_valid_playlist_name },
