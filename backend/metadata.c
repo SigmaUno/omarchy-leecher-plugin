@@ -26,6 +26,14 @@ static void set_error(char *error, size_t error_size, const char *format, ...) {
     va_end(args);
 }
 
+/* Extra `ssh` options (SSH connection multiplexing) shared with the rest of the
+ * app; empty until the caller opts in via metadata_set_ssh_opts(). */
+static char ssh_opts[512];
+
+void metadata_set_ssh_opts(const char *opts) {
+    snprintf(ssh_opts, sizeof(ssh_opts), "%s", opts ? opts : "");
+}
+
 static void trim_string(char *str) {
     char *start, *end;
     size_t leading;
@@ -270,13 +278,13 @@ static int extract_ssh_metadata_with_tool(const char *username, const char *ip, 
 
     if (strcmp(tool, "mediainfo") == 0) {
         result = snprintf(command, sizeof(command),
-            "ssh -F /dev/null -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR -- %s@%s "
+            "ssh -F /dev/null -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR%s -- %s@%s "
             "%s 2>/dev/null",
-            username, ip, quoted_remote_cmd);
+            ssh_opts, username, ip, quoted_remote_cmd);
     } else {
         result = snprintf(command, sizeof(command),
-            "ssh -F /dev/null -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR -- %s@%s %s 2>/dev/null",
-            username, ip, quoted_remote_cmd);
+            "ssh -F /dev/null -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR%s -- %s@%s %s 2>/dev/null",
+            ssh_opts, username, ip, quoted_remote_cmd);
     }
     free(quoted_remote_cmd);
 

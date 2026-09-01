@@ -11,6 +11,8 @@
 #include "library_handler.h"
 #include "music_ripper.h"
 #include "assembler.h"
+#include "stream_buffer.h"
+#include "ssh_opts.h"
 #include "decoder.h"
 #include "metadata.h"
 #include "third_party/nuklear/nuklear.h"
@@ -103,6 +105,13 @@ typedef struct {
     pthread_t fetch_thread;
     int fetch_thread_valid;
     DecoderSource *fetch_decoder;
+    /* The download runs on its own thread so decoding can start before it
+     * finishes.  xfer_job is the in-flight fetch's transfer (not yet committed
+     * to playback); play_xfer_job is the playing track's transfer, still
+     * filling its StreamBuffer after commit_fetch().  Both are torn down only
+     * on the main thread (join_fetch_thread / finish_play_xfer). */
+    struct XferJob *xfer_job;
+    struct XferJob *play_xfer_job;
     char fetch_title[128];
     char fetch_artist[128];
     char fetch_album[128];
@@ -668,10 +677,6 @@ static LibrarySourceKind library_kind(SourceMethod method) {
     return (LibrarySourceKind)method;
 }
 
-static int assemble_audio(const unsigned char *data, size_t size, void *userdata) {
-    return assembler_push(userdata, data, size) == 1;
-}
-
 static int valid_ssh_name(const char *value, int allow_colon) {
     const unsigned char *p = (const unsigned char *)value;
     if (!p || !*p) return 0;
@@ -763,6 +768,30 @@ static char *remote_find_command(const char *path) {
  * argv element, so nothing local is interpreted. USERNAME/IP are validated so a
  * crafted value cannot become extra arguments. Returns the ssh exit status, or
  * -1 on validation/exec/setup failure. */
+/* Fill `out` (capacity >= 32) with an ssh argv: the hardening flags, the shared
+ * connection-multiplexing options (ssh_opts), then `-- target remote_cmd`.
+ * `stream_flags` adds the extra options the long-lived transfer/listing calls
+ * use. Safe to call after fork (no allocation). out[count] is left NULL. */
+static void build_ssh_argv(const char *out[], int stream_flags,
+                           const char *target, const char *remote_cmd) {
+    size_t n = 0, opt_n = 0, i;
+    const char *const *opts;
+    out[n++] = "ssh"; out[n++] = "-F"; out[n++] = "/dev/null";
+    out[n++] = "-o"; out[n++] = "BatchMode=yes";
+    if (stream_flags) {
+        out[n++] = "-o"; out[n++] = "RequestTTY=no";
+        out[n++] = "-o"; out[n++] = "ClearAllForwardings=yes";
+        out[n++] = "-o"; out[n++] = "LogLevel=ERROR";
+        out[n++] = "-o"; out[n++] = "ConnectTimeout=8";
+    } else {
+        out[n++] = "-o"; out[n++] = "ConnectTimeout=5";
+    }
+    opts = ssh_opts_argv(&opt_n);
+    for (i = 0; i < opt_n; i++) out[n++] = opts[i];
+    out[n++] = "--"; out[n++] = target; out[n++] = remote_cmd;
+    out[n] = NULL;
+}
+
 static int run_ssh_to_file(const char *username, const char *ip,
                            const char *remote_command, const char *dest_path) {
     char target[256];
@@ -777,13 +806,12 @@ static int run_ssh_to_file(const char *username, const char *ip,
     if (fd < 0) return -1;
     pid = fork();
     if (pid == 0) {
-        char *const arguments[] = { "ssh", "-F", "/dev/null", "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=5",
-            "--", target, (char *)remote_command, NULL };
+        const char *arguments[32];
+        build_ssh_argv(arguments, 0, target, remote_command);
         if (dup2(fd, STDOUT_FILENO) < 0) _exit(127);
         if (dup2(fd, STDERR_FILENO) < 0) _exit(127);
         close(fd);
-        execvp(arguments[0], arguments);
+        execvp(arguments[0], (char *const *)arguments);
         _exit(127);
     }
     close(fd);
@@ -809,13 +837,12 @@ static int stream_ssh(const LibrarySource *source, MusicRipperWriteFn write,
     if (!command || pipe(pipe_fds) != 0) { free(command); return -1; }
     pid = fork();
     if (pid == 0) {
-        char *const arguments[] = { "ssh", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "RequestTTY=no",
-            "-o", "ClearAllForwardings=yes", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=8",
-            "--", target, command, NULL };
+        const char *arguments[32];
+        build_ssh_argv(arguments, 1, target, command);
         close(pipe_fds[0]);
         if (dup2(pipe_fds[1], STDOUT_FILENO) < 0) _exit(127);
         close(pipe_fds[1]);
-        execvp(arguments[0], arguments);
+        execvp(arguments[0], (char *const *)arguments);
         _exit(127);
     }
     close(pipe_fds[1]);
@@ -1365,12 +1392,115 @@ typedef struct FetchJob {
     AppState *state;
     const LibraryHandler *library;
     size_t index;
-    Assembler *assembler;
-    MusicRipper ripper;
+    StreamBuffer *sb;
 } FetchJob;
+
+/* Bytes to buffer before playback may begin.  Comfortably past any header, so
+ * decoder_open() parses from memory without blocking, yet small enough that a
+ * track starts within a second or two on a typical link. */
+#define FETCH_PREBUFFER_BYTES ((size_t)1 << 20)
+
+/* Args for the transfer thread.  It carries a self-contained copy of the chosen
+ * source and the transport that streams it, so it holds no reference to the
+ * library handle (which the app may reload underneath it).  An XferJob is
+ * created by fetch_worker and torn down only on the main thread (xfer_job_join),
+ * so the thread never races a joiner over its own storage. */
+struct XferJob {
+    AppState *state;
+    StreamBuffer *sb;        /* borrowed: owned by a DecoderSource once sb_adopted */
+    size_t index;
+    LibrarySource src;       /* owned deep copy */
+    MusicRipperRemoteFn transport;
+    pthread_t thread;
+    volatile int cancel;
+    int started;
+    int sb_adopted;
+};
+typedef struct XferJob XferJob;
 
 static void fetch_lock(AppState *s) { pthread_mutex_lock(&s->fetch_mutex); }
 static void fetch_unlock(AppState *s) { pthread_mutex_unlock(&s->fetch_mutex); }
+
+static int sb_append_cb(const unsigned char *data, size_t size, void *userdata) {
+    XferJob *x = userdata;
+    if (x->cancel) return 0;
+    return stream_buffer_append(x->sb, data, size);
+}
+
+/* Streams a plain local file into the buffer -- the local-source transport,
+ * mirroring music_ripper.c's stream_local but polling the job's cancel flag. */
+static int stream_local_file(const LibrarySource *src, MusicRipperWriteFn write,
+                             void *write_userdata, void *transport_userdata) {
+    const volatile int *cancel = transport_userdata;
+    unsigned char buffer[64 * 1024];
+    size_t bytes;
+    FILE *file;
+    int bad;
+    if (!src || !src->path) return -1;
+    file = fopen(src->path, "rb");
+    if (!file) return -1;
+    while ((bytes = fread(buffer, 1, sizeof(buffer), file)) != 0) {
+        if (cancel && *cancel) { fclose(file); return -1; }
+        if (!write(buffer, bytes, write_userdata)) { fclose(file); return -1; }
+    }
+    bad = ferror(file);
+    fclose(file);
+    return bad ? -1 : 0;
+}
+
+static void source_free(LibrarySource *s) {
+    free(s->path); free(s->username); free(s->url); free(s->ip);
+    *s = (LibrarySource){0};
+}
+
+/* True when `s` has the fields its kind needs to be streamed (matches the check
+ * music_ripper_play_next applies when it picks a source). */
+static int source_usable(const LibrarySource *s) {
+    switch (s->kind) {
+    case LIBRARY_SOURCE_LOCAL:   return s->path && s->path[0];
+    case LIBRARY_SOURCE_SSH:
+    case LIBRARY_SOURCE_NETWORK: return s->path && s->path[0] && s->username && s->username[0] && s->ip && s->ip[0];
+    case LIBRARY_SOURCE_HTTPS:   return s->url && s->url[0];
+    }
+    return 0;
+}
+
+static void *xfer_worker(void *arg) {
+    XferJob *x = arg;
+    int rc = x->transport(&x->src, sb_append_cb, x, (void *)&x->cancel);
+    if (rc == 0) {
+        stream_buffer_set_complete(x->sb);
+    } else {
+        stream_buffer_set_failed(x->sb);
+        AppState *s = x->state;
+        fetch_lock(s);
+        if (!x->cancel && s->fetch_index == x->index && !s->fetch_error[0])
+            snprintf(s->fetch_error, sizeof(s->fetch_error), "%s", "source transfer failed");
+        fetch_unlock(s);
+    }
+    return NULL;
+}
+
+/* Cancel, join, and free a transfer job.  Destroys its StreamBuffer too unless
+ * a DecoderSource has adopted it (then decoder_close frees it).  Main thread
+ * only. */
+static void xfer_job_join(XferJob *x) {
+    if (!x) return;
+    if (x->started) {
+        x->cancel = 1;
+        stream_buffer_set_failed(x->sb);
+        pthread_join(x->thread, NULL);
+    }
+    if (!x->sb_adopted) stream_buffer_destroy(x->sb);
+    source_free(&x->src);
+    free(x);
+}
+
+/* Stop the transfer still feeding the playing decoder's buffer, so that buffer
+ * can be freed.  Call immediately before any decoder_close(s->decoder). */
+static void finish_play_xfer(AppState *s) {
+    if (s->play_xfer_job) { xfer_job_join(s->play_xfer_job); s->play_xfer_job = NULL; }
+}
 
 static void free_fetch_cache(AppState *s) {
     if (s->fetch_decoder) { decoder_close(s->fetch_decoder); s->fetch_decoder = NULL; }
@@ -1515,8 +1645,8 @@ static void extract_source_cover(const LibrarySource *source, char *out, size_t 
         char *qcover = shell_quote_words(cover_file);
         if (!qcover) { free(qcmd); return; }
         int wrote = snprintf(command, sizeof(command),
-                     "ssh -F /dev/null -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR -- %s@%s %s 2>/dev/null | ffmpeg -v error -y -i - -an -map 0:v:0 -c:v copy -frames:v 1 %s 2>/dev/null",
-                     source->username, source->ip, qcmd, qcover);
+                     "ssh -F /dev/null -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR%s -- %s@%s %s 2>/dev/null | ffmpeg -v error -y -i - -an -map 0:v:0 -c:v copy -frames:v 1 %s 2>/dev/null",
+                     ssh_opts_str(), source->username, source->ip, qcmd, qcover);
         free(qcmd);
         free(qcover);
         if (wrote >= (int)sizeof(command))
@@ -1531,18 +1661,31 @@ static void extract_source_cover(const LibrarySource *source, char *out, size_t 
     }
 }
 
+/* strdup that tolerates NULL (returns NULL). */
+static char *dup_or_null(const char *s) { return s ? strdup(s) : NULL; }
+
+/* True for formats the decoder can open (and start playing) from a partial
+ * download: the header carries the sample count and libsndfile does not read to
+ * the end of the file while parsing it.  FLAC qualifies; WAV does not (its
+ * parser seeks past the data chunk), and MP3/Ogg need a length probe -- those
+ * wait for the whole transfer. */
+static int is_progressive_format(const char *name) {
+    size_t n = name ? strlen(name) : 0;
+    return n >= 5 && !strcasecmp(name + n - 5, ".flac");
+}
+
 static void *fetch_worker(void *arg) {
     FetchJob *job = (FetchJob *)arg;
     AppState *s = job->state;
     LibraryTrack track = {0};
-    LibrarySongQuery song = {0};
     DecoderSource *decoder = NULL;
     char error[256] = {0};
     char save_title[128] = {0}, save_artist[128] = {0}, save_album[128] = {0};
     char save_cover[512] = {0};
-    int ready = 0;
+    XferJob *x = NULL;
+    int published = 0, ready = 0, progressive = 0;
+
     if (library_handler_track_at(job->library, job->index, &track, error, sizeof(error)) == 1) {
-        song = (LibrarySongQuery){ .id = track.id, .title = track.title, .artist = track.artist, .album = track.album };
         if (track.title) snprintf(save_title, sizeof(save_title), "%s", track.title);
         if (track.artist) snprintf(save_artist, sizeof(save_artist), "%s", track.artist);
         if (track.album) snprintf(save_album, sizeof(save_album), "%s", track.album);
@@ -1561,18 +1704,58 @@ static void *fetch_worker(void *arg) {
             rename(save_cover, unique);
             snprintf(save_cover, sizeof(save_cover), "%s", unique);
         }
-        if (!s->fetch_cancel &&
-            music_ripper_play_next(&job->ripper, &song, NULL, assemble_audio, job->assembler, error, sizeof(error)) == 1 &&
-            !s->fetch_cancel &&
-            decoder_open(job->assembler, &decoder, error, sizeof(error)) == 1 &&
-            !s->fetch_cancel) {
-            ready = 1;
+        const LibrarySource *chosen = NULL;
+        for (size_t ci = 0; ci < track.source_count; ci++) {
+            if (source_usable(&track.sources[ci])) { chosen = &track.sources[ci]; break; }
+        }
+        if (!chosen) {
+            snprintf(error, sizeof(error), "track has no usable source");
+        } else if (!s->fetch_cancel && (x = calloc(1, sizeof(*x))) != NULL) {
+            progressive = is_progressive_format(chosen->kind == LIBRARY_SOURCE_HTTPS
+                                                ? chosen->url : chosen->path);
+            x->state = s;
+            x->sb = job->sb;
+            x->index = job->index;
+            x->src.kind = chosen->kind;
+            x->src.path = dup_or_null(chosen->path);
+            x->src.username = dup_or_null(chosen->username);
+            x->src.url = dup_or_null(chosen->url);
+            x->src.ip = dup_or_null(chosen->ip);
+            x->transport = chosen->kind == LIBRARY_SOURCE_LOCAL ? stream_local_file
+                         : chosen->kind == LIBRARY_SOURCE_HTTPS ? stream_https
+                         : stream_ssh;   /* SSH and NETWORK */
+            if (pthread_create(&x->thread, NULL, xfer_worker, x) == 0) {
+                x->started = 1;
+                /* Publish the transfer at once so a joiner can always find it;
+                 * from here fetch_worker never frees x. */
+                fetch_lock(s);
+                s->xfer_job = x;
+                fetch_unlock(s);
+                published = 1;
+            }
         }
         library_handler_track_destroy(&track);
     }
+
+    if (published && !s->fetch_cancel) {
+        /* FLAC/WAV: open once a playback cushion (or the whole short track) has
+         * arrived and keep streaming.  Other formats need the full file for an
+         * accurate header, so wait for the transfer to finish first. */
+        long long pre = progressive
+            ? stream_buffer_wait_prebuffer(job->sb, FETCH_PREBUFFER_BYTES)
+            : stream_buffer_wait_complete(job->sb);
+        if (pre >= 0 && !s->fetch_cancel &&
+            decoder_open(job->sb, &decoder, error, sizeof(error)) == 1) {
+            ready = 1;
+        } else if (!error[0]) {
+            snprintf(error, sizeof(error), "source unavailable");
+        }
+    }
+
+    fetch_lock(s);
     if (ready) {
-        fetch_lock(s);
         free_fetch_cache(s);
+        x->sb_adopted = 1;               /* the decoder now owns job->sb */
         s->fetch_decoder = decoder;
         snprintf(s->fetch_title, sizeof(s->fetch_title), "%s", save_title);
         snprintf(s->fetch_artist, sizeof(s->fetch_artist), "%s", save_artist);
@@ -1580,21 +1763,22 @@ static void *fetch_worker(void *arg) {
         snprintf(s->fetch_cover, sizeof(s->fetch_cover), "%s", save_cover);
         s->fetch_error[0] = '\0';
         s->fetch_ready = 1;
-        fetch_unlock(s);
     } else {
-        if (decoder) decoder_close(decoder);
-        /* Record why, so an autoplay skip can say more than "track vanished".
-         * A cancel is not a failure: the next fetch is already starting. */
-        fetch_lock(s);
-        if (!s->fetch_cancel)
+        /* A cancel is not a failure: the next fetch is already starting. */
+        if (!s->fetch_cancel && !s->fetch_error[0])
             snprintf(s->fetch_error, sizeof(s->fetch_error), "%s",
                      error[0] ? error : "source unavailable");
-        fetch_unlock(s);
+        if (!published) {
+            /* No transfer was ever handed off: this thread still owns the
+             * buffer (and a half-built x). */
+            if (x) { source_free(&x->src); free(x); }
+            stream_buffer_destroy(job->sb);
+        }
+        /* When published, s->xfer_job holds x and join_fetch_thread reaps it
+         * (and its buffer, since sb_adopted stayed 0). */
     }
-    fetch_lock(s);
     s->fetch_active = 0;
     fetch_unlock(s);
-    assembler_destroy(job->assembler);
     free(job);
     return NULL;
 }
@@ -1607,14 +1791,29 @@ static void *fetch_worker(void *arg) {
  * fetch_mutex and have confirmed fetch_thread_valid; the lock is dropped for
  * the fill + join and retaken before return. */
 static void join_fetch_thread(AppState *s) {
+    XferJob *x = s->xfer_job;
+    s->xfer_job = NULL;
     s->fetch_cancel = 1;
     pthread_mutex_unlock(&s->fetch_mutex);
     s->stream_target_ms = 6000;
     stream_audio(s);
     s->stream_target_ms = 0;
+    /* Signal the transfer so a fetch_worker parked on the buffer (prebuffer /
+     * header) unblocks, then join fetch_worker before the buffer is freed so it
+     * cannot still be reading it, then reap the transfer thread itself. */
+    if (x) { x->cancel = 1; stream_buffer_set_failed(x->sb); }
     pthread_join(s->fetch_thread, NULL);
+    if (x) xfer_job_join(x);
     pthread_mutex_lock(&s->fetch_mutex);
     s->fetch_thread_valid = 0;
+    /* fetch_worker may have published its transfer during the join window. */
+    if (s->xfer_job) {
+        XferJob *late = s->xfer_job;
+        s->xfer_job = NULL;
+        pthread_mutex_unlock(&s->fetch_mutex);
+        xfer_job_join(late);
+        pthread_mutex_lock(&s->fetch_mutex);
+    }
 }
 
 /* Restart the worker (joining an in-flight one first) to fetch `index` from the
@@ -1640,19 +1839,12 @@ static void start_fetch(AppState *s, size_t index) {
     /* Bound the compressed stream buffered during a fetch: a stuck source that
      * streams data forever must eventually fail instead of growing RAM without
      * limit. The limit is generous so legitimate lossless files still fit. */
-    {
-        AssemblerConfig acfg = {0};
-        acfg.max_queued_bytes = (size_t)3 * 1024 * 1024 * 1024;
-        job->assembler = assembler_create(&acfg);
-    }
-    if (!job->assembler) { free(job); fetch_lock(s); s->fetch_active = 0; fetch_unlock(s); return; }
-    job->ripper.library = library;
-    job->ripper.transports = s->transports;
-    job->ripper.transports.userdata = (void *)&s->fetch_cancel;
+    job->sb = stream_buffer_create((size_t)3 * 1024 * 1024 * 1024);
+    if (!job->sb) { free(job); fetch_lock(s); s->fetch_active = 0; fetch_unlock(s); return; }
     if (pthread_create(&s->fetch_thread, NULL, fetch_worker, job) == 0) {
         s->fetch_thread_valid = 1;
     } else {
-        assembler_destroy(job->assembler);
+        stream_buffer_destroy(job->sb);
         free(job);
         fetch_lock(s); s->fetch_active = 0; fetch_unlock(s);
     }
@@ -1721,6 +1913,7 @@ static void reopen_audio_device(AppState *s) {
 static void commit_fetch(AppState *s, size_t idx) {
     SDL_AudioSpec desired = {0}, obtained = {0};
     DecoderSource *decoder = NULL;
+    XferJob *newxfer = NULL;
     int channels = 0, rate = 0;
     Uint64 total_frames = 0;
 
@@ -1731,6 +1924,7 @@ static void commit_fetch(AppState *s, size_t idx) {
         return;
     }
     decoder = s->fetch_decoder;
+    newxfer = s->xfer_job;   /* the transfer still filling this decoder's buffer */
     total_frames = (Uint64)decoder_total_frames(decoder);
     channels = decoder_channels(decoder);
     rate = decoder_rate(decoder);
@@ -1739,11 +1933,14 @@ static void commit_fetch(AppState *s, size_t idx) {
     snprintf(s->album, sizeof(s->album), "%s", s->fetch_album);
     snprintf(s->cover_file, sizeof(s->cover_file), "%s", s->fetch_cover);
     s->fetch_decoder = NULL;
+    s->xfer_job = NULL;
     free_fetch_cache(s);
     fetch_unlock(s);
 
+    finish_play_xfer(s);                     /* stop the outgoing track's transfer */
     if (s->decoder) decoder_close(s->decoder);
     s->decoder = decoder;
+    s->play_xfer_job = newxfer;              /* it keeps downloading behind playback */
     s->audio_queued_frame = 0;
 
     if (s->audio_device) SDL_CloseAudioDevice(s->audio_device);
@@ -1755,6 +1952,7 @@ static void commit_fetch(AppState *s, size_t idx) {
     if (!s->audio_device || total_frames == 0) {
         snprintf(s->status, sizeof(s->status), "SDL audio: %s", SDL_GetError());
         if (s->audio_device) { SDL_CloseAudioDevice(s->audio_device); s->audio_device = 0; }
+        finish_play_xfer(s);
         decoder_close(s->decoder); s->decoder = NULL;
         s->is_playing = 0;
         write_status(s);
@@ -3184,6 +3382,8 @@ int main(int argc, char **argv) {
     signal(SIGTERM, request_stop);
     pthread_mutex_init(&state.fetch_mutex, NULL);
     init_ipc_dir();
+    ssh_opts_init(ipc_dir);              /* reuse one multiplexed ssh connection per host */
+    metadata_set_ssh_opts(ssh_opts_str());
 
     /* Resolve the library directory (migrating a legacy single-file library the
      * first time) and choose the playlist to open. The playlist that was
@@ -3488,10 +3688,12 @@ int main(int argc, char **argv) {
     write_resume(&state);   /* final resume point on a clean shutdown */
     cancel_fetch(&state);
     if (state.audio_device) SDL_CloseAudioDevice(state.audio_device);
+    finish_play_xfer(&state);
     if (state.decoder) { decoder_close(state.decoder); state.decoder = NULL; }
     remove_cover_files(); /* GC committed covers on shutdown */
     pthread_mutex_destroy(&state.fetch_mutex);
     stop_ssh_agent(&state);
+    ssh_opts_cleanup();
     if (!headless) { nk_sdl_shutdown(); SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window); }
     SDL_Quit(); assembler_destroy(assembler); library_handler_close(library); library_handler_close(state.play_lib);
     return 0;
