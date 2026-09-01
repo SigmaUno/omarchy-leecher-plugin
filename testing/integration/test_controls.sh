@@ -108,10 +108,14 @@ send "play_pause"
 wait_for '.is_playing == true' "play_pause resumes"
 
 # A resent line (same id) must be acted on once, not toggled twice.
-dup_id=$((cmd_id + 1)); cmd_id=$dup_id
-printf '%d play_pause\n' "$dup_id" > "$D/control"
+# The first copy goes through send(), which re-issues the SAME id until it is
+# acked -- a raw single write here was the flake: the control file is written
+# non-atomically and a loaded runner can miss the poll, so "first copy pauses"
+# failed before the dedup behaviour was ever exercised. Re-issuing is safe
+# precisely because of the dedup this test is checking.
+send "play_pause"
 wait_for '.is_playing == false' "resend: first copy pauses"
-printf '%d play_pause\n' "$dup_id" > "$D/control"   # identical id
+printf '%d play_pause\n' "$cmd_id" > "$D/control"   # identical id
 sleep 0.5
 jq -e '.is_playing == false' "$D/status.json" >/dev/null 2>&1 \
     && pass "resend with the same id is not run twice" \
