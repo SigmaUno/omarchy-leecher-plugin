@@ -274,46 +274,6 @@ static void test_next_encoded_token(void) {
     CHECK_STR(tok, "");                               /* exhausted */
 }
 
-/* ---------------------------------------------------------------- assembler */
-static void test_assembler(void) {
-    Assembler *a;
-    AssemblerPiece p = {0};
-    AssemblerConfig cfg = {0};
-    unsigned char buf[4096];
-    size_t i;
-
-    a = assembler_create(NULL);
-    CHECK(a != NULL);
-    CHECK(assembler_pop(a, &p) == 0);                 /* empty */
-    CHECK(assembler_push(a, (const unsigned char *)"abc", 3) == 1);
-    CHECK(assembler_push(a, (const unsigned char *)"de", 2) == 1);
-    CHECK(assembler_queued_bytes(a) == 5);
-    CHECK(assembler_queued_pieces(a) == 2);
-    CHECK(assembler_pop(a, &p) == 1);
-    CHECK(p.size == 3 && memcmp(p.data, "abc", 3) == 0);
-    assembler_piece_destroy(&p);
-    CHECK(assembler_queued_bytes(a) == 2);
-    CHECK(assembler_pop(a, &p) == 1 && p.size == 2);
-    assembler_piece_destroy(&p);
-    CHECK(assembler_pop(a, &p) == 0);
-    assembler_destroy(a);
-
-    /* backpressure: max_queued_bytes is a hard ceiling, push returns 0 */
-    cfg.max_queued_bytes = 5000;
-    a = assembler_create(&cfg);
-    CHECK(a != NULL);
-    for (i = 0; i < sizeof(buf); i++) buf[i] = (unsigned char)i;
-    CHECK(assembler_push(a, buf, 4096) == 1);
-    CHECK(assembler_push(a, buf, 4096) == 0);         /* would exceed 5000 */
-    CHECK(assembler_queued_bytes(a) == 4096);
-    CHECK(assembler_pop(a, &p) == 1);
-    CHECK(memcmp(p.data, buf, p.size) == 0);          /* bytes intact */
-    assembler_piece_destroy(&p);
-    assembler_destroy(a);
-
-    assembler_destroy(NULL);                          /* tolerates NULL */
-}
-
 /* ------------------------------------------------------------------ decoder */
 /* Minimal PCM16 mono WAV in memory. */
 static unsigned char *make_wav(int rate, int frames, size_t *out_len) {
@@ -866,7 +826,6 @@ int main(void) {
         { "play_queue",          test_play_queue },
         { "take_next_index",     test_take_next_index },
         { "next_encoded_token",  test_next_encoded_token },
-        { "assembler",           test_assembler },
         { "stream_buffer",       test_stream_buffer },
         { "decoder",             test_decoder },
         { "library_handler",     test_library_handler },

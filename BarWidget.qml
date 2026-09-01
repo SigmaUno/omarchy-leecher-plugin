@@ -377,9 +377,14 @@ BarWidget {
         }
         return out;
     }
+    /* Returns true when the command was accepted into the outgoing queue. The
+     * optimistic toggles below only flip on true, so a command that was never
+     * sent cannot leave the UI showing a state the backend does not have. */
     function sendControlRaw(cmdLine, coalesceKey) {
-        if (!root.runtimeDirSafe)
-            return;
+        if (!root.runtimeDirSafe) {
+            root.statusText = "Not connected to the player yet.";
+            return false;
+        }
         var entry = { line: cmdLine, reload: root.reloadOnAck, key: coalesceKey || "" };
         root.reloadOnAck = false;
         var q = root.commandQueue.slice();
@@ -394,18 +399,19 @@ BarWidget {
                     q[i] = entry;
                     root.commandQueue = q;
                     root.pumpCommandQueue();
-                    return;
+                    return true;
                 }
             }
         }
         q.push(entry);
         root.commandQueue = q;
         root.pumpCommandQueue();
+        return true;
     }
     function sendControl(cmd) {
         /* Encode the payload so values (titles/artists/albums) can contain
          * newlines or shell-special characters without corrupting the line. */
-        root.sendControlRaw(enc(cmd), String(cmd).split(" ")[0]);
+        return root.sendControlRaw(enc(cmd), String(cmd).split(" ")[0]);
     }
     /* Fire the head of the queue if nothing is in flight. */
     function pumpCommandQueue() {
@@ -493,25 +499,29 @@ BarWidget {
         root.addingPlaylist = false;
     }
     function toggleAutoplay() {
-        root.autoplay = !root.autoplay;
-        root.sendControl(root.autoplay ? "autoplay on" : "autoplay off");
+        var next = !root.autoplay;
+        if (root.sendControl(next ? "autoplay on" : "autoplay off"))
+            root.autoplay = next;
     }
     function toggleShuffle() {
-        root.shuffle = !root.shuffle;
-        root.sendControl(root.shuffle ? "shuffle on" : "shuffle off");
+        var next = !root.shuffle;
+        if (root.sendControl(next ? "shuffle on" : "shuffle off"))
+            root.shuffle = next;
     }
     function toggleRepeatOne() {
-        root.repeatOne = !root.repeatOne;
-        root.sendControl(root.repeatOne ? "repeat one" : "repeat off");
+        var next = !root.repeatOne;
+        if (root.sendControl(next ? "repeat one" : "repeat off"))
+            root.repeatOne = next;
     }
     function setVolume(v) {
         var clamped = Math.max(0, Math.min(100, Math.round(v)));
-        root.volume = clamped;
-        root.sendControl("volume " + clamped);
+        if (root.sendControl("volume " + clamped))
+            root.volume = clamped;
     }
     function toggleMute() {
-        root.muted = !root.muted;
-        root.sendControl(root.muted ? "mute on" : "mute off");
+        var next = !root.muted;
+        if (root.sendControl(next ? "mute on" : "mute off"))
+            root.muted = next;
     }
     function queueTrack(i) {
         root.sendControl("queue " + i);

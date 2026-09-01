@@ -10,8 +10,6 @@ echo "== unit: backend logic =="
 $cc -std=c11 -Wall -Wextra -O2 -I"$here/../../backend" \
     "$here/test_backend_logic.c" \
     "$here/../../backend/library_handler.c" \
-    "$here/../../backend/music_ripper.c" \
-    "$here/../../backend/assembler.c" \
     "$here/../../backend/stream_buffer.c" \
     "$here/../../backend/ssh_opts.c" \
     "$here/../../backend/decoder.c" \

@@ -9,8 +9,6 @@
 #define NK_SDL_RENDERER_IMPLEMENTATION
 
 #include "library_handler.h"
-#include "music_ripper.h"
-#include "assembler.h"
 #include "stream_buffer.h"
 #include "ssh_opts.h"
 #include "decoder.h"
@@ -24,6 +22,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +35,14 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+
+/* A source transport: streams one LibrarySource to `write`, polling
+ * `transport_userdata` (a cancel flag) between chunks. These lived in
+ * music_ripper.h, whose own resolver was never called -- the fetch worker
+ * picks and drives a transport itself. */
+typedef int (*MusicRipperWriteFn)(const unsigned char *data, size_t size, void *userdata);
+typedef int (*MusicRipperRemoteFn)(const LibrarySource *source, MusicRipperWriteFn write,
+                                   void *write_userdata, void *transport_userdata);
 
 typedef enum { SOURCE_LOCAL, SOURCE_SSH, SOURCE_HTTPS, SOURCE_NETWORK } SourceMethod;
 
@@ -113,9 +120,8 @@ typedef struct {
     Uint32 resume_position_ms;    /* one-shot: seek here on the next commit_fetch */
     int resume_paused;            /* one-shot: start that track paused */
     Uint32 last_resume_write_ms;  /* throttle the resume-state file writes */
-    MusicRipperTransports transports;
     pthread_mutex_t fetch_mutex;
-    volatile int fetch_cancel;
+    atomic_int fetch_cancel;
     int fetch_active;
     int fetch_ready;
     size_t fetch_index;
@@ -149,8 +155,8 @@ typedef struct {
      * results need no lock (the join is the barrier). */
     pthread_t cover_thread;
     int cover_thread_valid;
-    volatile int cover_active;
-    volatile int cover_cancel;
+    atomic_int cover_active;
+    atomic_int cover_cancel;
     struct CoverJob *cover_job;
     CoverResult cover_results[COVER_RESULT_MAX];
     int cover_result_count;
@@ -158,9 +164,9 @@ typedef struct {
     /* Background directory scan -> "INCOMING >> <target> <<" staging playlist. */
     pthread_t scan_thread;
     int scan_thread_valid;
-    volatile int scan_active;
-    volatile int scan_cancel;
-    volatile int scan_count;
+    atomic_int scan_active;
+    atomic_int scan_cancel;
+    atomic_int scan_count;
     char scan_incoming[LIBRARY_NAME_MAX];  /* the staging playlist stem */
     char scan_target[LIBRARY_NAME_MAX];    /* the playlist accepted tracks land in */
 } AppState;
@@ -437,7 +443,21 @@ static void write_status(const AppState *state) {
     free(title); free(artist); free(album); free(library); free(cover); free(status); free(output);
     free(dir); free(viewed); free(playing); free(cstatus);
     if (n < 0 || (size_t)n >= sizeof(tmp)) return; /* oversized; leave old status intact */
-    atomic_write(status_file, tmp, (size_t)n);
+
+    /* Skip the write when the bytes are identical to what is already published.
+     * Several callers fire in bursts with nothing new to say -- scan progress
+     * every 400ms, a re-echoed duplicate command id, announce_fetch_failure
+     * followed by another status write -- and each redundant write costs a
+     * mkstemp+fsync+rename here and a full JSON re-parse in the widget, which
+     * watches this file. */
+    {
+        static char published[sizeof(tmp)];
+        static int published_len = -1;
+        if (n == published_len && !memcmp(tmp, published, (size_t)n)) return;
+        if (!atomic_write(status_file, tmp, (size_t)n)) return;
+        memcpy(published, tmp, (size_t)n);
+        published_len = n;
+    }
 }
 
 /* Resume state persists across a backend restart, so it lives in the library
@@ -472,18 +492,28 @@ static void incoming_name_for(const char *target, char *out, size_t out_size) {
 
 /* If `name` is a staging playlist, copy its target stem into `target` (may be
  * NULL) and return 1. */
+static int valid_playlist_name(const char *name);
+
 static int incoming_target_of(const char *name, char *target, size_t target_size) {
+    char extracted[LIBRARY_NAME_MAX];
     size_t n = strlen(name);
     size_t pl = sizeof(INCOMING_PREFIX) - 1, sl = sizeof(INCOMING_SUFFIX) - 1;
+    size_t tl;
     if (n <= pl + sl) return 0;
     if (strncmp(name, INCOMING_PREFIX, pl) != 0) return 0;
     if (strcmp(name + n - sl, INCOMING_SUFFIX) != 0) return 0;
-    if (target && target_size) {
-        size_t tl = n - pl - sl;
-        if (tl >= target_size) tl = target_size - 1;
-        memcpy(target, name + pl, tl);
-        target[tl] = '\0';
-    }
+    tl = n - pl - sl;
+    if (tl >= sizeof(extracted)) return 0;
+    memcpy(extracted, name + pl, tl);
+    extracted[tl] = '\0';
+    /* The target becomes a path component in playlist_file_path(), and this
+     * name came off disk (scan_playlists lists whatever *.json is there), so it
+     * is not necessarily one we created. Reject anything valid_playlist_name()
+     * would not have allowed -- notably '/' and '..' -- rather than let a
+     * crafted "INCOMING >> ../x <<.json" steer a write out of the library. */
+    if (!valid_playlist_name(extracted)) return 0;
+    if (target && target_size)
+        snprintf(target, target_size, "%s", extracted);
     return 1;
 }
 
@@ -922,7 +952,7 @@ static int stream_ssh(const LibrarySource *source, MusicRipperWriteFn write,
     pid_t pid;
     ssize_t bytes;
     int result = 0;
-    const volatile int *cancel = (const volatile int *)transport_userdata;
+    const atomic_int *cancel = (const atomic_int *)transport_userdata;
     if (!source || !source->path || !valid_ssh_name(source->username, 0) ||
         !valid_ssh_name(source->ip, 1)) return -1;
     if (snprintf(target, sizeof(target), "%s@%s", source->username, source->ip) >= (int)sizeof(target)) return -1;
@@ -941,7 +971,7 @@ static int stream_ssh(const LibrarySource *source, MusicRipperWriteFn write,
     close(pipe_fds[1]);
     if (pid < 0) { close(pipe_fds[0]); free(command); return -1; }
     while ((bytes = read(pipe_fds[0], buffer, sizeof(buffer))) > 0) {
-        if (cancel && *cancel) { result = -1; break; }
+        if (cancel && atomic_load_explicit(cancel, memory_order_relaxed)) { result = -1; break; }
         if (!write(buffer, (size_t)bytes, write_userdata)) { result = -1; break; }
     }
     if (bytes < 0 && errno != EINTR) result = -1;
@@ -959,7 +989,7 @@ static int stream_https(const LibrarySource *source, MusicRipperWriteFn write,
     pid_t pid;
     ssize_t bytes;
     int result = 0;
-    const volatile int *cancel = (const volatile int *)transport_userdata;
+    const atomic_int *cancel = (const atomic_int *)transport_userdata;
     if (!source || !source->url || strncasecmp(source->url, "https://", 8) != 0) return -1;
     if (pipe(pipe_fds) != 0) return -1;
     pid = fork();
@@ -976,7 +1006,7 @@ static int stream_https(const LibrarySource *source, MusicRipperWriteFn write,
     close(pipe_fds[1]);
     if (pid < 0) { close(pipe_fds[0]); return -1; }
     while ((bytes = read(pipe_fds[0], buffer, sizeof(buffer))) > 0) {
-        if (cancel && *cancel) { result = -1; break; }
+        if (cancel && atomic_load_explicit(cancel, memory_order_relaxed)) { result = -1; break; }
         if (!write(buffer, (size_t)bytes, write_userdata)) { result = -1; break; }
     }
     if (bytes < 0 && errno != EINTR) result = -1;
@@ -1075,7 +1105,7 @@ static void extract_ssh_metadata(AppState *state) {
 }
 
 static void choose_ssh_file(AppState *state) {
-    char temp_file[256];
+    char temp_file[IPC_PATH_MAX + 32];
     char *remote;
     FILE *temp;
     char line[512];
@@ -1090,8 +1120,10 @@ static void choose_ssh_file(AppState *state) {
         return;
     }
 
-    /* Secure temp file for the list output; unlinked at the end of the function. */
-    snprintf(temp_file, sizeof(temp_file), "/tmp/leecher_files_XXXXXX");
+    /* Temp file for the list output, in our own 0700 IPC directory rather than
+     * a shared /tmp -- it holds a remote directory listing, and a crash between
+     * here and the unlink would otherwise leave it lying around in public. */
+    snprintf(temp_file, sizeof(temp_file), "%s/files-XXXXXX", ipc_dir);
     int fd = mkstemp(temp_file);
     if (fd < 0) {
         snprintf(state->status, sizeof(state->status), "Could not create temp file for SSH list.");
@@ -1370,7 +1402,7 @@ static void rebuild_star_playlist(AppState *s) {
  * saved (the track may be new or a merge into an existing one). */
 static int import_single_source(const char *library_path, AppState *state,
                                 const LibrarySongQuery *song, const LibrarySource *source,
-                                LibraryHandler **library, MusicRipper *ripper) {
+                                LibraryHandler **library) {
     char error[256] = {0};
     if (library_handler_add_source(library_path, song, source, error, sizeof(error)) != 1) {
         snprintf(state->status, sizeof(state->status), "Import failed for %.160s: %s", song->title, error);
@@ -1381,7 +1413,6 @@ static int import_single_source(const char *library_path, AppState *state,
         cancel_fetch(state);
         library_handler_close(*library);
         *library = reloaded;
-        if (ripper) ripper->library = reloaded;
         resync_play_lib(state);
     }
     return 1;
@@ -1403,7 +1434,7 @@ static int is_audio_name(const char *name) {
 /* Pull every playable song out of the directory in `dir` and import it as a
  * LOCAL source, de-duplicating by exact title/artist/album. */
 static void pull_local_songs(const char *library_path, AppState *state,
-                             const char *dir, LibraryHandler **library, MusicRipper *ripper) {
+                             const char *dir, LibraryHandler **library) {
     DIR *d;
     struct dirent *ent;
     int total = 0, added = 0;
@@ -1423,7 +1454,7 @@ static void pull_local_songs(const char *library_path, AppState *state,
         total++;
         song = build_song_query(state, full, 0, title, sizeof(title), artist, sizeof(artist), album, sizeof(album));
         source = (LibrarySource){ .kind = LIBRARY_SOURCE_LOCAL, .path = full };
-        if (import_single_source(library_path, state, &song, &source, library, ripper)) added++;
+        if (import_single_source(library_path, state, &song, &source, library)) added++;
     }
     closedir(d);
     snprintf(state->status, sizeof(state->status), "Local pull: %d of %d songs imported from %.160s.", added, total, dir);
@@ -1432,8 +1463,8 @@ static void pull_local_songs(const char *library_path, AppState *state,
 /* Pull every playable song under the remote `path` (via find over SSH) and import
  * each as an SSH source, de-duplicating by exact title/artist/album. */
 static void pull_ssh_songs(const char *library_path, AppState *state,
-                           LibraryHandler **library, MusicRipper *ripper) {
-    char temp_file[256];
+                           LibraryHandler **library) {
+    char temp_file[IPC_PATH_MAX + 32];
     char *remote;
     char line[1024];
     FILE *list;
@@ -1442,7 +1473,7 @@ static void pull_ssh_songs(const char *library_path, AppState *state,
     if (!state->username[0] || !state->ip[0]) { snprintf(state->status, sizeof(state->status), "Enter USERNAME and IP first."); return; }
     if (!valid_ssh_name(state->username, 0) || !valid_ssh_name(state->ip, 1)) { snprintf(state->status, sizeof(state->status), "USERNAME/IP contains invalid characters."); return; }
     if (!state->path[0]) { snprintf(state->status, sizeof(state->status), "Enter a PATH directory to pull songs from."); return; }
-    snprintf(temp_file, sizeof(temp_file), "/tmp/leecher_pull_XXXXXX");
+    snprintf(temp_file, sizeof(temp_file), "%s/pull-XXXXXX", ipc_dir);
     int fd = mkstemp(temp_file);
     if (fd < 0) { snprintf(state->status, sizeof(state->status), "Could not create temp file for SSH pull."); return; }
     close(fd);
@@ -1464,7 +1495,7 @@ static void pull_ssh_songs(const char *library_path, AppState *state,
         total++;
         song = build_song_query(state, path, 1, title, sizeof(title), artist, sizeof(artist), album, sizeof(album));
         source = (LibrarySource){ .kind = LIBRARY_SOURCE_SSH, .path = path, .username = state->username, .ip = state->ip };
-        if (import_single_source(library_path, state, &song, &source, library, ripper)) added++;
+        if (import_single_source(library_path, state, &song, &source, library)) added++;
     }
     fclose(list);
     unlink(temp_file);
@@ -1474,7 +1505,7 @@ static void pull_ssh_songs(const char *library_path, AppState *state,
 /* Imports a single file dropped onto the window into the library as a LOCAL
  * source. */
 static void handle_dropped_file(const char *library_path, AppState *state, const char *file,
-                                LibraryHandler **library, MusicRipper *ripper) {
+                                LibraryHandler **library) {
     struct stat st;
     LibrarySource source;
     LibrarySongQuery song;
@@ -1484,7 +1515,7 @@ static void handle_dropped_file(const char *library_path, AppState *state, const
     if (!is_audio_name(file)) { snprintf(state->status, sizeof(state->status), "Dropped item is not an audio file: %.160s", file); return; }
     song = build_song_query(state, file, 0, title, sizeof(title), artist, sizeof(artist), album, sizeof(album));
     source = (LibrarySource){ .kind = LIBRARY_SOURCE_LOCAL, .path = (char *)file };
-    if (import_single_source(library_path, state, &song, &source, library, ripper))
+    if (import_single_source(library_path, state, &song, &source, library))
         snprintf(state->status, sizeof(state->status), "Imported dropped file: %.160s", file);
 }
 
@@ -1514,7 +1545,7 @@ struct XferJob {
     LibrarySource src;       /* owned deep copy */
     MusicRipperRemoteFn transport;
     pthread_t thread;
-    volatile int cancel;
+    atomic_int cancel;
     int started;
     int sb_adopted;
 };
@@ -1525,15 +1556,15 @@ static void fetch_unlock(AppState *s) { pthread_mutex_unlock(&s->fetch_mutex); }
 
 static int sb_append_cb(const unsigned char *data, size_t size, void *userdata) {
     XferJob *x = userdata;
-    if (x->cancel) return 0;
+    if (atomic_load_explicit(&x->cancel, memory_order_relaxed)) return 0;
     return stream_buffer_append(x->sb, data, size);
 }
 
 /* Streams a plain local file into the buffer -- the local-source transport,
- * mirroring music_ripper.c's stream_local but polling the job's cancel flag. */
+ * polling the job's cancel flag between chunks. */
 static int stream_local_file(const LibrarySource *src, MusicRipperWriteFn write,
                              void *write_userdata, void *transport_userdata) {
-    const volatile int *cancel = transport_userdata;
+    const atomic_int *cancel = (const atomic_int *)transport_userdata;
     unsigned char buffer[64 * 1024];
     size_t bytes;
     FILE *file;
@@ -1542,7 +1573,7 @@ static int stream_local_file(const LibrarySource *src, MusicRipperWriteFn write,
     file = fopen(src->path, "rb");
     if (!file) return -1;
     while ((bytes = fread(buffer, 1, sizeof(buffer), file)) != 0) {
-        if (cancel && *cancel) { fclose(file); return -1; }
+        if (cancel && atomic_load_explicit(cancel, memory_order_relaxed)) { fclose(file); return -1; }
         if (!write(buffer, bytes, write_userdata)) { fclose(file); return -1; }
     }
     bad = ferror(file);
@@ -1556,7 +1587,7 @@ static void source_free(LibrarySource *s) {
 }
 
 /* True when `s` has the fields its kind needs to be streamed (matches the check
- * music_ripper_play_next applies when it picks a source). */
+ * the fetch worker applies when it picks a source). */
 static int source_usable(const LibrarySource *s) {
     switch (s->kind) {
     case LIBRARY_SOURCE_LOCAL:   return s->path && s->path[0];
@@ -1648,7 +1679,7 @@ static int ssh_name_valid(const char *value, int allow_colon) {
  * player.  When `cancel` is set (non-NULL and non-zero) the child group is
  * killed and -1 returned immediately, so aborting a fetch in the worker thread
  * never blocks the caller. */
-static int run_command_timeout(const char *cmd, int timeout_ms, const volatile int *cancel) {
+static int run_command_timeout(const char *cmd, int timeout_ms, const atomic_int *cancel) {
     pid_t pid = fork();
     int status;
     int waited = 0;
@@ -1663,7 +1694,7 @@ static int run_command_timeout(const char *cmd, int timeout_ms, const volatile i
     }
     signal(SIGPIPE, SIG_IGN);
     while (waited < timeout_ms) {
-        if (cancel && *cancel) {
+        if (cancel && atomic_load_explicit(cancel, memory_order_relaxed)) {
             kill(-pid, SIGKILL);
             kill(pid, SIGKILL);
             waitpid(pid, &status, 0);
@@ -1685,7 +1716,7 @@ static int run_command_timeout(const char *cmd, int timeout_ms, const volatile i
  * writing the resulting path into `out` (cleared when no attached picture is
  * found). */
 static void run_ffmpeg_cover(const char *input, char *out, size_t out_size, int timeout_ms,
-                             const volatile int *cancel) {
+                             const atomic_int *cancel) {
     char command[3600];
     char *qcover;
     struct stat st;
@@ -1712,7 +1743,7 @@ static void run_ffmpeg_cover(const char *input, char *out, size_t out_size, int 
  * cancelled, instead of stalling the worker (and the main loop that joins it)
  * for the full timeout. */
 static void extract_source_cover(const LibrarySource *source, char *out, size_t out_size,
-                                 const volatile int *cancel) {
+                                 const atomic_int *cancel) {
     out[0] = '\0';
     if (!source) return;
     switch (source->kind) {
@@ -2753,7 +2784,7 @@ static void resync_play_lib(AppState *s) {
     s->play_lib = h;
 }
 
-static void handle_set_field(LibraryHandler **library, MusicRipper *ripper, const char *library_path,
+static void handle_set_field(LibraryHandler **library, const char *library_path,
                              AppState *state, const char *prefix, const char *key, const char *command) {
     char *end;
     size_t idx = (size_t)strtoul(command + strlen(prefix), &end, 10);
@@ -2769,14 +2800,14 @@ static void handle_set_field(LibraryHandler **library, MusicRipper *ripper, cons
     }
     {
         LibraryHandler *reloaded = library_handler_open(library_path, reload, sizeof(reload));
-        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; resync_play_lib(state); }
+        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; resync_play_lib(state); }
         else snprintf(state->status, sizeof(state->status), "Updated, but reload failed: %s", reload);
     }
     snprintf(state->status, sizeof(state->status), "Updated %s for track %zu.", key, idx);
     write_status(state);
 }
 
-static void handle_remove_track(LibraryHandler **library, MusicRipper *ripper, const char *library_path,
+static void handle_remove_track(LibraryHandler **library, const char *library_path,
                                 AppState *state, const char *command) {
     char *end;
     size_t idx = (size_t)strtoul(command + 7, &end, 10);
@@ -2788,7 +2819,7 @@ static void handle_remove_track(LibraryHandler **library, MusicRipper *ripper, c
     {
         char reload[256] = {0};
         LibraryHandler *reloaded = library_handler_open(library_path, reload, sizeof(reload));
-        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; resync_play_lib(state); }
+        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; resync_play_lib(state); }
         else snprintf(state->status, sizeof(state->status), "Removed, but reload failed: %s", reload);
     }
     if (idx == state->selected_track) {
@@ -2814,7 +2845,7 @@ static void handle_remove_track(LibraryHandler **library, MusicRipper *ripper, c
 /* Imports one local audio file requested by the bar widget.  Reuse the same
  * validation and metadata extraction path as drag-and-drop, so a control
  * command cannot add a directory or an unsupported source to the library. */
-static void handle_add_local_track(LibraryHandler **library, MusicRipper *ripper,
+static void handle_add_local_track(LibraryHandler **library,
                                    const char *library_path, AppState *state,
                                    const char *command) {
     const char *path = command + strlen("add_local ");
@@ -2823,7 +2854,7 @@ static void handle_add_local_track(LibraryHandler **library, MusicRipper *ripper
         snprintf(state->status, sizeof(state->status), "Add failed: a local audio-file path is required.");
         return;
     }
-    handle_dropped_file(library_path, state, path, library, ripper);
+    handle_dropped_file(library_path, state, path, library);
 }
 
 /* Control lines are percent-encoded by the widget so that command values
@@ -2849,7 +2880,7 @@ static void control_decode(char *out, size_t out_size, const char *in) {
  * contain no literal spaces; the tokens are separated by single spaces.  Decode
  * each field and apply all three in ONE atomic library write, avoiding the old
  * three separate set_* commands that could persist a half-applied edit. */
-static void handle_set_fields(LibraryHandler **library, MusicRipper *ripper,
+static void handle_set_fields(LibraryHandler **library,
                               const char *library_path, AppState *state, const char *command) {
     const char *p = command + strlen("set_fields ");
     char *end;
@@ -2886,7 +2917,7 @@ static void handle_set_fields(LibraryHandler **library, MusicRipper *ripper,
     }
     {
         LibraryHandler *reloaded = library_handler_open(library_path, reload, sizeof(reload));
-        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; resync_play_lib(state); }
+        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; resync_play_lib(state); }
         else snprintf(state->status, sizeof(state->status), "Updated, but reload failed: %s", reload);
     }
     snprintf(state->status, sizeof(state->status), "Updated track %zu.", idx);
@@ -2917,7 +2948,7 @@ static const char *next_encoded_token(const char **pp, char *out, size_t size) {
 /* Imports one source requested by the bar widget over SSH or the local network.
  * `kind` is LIBRARY_SOURCE_SSH or LIBRARY_SOURCE_NETWORK; both use
  * username/host/path with the SSH transport and identical field layouts. */
-static void handle_add_ssh_network_track(LibraryHandler **library, MusicRipper *ripper,
+static void handle_add_ssh_network_track(LibraryHandler **library,
                                          const char *library_path, AppState *state,
                                          const char *command, LibrarySourceKind kind) {
     const char *p = command + (kind == LIBRARY_SOURCE_SSH ? 8 : 12);
@@ -2945,14 +2976,14 @@ static void handle_add_ssh_network_track(LibraryHandler **library, MusicRipper *
     song = build_song_query_for(state, remote_path, username, host, NULL,
                                 title, sizeof(title), artist, sizeof(artist), album, sizeof(album));
     source = (LibrarySource){ .kind = kind, .path = remote_path, .username = username, .ip = host };
-    if (import_single_source(library_path, state, &song, &source, library, ripper))
+    if (import_single_source(library_path, state, &song, &source, library))
         snprintf(state->status, sizeof(state->status), "Imported %s source %.160s (%.60s).",
                  kind == LIBRARY_SOURCE_SSH ? "SSH" : "network", remote_path, host);
 }
 
 /* Imports one https:// stream requested by the bar widget.  HTTPS URLs are
  * accepted as-is (no audio-extension check: a stream may not end in .mp3). */
-static void handle_add_https_track(LibraryHandler **library, MusicRipper *ripper,
+static void handle_add_https_track(LibraryHandler **library,
                                    const char *library_path, AppState *state,
                                    const char *command) {
     const char *p = command + 10;
@@ -2973,7 +3004,7 @@ static void handle_add_https_track(LibraryHandler **library, MusicRipper *ripper
     song = build_song_query_for(state, url, NULL, NULL, url,
                                 title, sizeof(title), artist, sizeof(artist), album, sizeof(album));
     source = (LibrarySource){ .kind = LIBRARY_SOURCE_HTTPS, .url = url };
-    if (import_single_source(library_path, state, &song, &source, library, ripper))
+    if (import_single_source(library_path, state, &song, &source, library))
         snprintf(state->status, sizeof(state->status), "Imported https source %.120s", url);
 }
 
@@ -2981,7 +3012,7 @@ static void handle_add_https_track(LibraryHandler **library, MusicRipper *ripper
  * Playback is untouched -- it keeps running over playing_playlist. Viewing "*"
  * rebuilds it first from the other playlists, so it always shows what has been
  * added since (a no-op re-view of "*" still refreshes it). */
-static void switch_viewed_playlist(LibraryHandler **library, MusicRipper *ripper,
+static void switch_viewed_playlist(LibraryHandler **library,
                                    AppState *state, const char *name) {
     char path[LIBRARY_PATH_MAX], err[128];
     LibraryHandler *h;
@@ -3002,7 +3033,6 @@ static void switch_viewed_playlist(LibraryHandler **library, MusicRipper *ripper
     }
     library_handler_close(*library);
     *library = h;
-    if (ripper) ripper->library = h;
     snprintf(state->viewed_playlist, sizeof(state->viewed_playlist), "%s", name);
     snprintf(state->library_path, sizeof(state->library_path), "%s", path);
     snprintf(state->status, sizeof(state->status), "Viewing playlist \"%s\".", name);
@@ -3010,7 +3040,7 @@ static void switch_viewed_playlist(LibraryHandler **library, MusicRipper *ripper
 }
 
 /* Create a new empty playlist file and switch to viewing it. */
-static void create_playlist(LibraryHandler **library, MusicRipper *ripper,
+static void create_playlist(LibraryHandler **library,
                             AppState *state, const char *name) {
     char path[LIBRARY_PATH_MAX];
     if (!valid_playlist_name(name)) {
@@ -3019,7 +3049,7 @@ static void create_playlist(LibraryHandler **library, MusicRipper *ripper,
         write_status(state);
         return;
     }
-    if (playlist_known(state, name)) { switch_viewed_playlist(library, ripper, state, name); return; }
+    if (playlist_known(state, name)) { switch_viewed_playlist(library, state, name); return; }
     if (state->playlist_count >= (int)(sizeof(state->playlists) / sizeof(state->playlists[0]))) {
         snprintf(state->status, sizeof(state->status), "Too many playlists.");
         write_status(state);
@@ -3032,7 +3062,7 @@ static void create_playlist(LibraryHandler **library, MusicRipper *ripper,
         return;
     }
     scan_playlists(state);
-    switch_viewed_playlist(library, ripper, state, name);
+    switch_viewed_playlist(library, state, name);
     snprintf(state->status, sizeof(state->status), "Created playlist \"%s\".", name);
     write_status(state);
 }
@@ -3041,13 +3071,12 @@ static void create_playlist(LibraryHandler **library, MusicRipper *ripper,
  * switch_viewed_playlist -- used after a background scan has grown the file, or
  * after accept/decline mutated it. Safe w.r.t. the fetch thread: that holds its
  * own play_lib handle, never *library. */
-static void reload_viewed_playlist(LibraryHandler **library, MusicRipper *ripper, AppState *state) {
+static void reload_viewed_playlist(LibraryHandler **library, AppState *state) {
     char err[128];
     LibraryHandler *h = library_handler_open(state->library_path, err, sizeof(err));
     if (!h) return;
     library_handler_close(*library);
     *library = h;
-    if (ripper) ripper->library = h;
 }
 
 /* ---- Directory scan -> INCOMING staging playlist ---------------------- */
@@ -3127,8 +3156,10 @@ static void *scan_worker(void *arg) {
             closedir(d);
         }
     } else {
-        char tmp[] = "/tmp/leecher_scan_XXXXXX";
-        int fd = mkstemp(tmp);
+        char tmp[IPC_PATH_MAX + 32];
+        int fd;
+        snprintf(tmp, sizeof(tmp), "%s/scan-XXXXXX", ipc_dir);
+        fd = mkstemp(tmp);
         if (fd >= 0) {
             char *rcmd = remote_find_command(job->dir);
             close(fd);
@@ -3174,7 +3205,7 @@ static void *scan_worker(void *arg) {
 
 /* Kick off a background scan of `dir` into "INCOMING >> <target> <<", creating
  * the staging playlist and switching the view to it right away. */
-static void start_scan(LibraryHandler **library, MusicRipper *ripper, AppState *state,
+static void start_scan(LibraryHandler **library, AppState *state,
                        LibrarySourceKind kind, const char *target,
                        const char *user, const char *host, const char *dir) {
     char real_target[LIBRARY_NAME_MAX];
@@ -3217,7 +3248,7 @@ static void start_scan(LibraryHandler **library, MusicRipper *ripper, AppState *
         return;
     }
     scan_playlists(state);
-    switch_viewed_playlist(library, ripper, state, iname);
+    switch_viewed_playlist(library, state, iname);
 
     job = (ScanJob *)calloc(1, sizeof(*job));
     if (!job) { snprintf(state->status, sizeof(state->status), "Scan failed: out of memory."); write_status(state); return; }
@@ -3246,7 +3277,7 @@ static void start_scan(LibraryHandler **library, MusicRipper *ripper, AppState *
 
 /* `scan_local <enc-target> <enc-dir>` /
  * `scan_ssh|scan_network <enc-target> <enc-user> <enc-host> <enc-dir>` */
-static void handle_scan(LibraryHandler **library, MusicRipper *ripper, AppState *state,
+static void handle_scan(LibraryHandler **library, AppState *state,
                         const char *args, LibrarySourceKind kind) {
     const char *p = args;
     char target[LIBRARY_NAME_MAX], user[128] = "", host[128] = "", dir[1024];
@@ -3257,7 +3288,7 @@ static void handle_scan(LibraryHandler **library, MusicRipper *ripper, AppState 
     }
     next_encoded_token(&p, dir, sizeof(dir));
     if (!*target) { snprintf(state->status, sizeof(state->status), "Scan failed: missing target playlist."); write_status(state); return; }
-    start_scan(library, ripper, state, kind, target,
+    start_scan(library, state, kind, target,
                *user ? user : NULL, *host ? host : NULL, dir);
 }
 
@@ -3317,7 +3348,7 @@ static void handle_cover_apply(AppState *state, const char *args) {
 
 /* Main thread: the cover worker has finished. Publish search hits, or commit a
  * fetched image onto the playing track (every library write stays here). */
-static void finish_cover_job(LibraryHandler **library, MusicRipper *ripper, AppState *state) {
+static void finish_cover_job(LibraryHandler **library, AppState *state) {
     CoverJob *job = state->cover_job;
     pthread_join(state->cover_thread, NULL);
     state->cover_thread_valid = 0;
@@ -3347,7 +3378,7 @@ static void finish_cover_job(LibraryHandler **library, MusicRipper *ripper, AppS
                 unlink(previous);
             snprintf(state->cover_file, sizeof(state->cover_file), "%s", job->stored);
             if (!strcmp(state->viewed_playlist, state->playing_playlist))
-                reload_viewed_playlist(library, ripper, state);
+                reload_viewed_playlist(library, state);
             resync_play_lib(state);
         } else {
             unlink(job->stored);
@@ -3360,7 +3391,7 @@ static void finish_cover_job(LibraryHandler **library, MusicRipper *ripper, AppS
     write_status(state);
 }
 
-static void handle_accept_decline(LibraryHandler **library, MusicRipper *ripper, AppState *state,
+static void handle_accept_decline(LibraryHandler **library, AppState *state,
                                   const char *idx_list, int accept) {
     char target[LIBRARY_NAME_MAX];
     char ipath[LIBRARY_PATH_MAX], tpath[LIBRARY_PATH_MAX];
@@ -3411,13 +3442,13 @@ static void handle_accept_decline(LibraryHandler **library, MusicRipper *ripper,
     }
 
     cancel_fetch(state);
-    reload_viewed_playlist(library, ripper, state);
+    reload_viewed_playlist(library, state);
     resync_play_lib(state);
 
     if (library_handler_track_count(*library) == 0) {
         unlink(ipath);
         scan_playlists(state);
-        switch_viewed_playlist(library, ripper, state, target);
+        switch_viewed_playlist(library, state, target);
         if (!strcmp(state->playing_playlist, target)) resync_play_lib(state);
         if (accept)
             snprintf(state->status, sizeof(state->status),
@@ -3433,31 +3464,30 @@ static void handle_accept_decline(LibraryHandler **library, MusicRipper *ripper,
     write_status(state);
 }
 
-static void handle_control(const char *command, LibraryHandler **library, MusicRipper *ripper,
-                           Assembler *assembler, AppState *state, const char *library_path) {
+static void handle_control(const char *command, LibraryHandler **library,
+                           AppState *state, const char *library_path) {
     /* Commands arrive as one line, e.g.: "play_pause", "next", "previous",
      * "seek 45000", "play 16", "set_fields 3 ...", "remove 4",
      * "add_local /path/to/song.flac",
      * "autoplay on". Called from the main loop once per frame. */
     while (command && *command && (*command == ' ' || *command == '\t' || *command == '\n' || *command == '\r')) command++;
     if (!command || !*command) return;
-    (void)assembler;
     if (!strncmp(command, "play_pause", 10)) toggle_play_pause(state);
     else if (!strncmp(command, "play ", 5)) play_library_index(state, (size_t)strtoul(command + 5, NULL, 10));
     else if (!strncmp(command, "next", 4)) play_library_relative(state, +1);
     else if (!strncmp(command, "previous", 8)) play_library_relative(state, -1);
     else if (!strncmp(command, "playlist_new ", 13)) {
         const char *n = command + 13; while (*n == ' ') n++;
-        create_playlist(library, ripper, state, n);
+        create_playlist(library, state, n);
     }
     else if (!strncmp(command, "playlist ", 9)) {
         const char *n = command + 9; while (*n == ' ') n++;
-        switch_viewed_playlist(library, ripper, state, n);
+        switch_viewed_playlist(library, state, n);
     }
     else if (!strncmp(command, "accept_incoming ", 16))
-        handle_accept_decline(library, ripper, state, command + 16, 1);
+        handle_accept_decline(library, state, command + 16, 1);
     else if (!strncmp(command, "decline_incoming ", 17))
-        handle_accept_decline(library, ripper, state, command + 17, 0);
+        handle_accept_decline(library, state, command + 17, 0);
     else if (!strncmp(command, "seek ", 5)) { long v = strtol(command + 5, NULL, 10); if (v < 0) v = 0; seek_ms(state, (Uint32)v); }
     else if (!strncmp(command, "autoplay ", 9)) {
         state->autoplay = (strncmp(command + 9, "off", 3) == 0) ? 0 : 1;
@@ -3543,16 +3573,16 @@ static void handle_control(const char *command, LibraryHandler **library, MusicR
             reopen_audio_device(state);
         write_status(state);
     }
-    else if (!strncmp(command, "set_title ", 10)) handle_set_field(library, ripper, library_path, state, "set_title ", "title", command);
-    else if (!strncmp(command, "set_artist ", 11)) handle_set_field(library, ripper, library_path, state, "set_artist ", "artist", command);
-    else if (!strncmp(command, "set_album ", 10)) handle_set_field(library, ripper, library_path, state, "set_album ", "album", command);
-    else if (!strncmp(command, "remove ", 7)) handle_remove_track(library, ripper, library_path, state, command);
-    else if (!strncmp(command, "add_local ", 10)) handle_add_local_track(library, ripper, library_path, state, command);
+    else if (!strncmp(command, "set_title ", 10)) handle_set_field(library, library_path, state, "set_title ", "title", command);
+    else if (!strncmp(command, "set_artist ", 11)) handle_set_field(library, library_path, state, "set_artist ", "artist", command);
+    else if (!strncmp(command, "set_album ", 10)) handle_set_field(library, library_path, state, "set_album ", "album", command);
+    else if (!strncmp(command, "remove ", 7)) handle_remove_track(library, library_path, state, command);
+    else if (!strncmp(command, "add_local ", 10)) handle_add_local_track(library, library_path, state, command);
     else snprintf(state->status, sizeof(state->status), "Unknown control command: %.220s", command);
 }
 
-static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
-                         Assembler *assembler, AppState *state, const char *library_path) {
+static void poll_control(LibraryHandler **library,
+                         AppState *state, const char *library_path) {
     struct stat st;
     int fd = open(control_file, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     FILE *file;
@@ -3605,26 +3635,26 @@ static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
              * contain literal spaces after decode), so route them before the
              * whole-line decode. */
             if (strncmp(cmd, "set_fields ", 11) == 0) {
-                handle_set_fields(library, (MusicRipper *)ripper, library_path, state, cmd);
+                handle_set_fields(library, library_path, state, cmd);
             } else if (strncmp(cmd, "add_ssh ", 8) == 0) {
-                handle_add_ssh_network_track(library, (MusicRipper *)ripper, library_path, state, cmd, LIBRARY_SOURCE_SSH);
+                handle_add_ssh_network_track(library, library_path, state, cmd, LIBRARY_SOURCE_SSH);
             } else if (strncmp(cmd, "add_network ", 12) == 0) {
-                handle_add_ssh_network_track(library, (MusicRipper *)ripper, library_path, state, cmd, LIBRARY_SOURCE_NETWORK);
+                handle_add_ssh_network_track(library, library_path, state, cmd, LIBRARY_SOURCE_NETWORK);
             } else if (strncmp(cmd, "add_https ", 10) == 0) {
-                handle_add_https_track(library, (MusicRipper *)ripper, library_path, state, cmd);
+                handle_add_https_track(library, library_path, state, cmd);
             } else if (strncmp(cmd, "cover_search", 12) == 0) {
                 handle_cover_search(state, cmd + 12);
             } else if (strncmp(cmd, "cover_apply ", 12) == 0) {
                 handle_cover_apply(state, cmd + 12);
             } else if (strncmp(cmd, "scan_local ", 11) == 0) {
-                handle_scan(library, (MusicRipper *)ripper, state, cmd + 11, LIBRARY_SOURCE_LOCAL);
+                handle_scan(library, state, cmd + 11, LIBRARY_SOURCE_LOCAL);
             } else if (strncmp(cmd, "scan_ssh ", 9) == 0) {
-                handle_scan(library, (MusicRipper *)ripper, state, cmd + 9, LIBRARY_SOURCE_SSH);
+                handle_scan(library, state, cmd + 9, LIBRARY_SOURCE_SSH);
             } else if (strncmp(cmd, "scan_network ", 13) == 0) {
-                handle_scan(library, (MusicRipper *)ripper, state, cmd + 13, LIBRARY_SOURCE_NETWORK);
+                handle_scan(library, state, cmd + 13, LIBRARY_SOURCE_NETWORK);
             } else {
                 control_decode(decoded, sizeof(decoded), cmd);
-                handle_control(decoded, library, (MusicRipper *)ripper, assembler, state, library_path);
+                handle_control(decoded, library, state, library_path);
             }
         }
     }
@@ -3662,7 +3692,7 @@ static void draw_library(struct nk_context *ctx, const LibraryHandler *library, 
 }
 
 static void draw_scraper(struct nk_context *ctx, AppState *state, LibraryHandler **library,
-                         const char *library_path, MusicRipper *ripper) {
+                         const char *library_path) {
     static const char *methods[] = { "Local file", "SSH", "HTTPS", "Local network" };
     if (!nk_group_begin(ctx, "scraper-scroll", NK_WINDOW_BORDER | NK_WINDOW_TITLE)) return;
     nk_layout_row_dynamic(ctx, 26, 1);
@@ -3686,7 +3716,7 @@ static void draw_scraper(struct nk_context *ctx, AppState *state, LibraryHandler
         if (state->method == SOURCE_LOCAL) {
             nk_layout_row_dynamic(ctx, 28, 1);
             if (nk_button_label(ctx, "Choose local music file")) choose_local_file(state);
-            if (nk_button_label(ctx, "Pull all unique songs from path")) pull_local_songs(library_path, state, state->path, library, ripper);
+            if (nk_button_label(ctx, "Pull all unique songs from path")) pull_local_songs(library_path, state, state->path, library);
             nk_layout_row_dynamic(ctx, 22, 1);
             nk_label(ctx, "Drag audio files from your file manager into this window to import them.", NK_TEXT_LEFT);
             nk_layout_row_dynamic(ctx, 24, 1);
@@ -3699,7 +3729,7 @@ static void draw_scraper(struct nk_context *ctx, AppState *state, LibraryHandler
             nk_layout_row_dynamic(ctx, 28, 1);
             if (nk_button_label(ctx, "Choose remote music file")) choose_ssh_file(state);
             if (nk_button_label(ctx, "Extract SSH metadata")) extract_ssh_metadata(state);
-            if (nk_button_label(ctx, "Pull all unique songs from path")) pull_ssh_songs(library_path, state, library, ripper);
+            if (nk_button_label(ctx, "Pull all unique songs from path")) pull_ssh_songs(library_path, state, library);
             nk_layout_row_dynamic(ctx, 24, 1);
         }
     }
@@ -3713,7 +3743,7 @@ static void draw_scraper(struct nk_context *ctx, AppState *state, LibraryHandler
         char error[256] = {0};
         if (library_handler_add_source(library_path, &song, &source, error, sizeof(error)) == 1) {
             LibraryHandler *reloaded = library_handler_open(library_path, error, sizeof(error));
-            if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; resync_play_lib(state); snprintf(state->status, sizeof(state->status), "%s source saved to the library.", method_name(state->method)); }
+            if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; resync_play_lib(state); snprintf(state->status, sizeof(state->status), "%s source saved to the library.", method_name(state->method)); }
             else snprintf(state->status, sizeof(state->status), "Saved source, but reload failed: %s", error);
         } else snprintf(state->status, sizeof(state->status), "%s", error);
     }
@@ -3913,8 +3943,6 @@ int main(int argc, char **argv) {
                                        : (argc > 1 ? argv[1] : "library.json");
     char error[256] = {0};
     LibraryHandler *library = NULL;
-    MusicRipper ripper = {0};
-    Assembler *assembler;
     SDL_Window *window = NULL;
     SDL_Renderer *renderer = NULL;
     struct nk_context *ctx = NULL;
@@ -3964,18 +3992,11 @@ int main(int argc, char **argv) {
     struct nk_font_atlas *font_atlas;
     ThemePalette palette;
     if (!library || !state.play_lib) { fprintf(stderr, "Cannot load %s: %s\n", state.library_path, error); return 1; }
-    ripper.library = library;
-    ripper.transports.ssh = stream_ssh;
-    ripper.transports.https = stream_https;
-    ripper.transports.network = stream_ssh;
-    state.transports = ripper.transports;
-    assembler = assembler_create(NULL);
-    if (!assembler) { fprintf(stderr, "Cannot create assembler queue\n"); library_handler_close(library); return 1; }
-    if (SDL_Init(headless ? SDL_INIT_AUDIO : SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); assembler_destroy(assembler); library_handler_close(library); return 1; }
+    if (SDL_Init(headless ? SDL_INIT_AUDIO : SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); library_handler_close(library); return 1; }
     if (!headless) {
         window = SDL_CreateWindow("Leecher Music Player", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1160, 720, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
         renderer = window ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC) : NULL;
-        if (!window || !renderer) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); if (renderer) SDL_DestroyRenderer(renderer); if (window) SDL_DestroyWindow(window); SDL_Quit(); assembler_destroy(assembler); library_handler_close(library); return 1; }
+        if (!window || !renderer) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); if (renderer) SDL_DestroyRenderer(renderer); if (window) SDL_DestroyWindow(window); SDL_Quit(); library_handler_close(library); return 1; }
         ctx = nk_sdl_init(window, renderer);
         nk_sdl_font_stash_begin(&font_atlas);
         SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
@@ -4020,7 +4041,7 @@ int main(int argc, char **argv) {
         }
     }
     while (running && !stop_requested) {
-        poll_control(&library, &ripper, assembler, &state, state.library_path);
+        poll_control(&library, &state, state.library_path);
 
         /* A background directory scan finished: join it, refresh the playlist
          * list and re-read the staging playlist we are (probably) viewing. */
@@ -4029,7 +4050,7 @@ int main(int argc, char **argv) {
             state.scan_thread_valid = 0;
             scan_playlists(&state);
             if (!strcmp(state.viewed_playlist, state.scan_incoming))
-                reload_viewed_playlist(&library, &ripper, &state);
+                reload_viewed_playlist(&library, &state);
             if (state.scan_count > 0)
                 snprintf(state.status, sizeof(state.status),
                          "Scan done: %d file(s) staged in \"%s\". Accept or decline them.",
@@ -4047,7 +4068,7 @@ int main(int argc, char **argv) {
         }
 
         if (state.cover_thread_valid && !state.cover_active)
-            finish_cover_job(&library, &ripper, &state);
+            finish_cover_job(&library, &state);
 
         /* Keep SDL's audio queue refilled from the decoder's rolling window. */
         stream_audio(&state);
@@ -4219,7 +4240,7 @@ int main(int argc, char **argv) {
                 if (event.type == SDL_QUIT) { running = 0; }
                 else if (event.type == SDL_DROPFILE) {
                     if (event.drop.file) {
-                        handle_dropped_file(state.library_path, &state, event.drop.file, &library, &ripper);
+                        handle_dropped_file(state.library_path, &state, event.drop.file, &library);
                         SDL_free(event.drop.file);
                     }
                     continue;
@@ -4237,7 +4258,7 @@ int main(int argc, char **argv) {
                     nk_layout_row_dynamic(ctx, 24, 1); nk_label(ctx, state.status[0] ? state.status : "Choose a library track or add a source route.", NK_TEXT_LEFT);
                     float body = (float)wh - 32 - 24 - 34;
                     if (body < 80) body = 80;
-                    nk_layout_row_dynamic(ctx, body, 2); draw_library(ctx, library, &state); draw_scraper(ctx, &state, &library, state.library_path, &ripper);
+                    nk_layout_row_dynamic(ctx, body, 2); draw_library(ctx, library, &state); draw_scraper(ctx, &state, &library, state.library_path);
                 }
             }
             nk_end(ctx);
@@ -4267,6 +4288,6 @@ int main(int argc, char **argv) {
     stop_ssh_agent(&state);
     ssh_opts_cleanup();
     if (!headless) { nk_sdl_shutdown(); SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window); }
-    SDL_Quit(); assembler_destroy(assembler); library_handler_close(library); library_handler_close(state.play_lib);
+    SDL_Quit(); library_handler_close(library); library_handler_close(state.play_lib);
     return 0;
 }
