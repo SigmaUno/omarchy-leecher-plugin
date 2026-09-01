@@ -9,6 +9,9 @@
 backend/app
 backend/library-handler
 
+# Compiled test binary (testing/unit/run.sh)
+testing/unit/test_backend_logic
+
 # Playlist directory created when the backend runs from the checkout
 /backend/library/
 
