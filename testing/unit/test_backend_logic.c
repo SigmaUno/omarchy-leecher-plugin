@@ -164,6 +164,52 @@ static void test_autoplay_note_failure(void) {
     CHECK(autoplay_note_failure(&s, 0) == 0);
 }
 
+/* --------------------------------------------------- cover-search parsing */
+static void test_cover_parsing(void) {
+    char buf[256];
+
+    /* url_encode: only the unreserved set survives verbatim */
+    url_encode("daft punk", buf, sizeof(buf));           CHECK_STR(buf, "daft%20punk");
+    url_encode("AC/DC", buf, sizeof(buf));               CHECK_STR(buf, "AC%2FDC");
+    url_encode("a-b_c.d~e", buf, sizeof(buf));           CHECK_STR(buf, "a-b_c.d~e");
+    url_encode("100%", buf, sizeof(buf));                CHECK_STR(buf, "100%25");
+    url_encode("", buf, sizeof(buf));                    CHECK_STR(buf, "");
+
+    /* upscale_artwork: same-width in-place swap of the LAST size segment */
+    snprintf(buf, sizeof(buf), "https://x/100x100/img/100x100bb.jpg");
+    upscale_artwork(buf);
+    CHECK_STR(buf, "https://x/100x100/img/600x600bb.jpg");
+    snprintf(buf, sizeof(buf), "https://x/nosize.jpg");   /* absent: left alone */
+    upscale_artwork(buf);
+    CHECK_STR(buf, "https://x/nosize.jpg");
+
+    /* json_scan_string: escapes iTunes actually emits */
+    CHECK(json_scan_string("{\"a\":\"one\",\"b\":\"two\"}", "b", buf, sizeof(buf)) == 1);
+    CHECK_STR(buf, "two");
+    CHECK(json_scan_string("{\"u\":\"https:\\/\\/x\\/y.jpg\"}", "u", buf, sizeof(buf)) == 1);
+    CHECK_STR(buf, "https://x/y.jpg");                    /* \/ unescaped */
+    CHECK(json_scan_string("{\"t\":\"a\\\"b\"}", "t", buf, sizeof(buf)) == 1);
+    CHECK_STR(buf, "a\"b");                                /* \" does not end it */
+    CHECK(json_scan_string("{\"a\":\"x\"}", "missing", buf, sizeof(buf)) == 0);
+    CHECK_STR(buf, "");
+
+    /* next_record_boundary: the separator is "}, \n{" -- whitespace AND a comma
+     * on both sides. A brace pair with no comma is not a record boundary. */
+    {
+        char body[] = "{\"a\":1}, \n{\"b\":2}";
+        char *next = NULL, *at = next_record_boundary(body, &next);
+        CHECK(at != NULL);
+        CHECK(at == body + 6);          /* the first '}' */
+        CHECK(next != NULL && *next == '{');
+        CHECK(next_record_boundary(next, &next) == NULL);   /* last record */
+    }
+    {
+        char nested[] = "{\"a\":1} {\"b\":2}";            /* no comma -> not a boundary */
+        char *next = NULL;
+        CHECK(next_record_boundary(nested, &next) == NULL);
+    }
+}
+
 /* ------------------------------------------------------------- the play queue */
 static void test_play_queue(void) {
     AppState s = {0};
@@ -713,7 +759,7 @@ static void test_library_json_edge_cases(void) {
         "{\"version\":1,\"tracks\":[{"
         "\"title\":\"T\",\"artist\":\"A\",\"album\":null,"
         "\"sources\":[{\"kind\":\"local\",\"PATH\":\"/x.flac\",\"USERNAME\":null,\"URL\":null,\"IP\":null}]}]}");
-    CHECK(library_handler_update_track(path, 0, NULL, NULL, "Real Album", err, sizeof(err)) == 1);
+    CHECK(library_handler_update_track(path, 0, NULL, NULL, "Real Album", NULL, err, sizeof(err)) == 1);
     CHECK(lib_count(path) == 1);   /* still valid JSON */
     {
         LibraryHandler *h = library_handler_open(path, err, sizeof(err));
@@ -779,7 +825,7 @@ static void test_library_handler(void) {
     }
 
     /* rename track 0, leave artist/album alone */
-    CHECK(library_handler_update_track(path, 0, "Alpha Prime", NULL, NULL, err, sizeof(err)) == 1);
+    CHECK(library_handler_update_track(path, 0, "Alpha Prime", NULL, NULL, NULL, err, sizeof(err)) == 1);
     lib_title(path, 0, title, sizeof(title));
     CHECK_STR(title, "Alpha Prime");
     h = library_handler_open(path, NULL, 0);
@@ -816,6 +862,7 @@ int main(void) {
         { "control_decode",      test_control_decode },
         { "next_autoplay_index", test_next_autoplay_index },
         { "autoplay_note_failure", test_autoplay_note_failure },
+        { "cover_parsing",       test_cover_parsing },
         { "play_queue",          test_play_queue },
         { "take_next_index",     test_take_next_index },
         { "next_encoded_token",  test_next_encoded_token },

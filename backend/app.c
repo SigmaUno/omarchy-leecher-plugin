@@ -39,6 +39,15 @@
 
 typedef enum { SOURCE_LOCAL, SOURCE_SSH, SOURCE_HTTPS, SOURCE_NETWORK } SourceMethod;
 
+/* One hit from the cover-art search (iTunes Search API: anonymous, no key). */
+#define COVER_RESULT_MAX 8
+typedef struct {
+    char art[512];     /* image URL, already upscaled to 600x600 */
+    char title[96];
+    char artist[96];
+    char album[96];
+} CoverResult;
+
 #define LIBRARY_NAME_MAX      96    /* playlist stem, incl. NUL (names capped at 64) */
 #define LIBRARY_DIR_MAX       512   /* library directory path, incl. NUL */
 #define LIBRARY_PATH_MAX      640   /* "<dir>/<name>.json" always fits */
@@ -130,6 +139,17 @@ typedef struct {
                                 * means every source is dead -- stop, don't spin */
     size_t play_queue[64];   /* ad-hoc "play next" order, consumed before library order */
     int play_queue_len;
+    /* Cover chooser. The worker only does network I/O and fills its own job;
+     * the main thread joins it and owns every library/state mutation, so the
+     * results need no lock (the join is the barrier). */
+    pthread_t cover_thread;
+    int cover_thread_valid;
+    volatile int cover_active;
+    volatile int cover_cancel;
+    struct CoverJob *cover_job;
+    CoverResult cover_results[COVER_RESULT_MAX];
+    int cover_result_count;
+    char cover_status[256];
     /* Background directory scan -> "INCOMING >> <target> <<" staging playlist. */
     pthread_t scan_thread;
     int scan_thread_valid;
@@ -334,11 +354,14 @@ static void write_status(const AppState *state) {
          *output = json_escape(state->audio_device_name[0] ? state->audio_device_name : NULL);
     char *dir = json_escape(state->library_dir[0] ? state->library_dir : NULL),
          *viewed = json_escape(state->viewed_playlist),
-         *playing = json_escape(state->playing_playlist);
+         *playing = json_escape(state->playing_playlist),
+         *cstatus = json_escape(state->cover_status);
     char tmp[32768];  /* headroom for up to LIBRARY_MAX_PLAYLISTS stems + outputs */
     char queue[16 * 64 + 4];  /* "[" + up to 64 "NNNNN," + "]" */
     char outputs[2560];       /* enumerated output device names, JSON array */
     char playlists[LIBRARY_MAX_PLAYLISTS * 100 + 4];  /* enumerated playlist stems, JSON array */
+    char covers[8192];        /* cover-search hits, JSON array */
+    int vn = 0, vi;
     int qn = 0, qi;
     int on = 0, od, ocount;
     int pn = 0, pi;
@@ -371,6 +394,19 @@ static void write_status(const AppState *state) {
     }
     playlists[pn++] = ']';
     playlists[pn] = '\0';
+    covers[vn++] = '[';
+    for (vi = 0; vi < state->cover_result_count && vn < (int)sizeof(covers) - 1200; vi++) {
+        char *ea = json_escape(state->cover_results[vi].art);
+        char *et = json_escape(state->cover_results[vi].title);
+        char *er = json_escape(state->cover_results[vi].artist);
+        char *eb = json_escape(state->cover_results[vi].album);
+        vn += snprintf(covers + vn, sizeof(covers) - (size_t)vn,
+                       "%s{\"art\":\"%s\",\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\"}",
+                       vi ? "," : "", ea ? ea : "", et ? et : "", er ? er : "", eb ? eb : "");
+        free(ea); free(et); free(er); free(eb);
+    }
+    covers[vn++] = ']';
+    covers[vn] = '\0';
     n = snprintf(tmp, sizeof(tmp),
                  "{\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
                  "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s,"
@@ -378,6 +414,7 @@ static void write_status(const AppState *state) {
                  "\"output\":\"%s\",\"outputs\":%s,\"cover\":\"%s\","
                  "\"library_dir\":\"%s\",\"playlists\":%s,\"viewed_playlist\":\"%s\",\"playing_playlist\":\"%s\","
                  "\"scanning\":%s,\"scan_count\":%d,"
+                 "\"cover_results\":%s,\"cover_status\":\"%s\",\"cover_busy\":%s,"
                  "\"status\":\"%s\",\"cmd_id\":%lu}\n",
                  title ? title : "", artist ? artist : "", album ? album : "",
                  state->position_ms, state->duration_ms,
@@ -389,9 +426,11 @@ static void write_status(const AppState *state) {
                  cover ? cover : "",
                  dir ? dir : "", playlists, viewed ? viewed : "", playing ? playing : "",
                  state->scan_thread_valid ? "true" : "false", state->scan_count,
+                 covers, cstatus ? cstatus : "",
+                 state->cover_thread_valid ? "true" : "false",
                  status ? status : "", state->last_cmd_id);
     free(title); free(artist); free(album); free(library); free(cover); free(status); free(output);
-    free(dir); free(viewed); free(playing);
+    free(dir); free(viewed); free(playing); free(cstatus);
     if (n < 0 || (size_t)n >= sizeof(tmp)) return; /* oversized; leave old status intact */
     atomic_write(status_file, tmp, (size_t)n);
 }
@@ -1719,6 +1758,314 @@ static void extract_source_cover(const LibrarySource *source, char *out, size_t 
     }
 }
 
+/* ---- User-chosen cover art --------------------------------------------- */
+
+/* Covers the user picks are not transient like the ffmpeg-extracted ones: they
+ * live beside the library so they survive a restart and travel with a backup.
+ * The directory holds no .json, so scan_playlists() ignores it. */
+static char covers_dir[LIBRARY_DIR_MAX + 16];
+
+static void init_covers_dir(const char *library_dir) {
+    snprintf(covers_dir, sizeof(covers_dir), "%s/covers", library_dir);
+    mkdir(covers_dir, 0700);
+}
+
+/* True when `path` sits inside covers_dir, i.e. we own it and may delete it. */
+static int is_stored_cover(const char *path) {
+    size_t n = strlen(covers_dir);
+    return covers_dir[0] && path && !strncmp(path, covers_dir, n) && path[n] == '/';
+}
+
+/* Sniff the image type from the leading bytes. Returns ".jpg"/".png", or NULL
+ * when the bytes are not an image we are willing to store -- a download must
+ * never be trusted just because the request succeeded. */
+static const char *image_extension(const char *path) {
+    unsigned char head[8];
+    size_t got;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    got = fread(head, 1, sizeof(head), f);
+    fclose(f);
+    if (got >= 3 && head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF) return ".jpg";
+    if (got >= 8 && !memcmp(head, "\x89PNG\r\n\x1a\n", 8)) return ".png";
+    return NULL;
+}
+
+/* Percent-encode `in` for use in a URL query value. */
+static void url_encode(const char *in, char *out, size_t out_size) {
+    static const char *hex = "0123456789ABCDEF";
+    size_t o = 0;
+    for (; *in && o + 4 < out_size; in++) {
+        unsigned char c = (unsigned char)*in;
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out[o++] = (char)c;
+        else { out[o++] = '%'; out[o++] = hex[c >> 4]; out[o++] = hex[c & 0xF]; }
+    }
+    out[o] = '\0';
+}
+
+/* Copy the JSON string value of `"key":"..."` out of `chunk` into `out`,
+ * undoing the escapes iTunes actually emits (\/ in URLs, \" and \\ in names).
+ * Returns 1 when the key was found. This deliberately does not pull in a JSON
+ * parser: the response shape is fixed and the values are flat strings. */
+static int json_scan_string(const char *chunk, const char *key, char *out, size_t out_size) {
+    char pattern[64];
+    const char *p;
+    size_t o = 0;
+    out[0] = '\0';
+    if (snprintf(pattern, sizeof(pattern), "\"%s\":\"", key) >= (int)sizeof(pattern)) return 0;
+    p = strstr(chunk, pattern);
+    if (!p) return 0;
+    p += strlen(pattern);
+    while (*p && *p != '"' && o + 1 < out_size) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            if (*p == 'n') out[o++] = '\n';
+            else if (*p == 't') out[o++] = '\t';
+            else if (*p == 'u') { if (strlen(p) < 5) break; p += 4; out[o++] = '?'; }
+            else out[o++] = *p;   /* \/ \" \\ and friends: keep the literal */
+            p++;
+        } else {
+            out[o++] = *p++;
+        }
+    }
+    out[o] = '\0';
+    return 1;
+}
+
+/* Next record boundary in a flat JSON array: a '}' followed by whitespace and
+ * a '{'. iTunes result objects have no nested objects, so a brace pair always
+ * separates two records. Returns the '}' and points *next at the '{'. */
+static char *next_record_boundary(char *p, char **next) {
+    while ((p = strchr(p, '}')) != NULL) {
+        char *q = p + 1;
+        int comma = 0;
+        /* The separator is "}, \n{": whitespace on both sides of one comma. */
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == ',') { comma = 1; q++; }
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (comma && *q == '{') { *next = q; return p; }
+        p++;
+    }
+    return NULL;
+}
+
+/* iTunes hands back a 100x100 thumbnail URL; the same path serves any size. */
+static void upscale_artwork(char *url) {
+    /* Same width either way, so this is a straight in-place overwrite of the
+     * last size segment ("...\/100x100bb.jpg" -> "...\/600x600bb.jpg"). */
+    char *at = NULL, *scan = url;
+    while ((scan = strstr(scan, "100x100")) != NULL) { at = scan; scan += 7; }
+    if (at) memcpy(at, "600x600", 7);
+}
+
+struct CoverJob {
+    AppState *state;
+    int apply;                              /* 0 = search, 1 = fetch one image */
+    char query[512];                        /* search: free text */
+    char source[1024];                      /* apply: local path or https URL */
+    char stored[512];                       /* apply: where the image landed */
+    CoverResult results[COVER_RESULT_MAX];
+    int result_count;
+    char status[256];
+};
+typedef struct CoverJob CoverJob;
+
+/* Ask the iTunes Search API for candidate artwork. Anonymous: no key, no
+ * account. Runs on the cover thread -- never inline, a slow lookup must not
+ * stall the main loop (see the ffprobe/ssh timeouts elsewhere). */
+static void cover_search_job(CoverJob *job) {
+    char encoded[1600], command[2600], temp[IPC_PATH_MAX + 64];
+    char *body = NULL, *qurl, *qtemp;
+    long size;
+    FILE *f;
+    int fd;
+
+    url_encode(job->query, encoded, sizeof(encoded));
+    snprintf(temp, sizeof(temp), "%s/cover-search-XXXXXX", ipc_dir[0] ? ipc_dir : "/tmp");
+    fd = mkstemp(temp);
+    if (fd < 0) { snprintf(job->status, sizeof(job->status), "Cover search failed: no temp file."); return; }
+    close(fd);
+
+    {
+        char url[1800];
+        snprintf(url, sizeof(url),
+                 "https://itunes.apple.com/search?term=%s&entity=song&limit=%d",
+                 encoded, COVER_RESULT_MAX);
+        qurl = shell_quote_words(url);
+        qtemp = shell_quote_words(temp);
+        if (!qurl || !qtemp) { free(qurl); free(qtemp); unlink(temp);
+            snprintf(job->status, sizeof(job->status), "Cover search failed: out of memory."); return; }
+        if (snprintf(command, sizeof(command),
+                     "curl --fail --silent --show-error --location --max-redirs 3 --proto '=https'"
+                     " --tlsv1.2 --connect-timeout 5 --max-time 15 --max-filesize 2000000"
+                     " --output %s -- %s 2>/dev/null", qtemp, qurl) >= (int)sizeof(command)) {
+            free(qurl); free(qtemp); unlink(temp);
+            snprintf(job->status, sizeof(job->status), "Cover search failed: query too long."); return;
+        }
+        free(qurl); free(qtemp);
+    }
+
+    if (run_command_timeout(command, 16000, &job->state->cover_cancel) != 0) {
+        unlink(temp);
+        snprintf(job->status, sizeof(job->status), "Cover search failed: could not reach the service.");
+        return;
+    }
+
+    f = fopen(temp, "rb");
+    if (f) {
+        if (!fseek(f, 0, SEEK_END) && (size = ftell(f)) > 0 && size < (long)4 * 1024 * 1024 &&
+            !fseek(f, 0, SEEK_SET)) {
+            body = malloc((size_t)size + 1);
+            if (body && fread(body, 1, (size_t)size, f) == (size_t)size) body[size] = '\0';
+            else { free(body); body = NULL; }
+        }
+        fclose(f);
+    }
+    unlink(temp);
+    if (!body) { snprintf(job->status, sizeof(job->status), "Cover search returned nothing."); return; }
+
+    /* The results array elements are separated by "},{" -- split on that and
+     * pull each field out of its own chunk, so fields never cross records. */
+    {
+        /* The service pretty-prints ("results": [\n{...}, \n{...}]), so neither
+         * the array opener nor the record separator can be matched literally. */
+        char *start = strstr(body, "\"results\"");
+        char *cursor = NULL;
+        if (start) {
+            cursor = start + 9;
+            while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n' ||
+                   *cursor == ':') cursor++;
+            if (*cursor == '[') cursor++; else cursor = NULL;
+        }
+        while (cursor && *cursor && job->result_count < COVER_RESULT_MAX) {
+            char *next = NULL;
+            char *end = next_record_boundary(cursor, &next);
+            size_t len = end ? (size_t)(end - cursor) : strlen(cursor);
+            char *chunk = malloc(len + 1);
+            if (!chunk) break;
+            memcpy(chunk, cursor, len);
+            chunk[len] = '\0';
+            {
+                CoverResult *r = &job->results[job->result_count];
+                memset(r, 0, sizeof(*r));
+                if (json_scan_string(chunk, "artworkUrl100", r->art, sizeof(r->art)) && r->art[0]) {
+                    upscale_artwork(r->art);
+                    json_scan_string(chunk, "trackName", r->title, sizeof(r->title));
+                    json_scan_string(chunk, "artistName", r->artist, sizeof(r->artist));
+                    json_scan_string(chunk, "collectionName", r->album, sizeof(r->album));
+                    job->result_count++;
+                }
+            }
+            free(chunk);
+            if (!end) break;
+            cursor = next;
+        }
+    }
+    free(body);
+    if (job->result_count == 0)
+        snprintf(job->status, sizeof(job->status), "No cover art found for that search.");
+    else
+        snprintf(job->status, sizeof(job->status), "%d cover%s found.",
+                 job->result_count, job->result_count == 1 ? "" : "s");
+}
+
+/* Put the chosen image (https URL or local path) into covers_dir. Fills
+ * job->stored on success. Cover thread only. */
+static void cover_apply_job(CoverJob *job) {
+    char scratch[512];
+    const char *extension;
+    int ok = 0;
+
+    if (!covers_dir[0]) { snprintf(job->status, sizeof(job->status), "No covers directory."); return; }
+    if (snprintf(scratch, sizeof(scratch), "%s/.incoming-%lu.tmp", covers_dir,
+                 (unsigned long)getpid()) >= (int)sizeof(scratch)) {
+        snprintf(job->status, sizeof(job->status), "Covers path is too long.");
+        return;
+    }
+
+    if (!strncasecmp(job->source, "https://", 8)) {
+        char command[2600], *qurl = shell_quote_words(job->source), *qout = shell_quote_words(scratch);
+        if (qurl && qout &&
+            snprintf(command, sizeof(command),
+                     "curl --fail --silent --show-error --location --max-redirs 3 --proto '=https'"
+                     " --tlsv1.2 --connect-timeout 5 --max-time 25 --max-filesize 8000000"
+                     " --output %s -- %s 2>/dev/null", qout, qurl) < (int)sizeof(command))
+            ok = run_command_timeout(command, 26000, &job->state->cover_cancel) == 0;
+        free(qurl); free(qout);
+        if (!ok) { unlink(scratch);
+            snprintf(job->status, sizeof(job->status), "Could not download that image."); return; }
+    } else {
+        struct stat st;
+        if (stat(job->source, &st) != 0 || !S_ISREG(st.st_mode)) {
+            snprintf(job->status, sizeof(job->status), "Not a readable image file."); return;
+        }
+        if (st.st_size > 8 * 1024 * 1024) {
+            snprintf(job->status, sizeof(job->status), "That image is too large (8 MB max)."); return;
+        }
+        if (!copy_file(job->source, scratch)) {
+            snprintf(job->status, sizeof(job->status), "Could not read that image."); return;
+        }
+    }
+
+    extension = image_extension(scratch);
+    if (!extension) {
+        unlink(scratch);
+        snprintf(job->status, sizeof(job->status), "That file is not a JPEG or PNG.");
+        return;
+    }
+    if (snprintf(job->stored, sizeof(job->stored), "%s/cover-%lu-%lu%s", covers_dir,
+                 (unsigned long)time(NULL), ++cover_nonce, extension) >= (int)sizeof(job->stored)) {
+        unlink(scratch);
+        job->stored[0] = '\0';
+        snprintf(job->status, sizeof(job->status), "Covers path is too long.");
+        return;
+    }
+    if (rename(scratch, job->stored) != 0) {
+        unlink(scratch);
+        job->stored[0] = '\0';
+        snprintf(job->status, sizeof(job->status), "Could not save the cover.");
+        return;
+    }
+    fsync_parent_dir(job->stored);
+    snprintf(job->status, sizeof(job->status), "Cover updated.");
+}
+
+static void *cover_worker(void *arg) {
+    CoverJob *job = (CoverJob *)arg;
+    if (job->apply) cover_apply_job(job);
+    else cover_search_job(job);
+    job->state->cover_active = 0;
+    return NULL;   /* the main thread joins and frees the job */
+}
+
+/* Start a cover search or fetch. One at a time; a second request is refused
+ * rather than queued, since the user is looking at the result of the first. */
+static int start_cover_job(AppState *s, int apply, const char *query, const char *source) {
+    CoverJob *job;
+    if (s->cover_thread_valid) {
+        snprintf(s->status, sizeof(s->status), "A cover lookup is already running.");
+        return 0;
+    }
+    job = (CoverJob *)calloc(1, sizeof(*job));
+    if (!job) { snprintf(s->status, sizeof(s->status), "Out of memory."); return 0; }
+    job->state = s;
+    job->apply = apply;
+    if (query) snprintf(job->query, sizeof(job->query), "%s", query);
+    if (source) snprintf(job->source, sizeof(job->source), "%s", source);
+    s->cover_cancel = 0;
+    s->cover_active = 1;
+    s->cover_job = job;
+    if (pthread_create(&s->cover_thread, NULL, cover_worker, job) != 0) {
+        s->cover_active = 0;
+        s->cover_job = NULL;
+        free(job);
+        snprintf(s->status, sizeof(s->status), "Could not start the cover lookup.");
+        return 0;
+    }
+    s->cover_thread_valid = 1;
+    return 1;
+}
+
 /* strdup that tolerates NULL (returns NULL). */
 static char *dup_or_null(const char *s) { return s ? strdup(s) : NULL; }
 
@@ -1747,6 +2094,12 @@ static void *fetch_worker(void *arg) {
         if (track.title) snprintf(save_title, sizeof(save_title), "%s", track.title);
         if (track.artist) snprintf(save_artist, sizeof(save_artist), "%s", track.artist);
         if (track.album) snprintf(save_album, sizeof(save_album), "%s", track.album);
+        /* A cover the user chose beats whatever is embedded in the audio, and
+         * is referenced where it already lives: it belongs to the library
+         * directory and must outlive this (and every later) playback. */
+        if (track.cover && track.cover[0] && access(track.cover, R_OK) == 0) {
+            snprintf(save_cover, sizeof(save_cover), "%s", track.cover);
+        } else {
         for (size_t ci = 0; ci < track.source_count && save_cover[0] == '\0'; ci++) {
             extract_source_cover(&track.sources[ci], save_cover, sizeof(save_cover), &s->fetch_cancel);
         }
@@ -1761,6 +2114,7 @@ static void *fetch_worker(void *arg) {
             snprintf(unique, sizeof(unique), "%s/cover-%zu-%lu.jpg", dir, job->index, nonce);
             rename(save_cover, unique);
             snprintf(save_cover, sizeof(save_cover), "%s", unique);
+        }
         }
         const LibrarySource *chosen = NULL;
         for (size_t ci = 0; ci < track.source_count; ci++) {
@@ -2398,7 +2752,7 @@ static void handle_set_field(LibraryHandler **library, MusicRipper *ripper, cons
     if (library_handler_update_track(library_path, idx, key[0] == 't' ? (*value ? value : NULL) : NULL,
                                      key[0] == 'a' && key[1] == 'r' ? (*value ? value : NULL) : NULL,
                                      key[0] == 'a' && key[1] == 'l' ? (*value ? value : NULL) : NULL,
-                                     error, sizeof(error)) != 1) {
+                                     NULL, error, sizeof(error)) != 1) {
         snprintf(state->status, sizeof(state->status), "Edit failed: %s", error[0] ? error : "unknown error");
         return;
     }
@@ -2515,7 +2869,7 @@ static void handle_set_fields(LibraryHandler **library, MusicRipper *ripper,
      * are decoded to "" and will clear the field, as the widget always sends all
      * three current values. */
     if (library_handler_update_track(library_path, idx, fields[0], fields[1], fields[2],
-                                     error, sizeof(error)) != 1) {
+                                     NULL, error, sizeof(error)) != 1) {
         snprintf(state->status, sizeof(state->status), "Edit failed: %s", error[0] ? error : "unknown error");
         return;
     }
@@ -2901,6 +3255,100 @@ static void handle_scan(LibraryHandler **library, MusicRipper *ripper, AppState 
  * drops them. Both operate on the currently-viewed "INCOMING >> <target> <<".
  * When the staging list ends up empty it is deleted and the view returns to
  * the target. */
+/* `cover_search <enc-query>`: look up candidate artwork for the playing track.
+ * An empty query falls back to "<artist> <title>" of what is playing. */
+static void handle_cover_search(AppState *state, const char *args) {
+    const char *p = args;
+    char query[512];
+    next_encoded_token(&p, query, sizeof(query));
+    /* The token split stops at a literal space, but a search is naturally
+     * several words -- take the rest of the line too. */
+    while (*p == ' ') p++;
+    if (*p) {
+        char rest[512], merged[512];
+        control_decode(rest, sizeof(rest), p);
+        snprintf(merged, sizeof(merged), "%.240s %.240s", query, rest);
+        snprintf(query, sizeof(query), "%s", merged);
+    }
+    if (!query[0])
+        snprintf(query, sizeof(query), "%s %s", state->artist, state->title);
+    if (!query[0] || query[0] == ' ') {
+        snprintf(state->status, sizeof(state->status), "Nothing to search for.");
+        write_status(state);
+        return;
+    }
+    state->cover_result_count = 0;
+    if (start_cover_job(state, 0, query, NULL))
+        snprintf(state->status, sizeof(state->status), "Searching for cover art...");
+    write_status(state);
+}
+
+/* `cover_apply <enc-url-or-path>`: store that image and hang it on the track
+ * that is currently playing. */
+static void handle_cover_apply(AppState *state, const char *args) {
+    const char *p = args;
+    char source[1024];
+    next_encoded_token(&p, source, sizeof(source));
+    if (!source[0]) {
+        snprintf(state->status, sizeof(state->status), "No image given.");
+        write_status(state);
+        return;
+    }
+    if (state->selected_track == (size_t)-1 || !state->play_lib) {
+        snprintf(state->status, sizeof(state->status), "No track is playing.");
+        write_status(state);
+        return;
+    }
+    if (start_cover_job(state, 1, NULL, source))
+        snprintf(state->status, sizeof(state->status), "Fetching cover...");
+    write_status(state);
+}
+
+/* Main thread: the cover worker has finished. Publish search hits, or commit a
+ * fetched image onto the playing track (every library write stays here). */
+static void finish_cover_job(LibraryHandler **library, MusicRipper *ripper, AppState *state) {
+    CoverJob *job = state->cover_job;
+    pthread_join(state->cover_thread, NULL);
+    state->cover_thread_valid = 0;
+    state->cover_job = NULL;
+    if (!job) return;
+
+    snprintf(state->cover_status, sizeof(state->cover_status), "%s", job->status);
+    if (!job->apply) {
+        int i;
+        state->cover_result_count = job->result_count;
+        for (i = 0; i < job->result_count; i++) state->cover_results[i] = job->results[i];
+    } else if (job->stored[0]) {
+        char path[LIBRARY_PATH_MAX], err[256] = {0}, previous[512] = {0};
+        int stored_ok;
+        LibraryTrack existing = {0};
+        playlist_file_path(state, state->playing_playlist, path, sizeof(path));
+        if (library_handler_track_at(state->play_lib, state->selected_track, &existing,
+                                     err, sizeof(err)) == 1 && existing.cover)
+            snprintf(previous, sizeof(previous), "%s", existing.cover);
+        library_handler_track_destroy(&existing);
+
+        stored_ok = library_handler_update_track(path, state->selected_track, NULL, NULL, NULL,
+                                                 job->stored, err, sizeof(err)) == 1;
+        if (stored_ok) {
+            /* The old art is ours to remove only if we stored it. */
+            if (previous[0] && strcmp(previous, job->stored) && is_stored_cover(previous))
+                unlink(previous);
+            snprintf(state->cover_file, sizeof(state->cover_file), "%s", job->stored);
+            if (!strcmp(state->viewed_playlist, state->playing_playlist))
+                reload_viewed_playlist(library, ripper, state);
+            resync_play_lib(state);
+        } else {
+            unlink(job->stored);
+            snprintf(state->cover_status, sizeof(state->cover_status),
+                     "Could not save the cover: %s", err[0] ? err : "unknown error");
+        }
+    }
+    snprintf(state->status, sizeof(state->status), "%s", state->cover_status);
+    free(job);
+    write_status(state);
+}
+
 static void handle_accept_decline(LibraryHandler **library, MusicRipper *ripper, AppState *state,
                                   const char *idx_list, int accept) {
     char target[LIBRARY_NAME_MAX];
@@ -3153,6 +3601,10 @@ static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
                 handle_add_ssh_network_track(library, (MusicRipper *)ripper, library_path, state, cmd, LIBRARY_SOURCE_NETWORK);
             } else if (strncmp(cmd, "add_https ", 10) == 0) {
                 handle_add_https_track(library, (MusicRipper *)ripper, library_path, state, cmd);
+            } else if (strncmp(cmd, "cover_search", 12) == 0) {
+                handle_cover_search(state, cmd + 12);
+            } else if (strncmp(cmd, "cover_apply ", 12) == 0) {
+                handle_cover_apply(state, cmd + 12);
             } else if (strncmp(cmd, "scan_local ", 11) == 0) {
                 handle_scan(library, (MusicRipper *)ripper, state, cmd + 11, LIBRARY_SOURCE_LOCAL);
             } else if (strncmp(cmd, "scan_ssh ", 9) == 0) {
@@ -3484,6 +3936,7 @@ int main(int argc, char **argv) {
         if (resolve_library_dir(library_arg, &state, legacy, sizeof(legacy)) != 0)
             return 1;
         init_resume_path(state.library_dir);
+        init_covers_dir(state.library_dir);
         rebuild_star_playlist(&state);   /* reconcile "*" with the other playlists */
         snprintf(state.viewed_playlist, sizeof(state.viewed_playlist), "%s",
                  state.playlist_count > 0 ? state.playlists[0] : "home");
@@ -3581,6 +4034,9 @@ int main(int argc, char **argv) {
             snprintf(state.status, sizeof(state.status), "Scanning... %d file(s) so far.", state.scan_count);
             write_status(&state);
         }
+
+        if (state.cover_thread_valid && !state.cover_active)
+            finish_cover_job(&library, &ripper, &state);
 
         /* Keep SDL's audio queue refilled from the decoder's rolling window. */
         stream_audio(&state);
@@ -3781,6 +4237,13 @@ int main(int argc, char **argv) {
         state.scan_cancel = 1;
         pthread_join(state.scan_thread, NULL);
         state.scan_thread_valid = 0;
+    }
+    if (state.cover_thread_valid) {
+        state.cover_cancel = 1;
+        pthread_join(state.cover_thread, NULL);
+        state.cover_thread_valid = 0;
+        free(state.cover_job);
+        state.cover_job = NULL;
     }
     if (state.audio_device) state.position_ms = playback_ms(&state);
     write_resume(&state);   /* final resume point on a clean shutdown */

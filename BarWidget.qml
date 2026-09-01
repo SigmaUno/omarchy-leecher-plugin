@@ -99,6 +99,11 @@ BarWidget {
     property string outputDevice: ""
     property var outputDevices: []
     property string coverSource: ""
+    /* Cover chooser: results come from the backend's iTunes Search lookup. */
+    property bool coverPickerOpen: false
+    property var coverResults: []
+    property string coverStatus: ""
+    property bool coverBusy: false
 
     property int basePosition: 0
     property real baseTime: 0
@@ -535,6 +540,33 @@ BarWidget {
             return base + "\n" + s;
         return base;
     }
+    /* The art is for the playing track, so seed the search from what is playing. */
+    function openCoverPicker() {
+        if (!root.hasTrack)
+            return;
+        root.coverPickerOpen = true;
+        coverQueryField.text = (root.artist !== "" && root.artist !== "No Artist"
+            ? root.artist + " " : "") + root.title;
+    }
+    function closeCoverPicker() {
+        root.coverPickerOpen = false;
+    }
+    function searchCovers(q) {
+        var trimmed = String(q).trim();
+        if (trimmed === "") {
+            root.statusText = "Type something to search for.";
+            return;
+        }
+        root.sendControlRaw("cover_search " + enc(trimmed));
+    }
+    /* `src` is either an https image URL from a search hit or a local path. */
+    function applyCover(src) {
+        var trimmed = String(src).trim();
+        if (trimmed === "")
+            return;
+        root.sendControlRaw("cover_apply " + enc(trimmed));
+        root.coverPickerOpen = false;
+    }
     function startEdit(i) {
         for (var k = 0; k < root.tracks.length; k++) {
             if (root.tracks[k].index === i) {
@@ -713,6 +745,7 @@ BarWidget {
         root.popupOpen = false;
         root.libraryOpen = false;
         root.audioOpen = false;
+        root.coverPickerOpen = false;
         root.actionsIndex = -1;
         root.editVisible = false;
         root.editIndex = -1;
@@ -825,6 +858,9 @@ BarWidget {
         root.outputDevices = Array.isArray(data.outputs) ? data.outputs : [];
         root.outputDevice = typeof data.output === "string" ? data.output : "";
         root.coverSource = data.cover ? String(data.cover) : "";
+        root.coverResults = Array.isArray(data.cover_results) ? data.cover_results : [];
+        root.coverStatus = data.cover_status ? String(data.cover_status) : "";
+        root.coverBusy = data.cover_busy === true;
         root.selectedTrackIndex = idx;
         if (isPlayingNow && root.pendingPlayIndex >= 0 && idx === root.pendingPlayIndex) {
             root.pendingPlayIndex = -1;
@@ -1152,6 +1188,165 @@ BarWidget {
                         asynchronous: true
                         clip: true
                         visible: root.coverSource !== ""
+                    }
+
+                    /* Hovering the art offers to set or replace it. Only with a
+                     * track playing -- the cover is hung on that track. */
+                    Rectangle {
+                        anchors.fill: parent
+                        anchors.margins: Style.space(2)
+                        radius: Math.max(Style.cornerRadius, Style.space(8))
+                        z: 4
+                        visible: root.hasTrack && (coverHoverArea.containsMouse || root.coverPickerOpen)
+                        color: Qt.rgba(0, 0, 0, 0.62)
+
+                        Text {
+                            anchors.centerIn: parent
+                            width: parent.width - Style.space(10)
+                            text: root.coverSource === "" ? "+ Add Cover" : "Change Cover"
+                            textFormat: Text.PlainText
+                            color: Color.accent
+                            font.family: root.bar.fontFamily
+                            font.pixelSize: Style.font.caption
+                            font.bold: true
+                            horizontalAlignment: Text.AlignHCenter
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+                    MouseArea {
+                        id: coverHoverArea
+                        anchors.fill: parent
+                        z: 5
+                        hoverEnabled: true
+                        enabled: root.hasTrack
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.coverPickerOpen ? root.closeCoverPicker() : root.openCoverPicker()
+                    }
+                }
+            }
+
+            /* Cover chooser, opened from the hover button on the art. Search hits
+             * come from the backend's iTunes Search lookup (anonymous, no key, no
+             * account); a local image path is accepted too. */
+            Item {
+                id: coverSection
+                width: parent.width
+                visible: root.coverPickerOpen
+                implicitHeight: visible ? coverCol.implicitHeight : 0
+
+                Column {
+                    id: coverCol
+                    width: parent.width
+                    spacing: Style.space(6)
+
+                    Item {
+                        width: parent.width
+                        height: coverQueryField.height
+
+                        TextField {
+                            id: coverQueryField
+                            anchors.left: parent.left
+                            anchors.right: coverSearchBtn.left
+                            anchors.rightMargin: Style.space(6)
+                            placeholderText: "Search cover art by artist and title"
+                            foreground: root.bar.foreground
+                            onAccepted: root.searchCovers(text)
+                        }
+                        Button {
+                            id: coverSearchBtn
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: root.coverBusy ? "..." : "Search"
+                            height: Style.space(26)
+                            fontSize: Style.font.caption
+                            foreground: Color.accent
+                            verticalPadding: 0
+                            horizontalPadding: Style.spacing.controlPaddingX
+                            borderSpec: root.transportButtonBorder
+                            onClicked: root.searchCovers(coverQueryField.text)
+                        }
+                    }
+
+                    Text {
+                        width: parent.width
+                        visible: root.coverStatus !== ""
+                        text: root.coverStatus
+                        textFormat: Text.PlainText
+                        color: Qt.darker(root.bar.foreground, 1.4)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.caption
+                        elide: Text.ElideRight
+                    }
+
+                    /* Click a thumbnail to hang it on the playing track. */
+                    Flow {
+                        width: parent.width
+                        spacing: Style.space(6)
+                        visible: root.coverResults.length > 0
+
+                        Repeater {
+                            model: root.coverResults
+
+                            delegate: Rectangle {
+                                required property var modelData
+                                readonly property real cell: Style.space(58)
+                                width: cell
+                                height: cell
+                                radius: Style.cornerRadius
+                                color: Style.normalFillFor(root.bar.foreground, Color.accent)
+                                border.width: hitHover.containsMouse ? Math.max(1, Style.space(1)) : 0
+                                border.color: Color.accent
+
+                                Image {
+                                    anchors.fill: parent
+                                    anchors.margins: Style.space(2)
+                                    source: modelData.art
+                                    fillMode: Image.PreserveAspectCrop
+                                    asynchronous: true
+                                    cache: false
+                                    clip: true
+                                }
+                                MouseArea {
+                                    id: hitHover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: root.applyCover(modelData.art)
+                                }
+                                PanelToolTip {
+                                    visible: hitHover.containsMouse
+                                    text: modelData.artist + " — " + modelData.title
+                                }
+                            }
+                        }
+                    }
+
+                    Item {
+                        width: parent.width
+                        height: coverPathField.height
+
+                        TextField {
+                            id: coverPathField
+                            anchors.left: parent.left
+                            anchors.right: coverPathBtn.left
+                            anchors.rightMargin: Style.space(6)
+                            placeholderText: "…or the path to a local JPEG/PNG"
+                            foreground: root.bar.foreground
+                            onAccepted: root.applyCover(text)
+                        }
+                        Button {
+                            id: coverPathBtn
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "Set"
+                            height: Style.space(26)
+                            fontSize: Style.font.caption
+                            foreground: root.bar.foreground
+                            verticalPadding: 0
+                            horizontalPadding: Style.spacing.controlPaddingX
+                            borderSpec: root.transportButtonBorder
+                            onClicked: root.applyCover(coverPathField.text)
+                        }
                     }
                 }
             }

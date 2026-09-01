@@ -71,6 +71,14 @@ fi
 printf '\n== backend ==\n'
 sh "$script_dir/install-backend.sh"
 
+# install-backend.sh uses `systemctl --user enable --now`, which does nothing to
+# a service that is already running -- so a freshly installed binary would keep
+# sitting on disk while the old process served the widget. Restart explicitly.
+if command -v systemctl >/dev/null 2>&1; then
+    printf 'Restarting the backend onto the new binary...\n'
+    systemctl --user restart leecher-media.service || true
+fi
+
 # ---- widget ---------------------------------------------------------------
 # install-backend.sh only handles the backend; the widget is a plain file copy
 # into the Omarchy plugin directory named after the manifest id.

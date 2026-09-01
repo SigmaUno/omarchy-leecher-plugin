@@ -268,6 +268,7 @@ void library_handler_track_destroy(LibraryTrack *track) {
     size_t i;
     if (!track) return;
     free(track->id); free(track->title); free(track->artist); free(track->album);
+    free(track->cover);
     for (i = 0; i < track->source_count; i++) {
         free(track->sources[i].path); free(track->sources[i].username);
         free(track->sources[i].url); free(track->sources[i].ip);
@@ -310,6 +311,7 @@ static int copy_track(const LibraryHandler *handler, int best, LibraryTrack *tra
     track->title = object_string(handler->json, handler->tokens, handler->token_count, best, "title");
     track->artist = object_string(handler->json, handler->tokens, handler->token_count, best, "artist");
     track->album = object_string(handler->json, handler->tokens, handler->token_count, best, "album");
+    track->cover = object_string(handler->json, handler->tokens, handler->token_count, best, "cover");
     sources = object_value(handler->json, handler->tokens, handler->token_count, best, "sources");
     if (sources < 0 || handler->tokens[sources].type != JSMN_ARRAY) return 1;
     for (i = sources + 1; i < handler->token_count && handler->tokens[i].start < handler->tokens[sources].end; i = token_skip(handler->tokens, handler->token_count, i)) if (handler->tokens[i].parent == sources && handler->tokens[i].type == JSMN_OBJECT) source_count++;
@@ -538,16 +540,17 @@ static void track_edits_sort(TrackEdit *edits, int how_many) {
 
 int library_handler_update_track(const char *library_path, size_t track_index,
                                  const char *title, const char *artist, const char *album,
-                                 char *error, size_t error_size) {
+                                 const char *cover, char *error, size_t error_size) {
     LibraryHandler *handler;
     int count, object, track_object = -1;
     size_t current = 0, cursor = 0, how_many = 0, i;
     char *new_json;
-    TrackEdit edits[3];
-    const char *fields[3] = { title, artist, album };
-    const char *keys[3] = { "title", "artist", "album" };
+    TrackEdit edits[4];
+    const char *fields[4] = { title, artist, album, cover };
+    const char *keys[4] = { "title", "artist", "album", "cover" };
+    const size_t field_count = sizeof(fields) / sizeof(fields[0]);
     if (!library_path) { set_error(error, error_size, "library path is required"); return -1; }
-    if (!title && !artist && !album) { set_error(error, error_size, "nothing to update"); return -1; }
+    if (!title && !artist && !album && !cover) { set_error(error, error_size, "nothing to update"); return -1; }
     handler = library_handler_open(library_path, error, error_size);
     if (!handler) return -1;
     count = handler->token_count; object = handler->tracks_token;
@@ -559,7 +562,7 @@ int library_handler_update_track(const char *library_path, size_t track_index,
     {
         char *insert_combined = NULL; /* combined `,"k":"v","k2":"v2"` for missing fields */
         size_t insert_len = 0, insert_cap = 0, j;
-        for (i = 0; i < 3; i++) {
+        for (i = 0; i < field_count; i++) {
             int value_token;
             if (!fields[i]) continue;
             value_token = object_value(handler->json, handler->tokens, count, track_object, keys[i]);

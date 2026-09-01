@@ -30,6 +30,8 @@ typedef struct {
     char *title;
     char *artist;
     char *album;
+    char *cover;     /* JSON: cover -- absolute path to a user-chosen image,
+                      * NULL when the art should come from the audio file */
     LibrarySource *sources;
     size_t source_count;
 } LibraryTrack;
@@ -49,11 +51,12 @@ int library_handler_track_at(const LibraryHandler *handler, size_t index, Librar
 int library_handler_add_source(const char *library_path, const LibrarySongQuery *song,
                                const LibrarySource *source, char *error, size_t error_size);
 
-/* Rewrites the title/artist/album of the track at tracks[track_index] and saves
- * atomically. A NULL value leaves that field untouched. Returns 1 on success. */
+/* Rewrites the title/artist/album/cover of the track at tracks[track_index] and
+ * saves atomically. A NULL value leaves that field untouched; a field absent
+ * from the object is inserted. Returns 1 on success. */
 int library_handler_update_track(const char *library_path, size_t track_index,
                                  const char *title, const char *artist, const char *album,
-                                 char *error, size_t error_size);
+                                 const char *cover, char *error, size_t error_size);
 
 /* Removes the track at tracks[track_index] and saves atomically. Returns 1 on
  * success, 0 for an out-of-range index, or -1 on error. */
