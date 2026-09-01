@@ -244,23 +244,23 @@ typedef struct {
     RGB foreground, accent, muted, urgent;
 } ThemePalette;
 
+/* JSON-escape `value` into a fresh malloc'd string (caller frees), NULL on OOM.
+ * Every input byte expands to at most 6 output bytes (\uXXXX), so the initial
+ * allocation is always exact -- no realloc (the old growth branch was dead code
+ * and leaked `out` on failure), and each escape is written straight into place
+ * rather than strcat'd. */
 static char *json_escape(const char *value) {
-    size_t cap = (value ? strlen(value) : 0) * 6 + 1, len = 0;
+    size_t vlen = value ? strlen(value) : 0, len = 0;
     const unsigned char *p = (const unsigned char *)(value ? value : "");
-    char *out = malloc(cap);
+    char *out = malloc(vlen * 6 + 1);
     if (!out) return NULL;
-    out[0] = '\0';
     for (; *p; p++) {
-        char esc[7];
-        if (*p == '"' || *p == '\\') { esc[0] = '\\'; esc[1] = (char)*p; esc[2] = '\0'; }
-        else if (*p == '\n') { esc[0] = '\\'; esc[1] = 'n'; esc[2] = '\0'; }
-        else if (*p == '\r') { esc[0] = '\\'; esc[1] = 'r'; esc[2] = '\0'; }
-        else if (*p == '\t') { esc[0] = '\\'; esc[1] = 't'; esc[2] = '\0'; }
-        else if (*p < 32) { snprintf(esc, sizeof(esc), "\\u%04x", *p); }
-        else { esc[0] = (char)*p; esc[1] = '\0'; }
-        len += strlen(esc);
-        if (len >= cap) { cap = len * 2 + 8; out = realloc(out, cap); if (!out) return NULL; }
-        strcat(out + (len - strlen(esc)), esc);
+        if (*p == '"' || *p == '\\') { out[len++] = '\\'; out[len++] = (char)*p; }
+        else if (*p == '\n') { out[len++] = '\\'; out[len++] = 'n'; }
+        else if (*p == '\r') { out[len++] = '\\'; out[len++] = 'r'; }
+        else if (*p == '\t') { out[len++] = '\\'; out[len++] = 't'; }
+        else if (*p < 32) { len += (size_t)snprintf(out + len, 7, "\\u%04x", *p); }
+        else { out[len++] = (char)*p; }
     }
     out[len] = '\0';
     return out;
