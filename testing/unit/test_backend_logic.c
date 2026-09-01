@@ -146,6 +146,24 @@ static void test_next_autoplay_index(void) {
     CHECK_EQ_SIZE(next_autoplay_index(&s, 1, 0, 1), 0);        /* can't avoid self with 1 */
 }
 
+/* ------------------------------------------------- autoplay dead-playlist guard */
+static void test_autoplay_note_failure(void) {
+    AppState s = {0};
+    /* 3-track playlist, every fetch failing: give up on the 3rd (a full lap). */
+    CHECK(autoplay_note_failure(&s, 3) == 0);
+    CHECK(autoplay_note_failure(&s, 3) == 0);
+    CHECK(autoplay_note_failure(&s, 3) == 1);
+    /* one success in between resets the streak */
+    s.autoplay_fail_streak = 0;
+    CHECK(autoplay_note_failure(&s, 3) == 0);
+    CHECK(autoplay_note_failure(&s, 3) == 0);
+    s.autoplay_fail_streak = 0;                 /* commit_fetch would do this */
+    CHECK(autoplay_note_failure(&s, 3) == 0);
+    /* count 0 never trips the guard */
+    s.autoplay_fail_streak = 99;
+    CHECK(autoplay_note_failure(&s, 0) == 0);
+}
+
 /* ------------------------------------------------------------- the play queue */
 static void test_play_queue(void) {
     AppState s = {0};
@@ -797,6 +815,7 @@ int main(void) {
         { "shell_quote_words",   test_shell_quote_words },
         { "control_decode",      test_control_decode },
         { "next_autoplay_index", test_next_autoplay_index },
+        { "autoplay_note_failure", test_autoplay_note_failure },
         { "play_queue",          test_play_queue },
         { "take_next_index",     test_take_next_index },
         { "next_encoded_token",  test_next_encoded_token },

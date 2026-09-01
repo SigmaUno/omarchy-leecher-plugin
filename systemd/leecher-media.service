@@ -6,6 +6,13 @@ Description=Leecher Music for Omarchy backend
 # into nothing (position frozen at 0, no output stream) until restarted.
 After=graphical-session.target pipewire.service pipewire-pulse.service wireplumber.service
 Wants=pipewire.service pipewire-pulse.service wireplumber.service
+# Give up after a burst of quick failures instead of restarting forever: a
+# reproducible startup crash (bad library, missing dependency) then surfaces as
+# a failed unit. The window is wide enough that the backend's own "exit 1 until
+# the library dir is readable" retry (a slow/late $HOME mount) still has ~10
+# tries to succeed.
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
