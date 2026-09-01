@@ -23,6 +23,9 @@ typedef struct {
     const char *title;
     const char *artist;
     const char *album;
+    /* Optional. Only written when a NEW track entry is created; merging a
+     * source into an existing track never clobbers the cover it already has. */
+    const char *cover;
 } LibrarySongQuery;
 
 typedef struct {

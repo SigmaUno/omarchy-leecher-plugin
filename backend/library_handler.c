@@ -498,10 +498,12 @@ int library_handler_add_source(const char *library_path, const LibrarySongQuery 
     } else {
         const jsmntok_t *tracks = &handler->tokens[handler->tracks_token];
         char *track_entry;
-        size_t capacity = strlen(entry) + 6 * (strlen(song->title) + (song->artist ? strlen(song->artist) : 0) + (song->album ? strlen(song->album) : 0)) + 128;
+        size_t capacity = strlen(entry) + 6 * (strlen(song->title) + (song->artist ? strlen(song->artist) : 0) + (song->album ? strlen(song->album) : 0) + (song->cover ? strlen(song->cover) : 0)) + 128;
         track_entry = calloc(capacity, 1);
         if (!track_entry) { library_handler_close(handler); free(entry); set_error(error, error_size, "out of memory"); return -1; }
-        { size_t length = 0; append_text(track_entry, capacity, &length, "{\"title\":"); append_json_string(track_entry, capacity, &length, song->title); append_text(track_entry, capacity, &length, ",\"artist\":"); append_json_value(track_entry, capacity, &length, song->artist); append_text(track_entry, capacity, &length, ",\"album\":"); append_json_value(track_entry, capacity, &length, song->album); append_text(track_entry, capacity, &length, ",\"sources\":["); append_text(track_entry, capacity, &length, entry); append_text(track_entry, capacity, &length, "]}"); }
+        { size_t length = 0; append_text(track_entry, capacity, &length, "{\"title\":"); append_json_string(track_entry, capacity, &length, song->title); append_text(track_entry, capacity, &length, ",\"artist\":"); append_json_value(track_entry, capacity, &length, song->artist); append_text(track_entry, capacity, &length, ",\"album\":"); append_json_value(track_entry, capacity, &length, song->album);
+          if (song->cover && *song->cover) { append_text(track_entry, capacity, &length, ",\"cover\":"); append_json_string(track_entry, capacity, &length, song->cover); }
+          append_text(track_entry, capacity, &length, ",\"sources\":["); append_text(track_entry, capacity, &length, entry); append_text(track_entry, capacity, &length, "]}"); }
         insert_at = tracks->end - 1; array_has_entries = tracks->size > 0;
         new_size = strlen(handler->json) + strlen(track_entry) + (array_has_entries ? 1 : 0) + 1;
         new_json = malloc(new_size);

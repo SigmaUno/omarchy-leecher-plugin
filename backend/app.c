@@ -1382,7 +1382,11 @@ static void rebuild_star_playlist(AppState *s) {
                 }
                 snprintf(seen[seen_len++], sizeof(seen[0]), "%s", key);
                 {
-                    LibrarySongQuery q = { .title = t.title, .artist = t.artist, .album = t.album };
+                    /* Carry the cover across too: "*" is rebuilt from scratch
+                     * on every view and at startup, so anything not copied here
+                     * is destroyed rather than merely stale. */
+                    LibrarySongQuery q = { .title = t.title, .artist = t.artist,
+                                           .album = t.album, .cover = t.cover };
                     library_handler_add_source(staging, &q, &t.sources[j], err, sizeof(err));
                 }
             }
@@ -1906,6 +1910,12 @@ struct CoverJob {
     char query[512];                        /* search: free text */
     char source[1024];                      /* apply: local path or https URL */
     char stored[512];                       /* apply: where the image landed */
+    /* The track this was started for. Captured up front because a fetch can
+     * take tens of seconds, and autoplay advancing (or a skip, or a playlist
+     * switch) in that window would otherwise land the art on whatever happens
+     * to be playing when the download lands. */
+    char playlist[LIBRARY_NAME_MAX];
+    size_t index;
     CoverResult results[COVER_RESULT_MAX];
     int result_count;
     char status[256];
@@ -2092,6 +2102,8 @@ static int start_cover_job(AppState *s, int apply, const char *query, const char
     if (!job) { snprintf(s->status, sizeof(s->status), "Out of memory."); return 0; }
     job->state = s;
     job->apply = apply;
+    snprintf(job->playlist, sizeof(job->playlist), "%s", s->playing_playlist);
+    job->index = s->selected_track;
     if (query) snprintf(job->query, sizeof(job->query), "%s", query);
     if (source) snprintf(job->source, sizeof(job->source), "%s", source);
     s->cover_cancel = 0;
@@ -2425,6 +2437,11 @@ static void commit_fetch(AppState *s, size_t idx) {
     s->pending_valid = 0;
     s->immediate_pending = 0;
     s->autoplay_fail_streak = 0;   /* a track actually started */
+    /* Cover hits were searched for the previous track. Clearing them here (not
+     * just in the widget, which re-reads this array on every status update)
+     * stops a click in the chooser hanging the old track's art on this one. */
+    s->cover_result_count = 0;
+    s->cover_status[0] = '\0';
     /* Fresh track: clear the stall/no-output detectors so the first buffer
      * fill is not mistaken for a stalled device. */
     s->position_stalls = 0;
@@ -3346,6 +3363,46 @@ static void handle_cover_apply(AppState *state, const char *args) {
     write_status(state);
 }
 
+/* "*" is a derived view -- rebuild_star_playlist() regenerates it from the other
+ * playlists on every view and at startup, and skips "*" itself -- so a cover
+ * written only there has nothing to be rebuilt from and is destroyed. Push it
+ * down to every real playlist holding the same source; the next rebuild then
+ * re-derives it into "*" on its own. Returns how many entries were updated. */
+static int apply_cover_to_origins(AppState *s, const char *key, const char *cover) {
+    int pi, wrote = 0;
+    for (pi = 0; pi < s->playlist_count; pi++) {
+        char path[LIBRARY_PATH_MAX], err[256];
+        LibraryHandler *h;
+        size_t count, i;
+        if (!strcmp(s->playlists[pi], STAR_PLAYLIST)) continue;
+        if (is_incoming_name(s->playlists[pi])) continue;   /* not real content yet */
+        playlist_file_path(s, s->playlists[pi], path, sizeof(path));
+        h = library_handler_open(path, err, sizeof(err));
+        if (!h) continue;
+        count = library_handler_track_count(h);
+        for (i = 0; i < count; i++) {
+            LibraryTrack t = {0};
+            int hit = 0;
+            size_t j;
+            if (library_handler_track_at(h, i, &t, err, sizeof(err)) == 1) {
+                for (j = 0; j < t.source_count && !hit; j++) {
+                    char k[1024];
+                    source_key(&t.sources[j], k, sizeof(k));
+                    if (!strcmp(k, key)) hit = 1;
+                }
+            }
+            library_handler_track_destroy(&t);
+            /* Setting a field leaves the row count and order alone, so the
+             * indices from `h` stay valid across these writes. */
+            if (hit && library_handler_update_track(path, i, NULL, NULL, NULL, cover,
+                                                    err, sizeof(err)) == 1)
+                wrote++;
+        }
+        library_handler_close(h);
+    }
+    return wrote;
+}
+
 /* Main thread: the cover worker has finished. Publish search hits, or commit a
  * fetched image onto the playing track (every library write stays here). */
 static void finish_cover_job(LibraryHandler **library, AppState *state) {
@@ -3362,22 +3419,59 @@ static void finish_cover_job(LibraryHandler **library, AppState *state) {
         for (i = 0; i < job->result_count; i++) state->cover_results[i] = job->results[i];
     } else if (job->stored[0]) {
         char path[LIBRARY_PATH_MAX], err[256] = {0}, previous[512] = {0};
+        char origin_key[1024] = {0};
         int stored_ok;
         LibraryTrack existing = {0};
-        playlist_file_path(state, state->playing_playlist, path, sizeof(path));
-        if (library_handler_track_at(state->play_lib, state->selected_track, &existing,
-                                     err, sizeof(err)) == 1 && existing.cover)
-            snprintf(previous, sizeof(previous), "%s", existing.cover);
-        library_handler_track_destroy(&existing);
+        LibraryHandler *target = NULL;
 
-        stored_ok = library_handler_update_track(path, state->selected_track, NULL, NULL, NULL,
+        /* Write to the track this job was started for, not whatever is playing
+         * now. If that playlist or row is gone, drop the image rather than
+         * hanging it on some other track (and deleting that track's cover as
+         * the one being "replaced"). */
+        if (!playlist_known(state, job->playlist)) {
+            unlink(job->stored);
+            snprintf(state->cover_status, sizeof(state->cover_status),
+                     "That playlist is gone; the cover was not saved.");
+            snprintf(state->status, sizeof(state->status), "%s", state->cover_status);
+            free(job);
+            write_status(state);
+            return;
+        }
+        playlist_file_path(state, job->playlist, path, sizeof(path));
+        target = library_handler_open(path, err, sizeof(err));
+        if (!target || job->index >= library_handler_track_count(target)) {
+            library_handler_close(target);
+            unlink(job->stored);
+            snprintf(state->cover_status, sizeof(state->cover_status),
+                     "That track is gone; the cover was not saved.");
+            snprintf(state->status, sizeof(state->status), "%s", state->cover_status);
+            free(job);
+            write_status(state);
+            return;
+        }
+        if (library_handler_track_at(target, job->index, &existing, err, sizeof(err)) == 1) {
+            if (existing.cover)
+                snprintf(previous, sizeof(previous), "%s", existing.cover);
+            if (existing.source_count > 0)
+                source_key(&existing.sources[0], origin_key, sizeof(origin_key));
+        }
+        library_handler_track_destroy(&existing);
+        library_handler_close(target);
+
+        stored_ok = library_handler_update_track(path, job->index, NULL, NULL, NULL,
                                                  job->stored, err, sizeof(err)) == 1;
         if (stored_ok) {
+            /* A cover set on "*" only sticks if it also reaches the playlists
+             * "*" is rebuilt from. */
+            if (!strcmp(job->playlist, STAR_PLAYLIST) && origin_key[0])
+                apply_cover_to_origins(state, origin_key, job->stored);
             /* The old art is ours to remove only if we stored it. */
             if (previous[0] && strcmp(previous, job->stored) && is_stored_cover(previous))
                 unlink(previous);
-            snprintf(state->cover_file, sizeof(state->cover_file), "%s", job->stored);
-            if (!strcmp(state->viewed_playlist, state->playing_playlist))
+            /* Only repaint the now-playing art if this really is that track. */
+            if (!strcmp(job->playlist, state->playing_playlist) && job->index == state->selected_track)
+                snprintf(state->cover_file, sizeof(state->cover_file), "%s", job->stored);
+            if (!strcmp(state->viewed_playlist, job->playlist))
                 reload_viewed_playlist(library, state);
             resync_play_lib(state);
         } else {
@@ -3432,7 +3526,8 @@ static void handle_accept_decline(LibraryHandler **library, AppState *state,
             continue;
         }
         if (accept) {
-            LibrarySongQuery q = { .title = t.title, .artist = t.artist, .album = t.album };
+            LibrarySongQuery q = { .title = t.title, .artist = t.artist,
+                                   .album = t.album, .cover = t.cover };
             size_t j;
             for (j = 0; j < t.source_count; j++)
                 library_handler_add_source(tpath, &q, &t.sources[j], err, sizeof(err));

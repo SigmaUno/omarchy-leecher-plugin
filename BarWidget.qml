@@ -133,6 +133,11 @@ BarWidget {
      * when the backend echoes that command's id back as `cmd_id`. */
     property var commandQueue: []
     property int commandRetries: 0
+    /* Far more than anyone clicks on purpose. runtimeDirSafe only says the
+     * runtime directory looks right, not that the backend is alive -- with a
+     * crashed backend every click would otherwise queue, take ~6s to time out,
+     * and then replay as a stale backlog when it came back. */
+    readonly property int commandQueueMax: 24
     /* First token of these is a "set to value" the backend applies idempotently,
      * so a still-queued one is replaced in place rather than piling up during a
      * volume/seek drag. */
@@ -404,6 +409,15 @@ BarWidget {
             }
         }
         q.push(entry);
+        /* Over the cap, drop the OLDEST waiting command: the newest click is the
+         * one the user means. Never drop q[0] while it is in flight -- its id is
+         * what the backend will echo. */
+        if (q.length > root.commandQueueMax) {
+            var dropFrom = root.pendingCommandId >= 0 ? 1 : 0;
+            while (q.length > root.commandQueueMax && q.length > dropFrom + 1)
+                q.splice(dropFrom, 1);
+            root.statusText = "Player is not responding; older commands were dropped.";
+        }
         root.commandQueue = q;
         root.pumpCommandQueue();
         return true;

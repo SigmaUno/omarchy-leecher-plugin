@@ -427,6 +427,45 @@ poll_state '.viewed_playlist == "roadtrip"' 40 \
     || { fail "clearing the staging list"; jq '{viewed_playlist,playlists}' "$D/status.json"; }
 [ -f "$inc" ] && fail "empty staging file removed" || pass "empty staging file removed"
 
+# ---- cover art on the derived "*" playlist --------------------------------
+# "*" is regenerated from the other playlists on every view and at startup, so
+# a cover written only there used to be destroyed by the next rebuild. It has
+# to reach the playlist "*" is derived from as well. Nothing here assumes a
+# row order: "*" is rebuilt, so indices move.
+if command -v ffmpeg >/dev/null 2>&1; then
+    art=$work/cover.jpg
+    ffmpeg -v error -f lavfi -i color=c=red:s=64x64:d=1 -frames:v 1 "$art" -y 2>/dev/null
+    star="$libdir/*.json"
+    covered() { jq -e '[.tracks[] | select(.cover != null and .cover != "")] | length > 0' "$1" >/dev/null 2>&1; }
+
+    send "autoplay off"
+    send "playlist *"
+    send "play 0"
+    if poll_state '.playing_playlist == "*"' 40; then
+        send "cover_apply $art"
+        if poll_state '.cover != ""' 60; then
+            pass "cover applied while playing from *"
+            covered "$star" && pass "cover recorded on the * entry" \
+                || { fail "cover recorded on the * entry"; jq -c '.tracks[].cover' "$star"; }
+            # the push-down: whatever real playlist "*" is derived from needs it
+            covered "$libdir/home.json" && pass "cover pushed down to the origin playlist" \
+                || { fail "cover pushed down to the origin playlist"; jq -c '.tracks[].cover' "$libdir/home.json"; }
+            # force a rebuild of "*" and make sure it was not wiped
+            send "playlist home"
+            send "playlist *"
+            covered "$star" && pass "cover survives a * rebuild" \
+                || { fail "cover survives a * rebuild"; jq -c '.tracks[].cover' "$star"; }
+        else
+            fail "cover applied while playing from *"
+        fi
+    else
+        fail "could not play out of *"
+    fi
+    send "autoplay on"
+else
+    echo "  (ffmpeg not found -- skipping the cover checks)"
+fi
+
 # --------------------------------------------------------------------------
 echo
 if [ "$fails" -eq 0 ]; then
