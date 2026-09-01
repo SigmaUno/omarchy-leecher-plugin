@@ -605,7 +605,7 @@ BarWidget {
             root.sendControl("decline_incoming " + indices.join(" "));
         }
     }
-    /* Indices of every row currently shown (after any filter), for shift-click. */
+    /* Indices of every row currently shown (after any filter), for "Add all". */
     function shownIncomingIndices() {
         return root.filteredTracks.map(function (t) { return t.index; });
     }
@@ -1615,6 +1615,12 @@ BarWidget {
                                         readonly property bool isViewed: pname === root.viewedPlaylist
                                         readonly property bool isPlaying: pname === root.playingPlaylist
                                         readonly property bool isIncoming: root.incomingTargetOf(pname) !== ""
+                                        /* The on-disk stem stays "INCOMING >> <target> <<" -- the
+                                         * backend parses the target back out of it -- so shorten it
+                                         * for display only. */
+                                        readonly property string label: ptab.isIncoming
+                                            ? "+ " + root.incomingTargetOf(pname)
+                                            : pname
                                         /* A staging list is always drawn in orange -- accent when
                                          * viewed, dimmer when not -- so it stands out as pending. */
                                         readonly property color tabTint: isIncoming ? root.incomingColor : Color.accent
@@ -1633,7 +1639,7 @@ BarWidget {
                                         Text {
                                             id: ptabText
                                             anchors.centerIn: parent
-                                            text: ptab.pname
+                                            text: ptab.label
                                             textFormat: Text.PlainText
                                             /* Passive tabs sit on the dark popup, so a dimmed
                                              * foreground reads as secondary. A filled tab is on
@@ -1656,13 +1662,54 @@ BarWidget {
                         }
                     }
 
-                    TextField {
-                        id: librarySearchField
+                    /* Search field, with the bulk-accept action beside it while
+                     * a staging list is under review -- it replaces the old
+                     * shift-click gesture, which was undiscoverable. */
+                    Item {
                         width: parent.width
                         visible: !root.editVisible
-                        placeholderText: "Filter by title, artist or album"
-                        foreground: root.bar.foreground
-                        onTextChanged: root.librarySearch = text
+                        height: librarySearchField.height
+
+                        TextField {
+                            id: librarySearchField
+                            anchors.left: parent.left
+                            anchors.right: addAllShown.visible ? addAllShown.left : parent.right
+                            anchors.rightMargin: addAllShown.visible ? Style.space(6) : 0
+                            placeholderText: "Filter by title, artist or album"
+                            foreground: root.bar.foreground
+                            onTextChanged: root.librarySearch = text
+                        }
+
+                        Rectangle {
+                            id: addAllShown
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            /* Only while reviewing staged tracks, and only when
+                             * the filter actually leaves something to add. */
+                            visible: root.viewingIncoming && root.filteredTracks.length > 0
+                            height: Style.space(28)
+                            width: addAllShownText.implicitWidth + Style.space(20)
+                            radius: Style.cornerRadius
+                            color: Color.accent
+
+                            Text {
+                                id: addAllShownText
+                                anchors.centerIn: parent
+                                text: "\uf067  Add all"
+                                textFormat: Text.PlainText
+                                /* On the accent fill, so the popup's own dark
+                                 * colour is what reads against it. */
+                                color: Color.popups.background
+                                font.family: root.bar.fontFamily
+                                font.pixelSize: Style.font.bodySmall
+                                font.weight: Font.Black
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.acceptIncoming(root.shownIncomingIndices())
+                            }
+                        }
                     }
 
                     /* Track-info editor. Shown instead of the list (not on top of
@@ -1814,16 +1861,6 @@ BarWidget {
                         elide: Text.ElideRight
                     }
 
-                    Text {
-                        width: parent.width
-                        visible: root.viewingIncoming && !root.editVisible
-                        text: "Shift-click to accept/decline all in search"
-                        color: Qt.darker(root.bar.foreground, 1.7)
-                        font.family: root.bar.fontFamily
-                        font.pixelSize: Style.font.caption
-                        font.italic: true
-                    }
-
                     ListView {
                         id: trackList
                         width: parent.width
@@ -1950,29 +1987,27 @@ BarWidget {
                                     }
                                 }
 
-                                /* Staging-list rows get accept (green tick) and
-                                 * decline (red cross). Shift-click applies to
-                                 * every row currently shown (after any filter). */
+                                /* Staging-list rows get accept (blue plus) and
+                                 * decline (red cross), one row per click. Bulk
+                                 * accept lives on the "Add all" button beside
+                                 * the search field. */
                                 Item {
                                     width: Style.space(24)
                                     height: parent.height
                                     visible: root.viewingIncoming
                                     Text {
                                         anchors.centerIn: parent
-                                        text: "\uf00c"
-                                        color: Qt.rgba(0.35, 0.75, 0.4, 1)
+                                        text: "\uf067"
+                                        color: Color.accent
                                         font.family: root.bar.fontFamily
                                         font.pixelSize: Style.font.bodySmall
+                                        font.bold: true
                                     }
                                     MouseArea {
                                         anchors.fill: parent
                                         z: 3
-                                        onClicked: (mouse) => {
-                                            if (mouse.modifiers & Qt.ShiftModifier)
-                                                root.acceptIncoming(root.shownIncomingIndices());
-                                            else
-                                                root.acceptIncoming([modelData.index]);
-                                        }
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: root.acceptIncoming([modelData.index])
                                     }
                                 }
                                 Item {
@@ -1989,12 +2024,8 @@ BarWidget {
                                     MouseArea {
                                         anchors.fill: parent
                                         z: 3
-                                        onClicked: (mouse) => {
-                                            if (mouse.modifiers & Qt.ShiftModifier)
-                                                root.declineIncoming(root.shownIncomingIndices());
-                                            else
-                                                root.declineIncoming([modelData.index]);
-                                        }
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: root.declineIncoming([modelData.index])
                                     }
                                 }
                                 Item {
