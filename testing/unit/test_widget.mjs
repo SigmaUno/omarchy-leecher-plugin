@@ -52,6 +52,26 @@ check("enc(del)", enc("x\x7fy"), "x%7Fy");
 check("enc(control)", enc("\x01\x1f"), "%01%1F");
 check("enc(unicode kept)", enc("café"), "café");
 
+// ---- track number split (right-aligned in the library and now-playing) ----
+const trackNumberOf = load("trackNumberOf");
+const titleWithoutNumber = load("titleWithoutNumber");
+for (const [title, num, rest] of [
+  ["Banana Co. (16)", "16", "Banana Co."],
+  ["The Call Of Ktulu (08)", "08", "The Call Of Ktulu"],
+  // a real parenthetical must survive; only the trailing number is taken
+  ["Welcome Home (Sanitarium) (08)", "08", "Welcome Home (Sanitarium)"],
+  ["Welcome Home (Sanitarium)", "", "Welcome Home (Sanitarium)"],
+  // the title's own leading digits are none of our business
+  ["2 + 2 = 5. (The Lukewarm.) (01)", "01", "2 + 2 = 5. (The Lukewarm.)"],
+  // four digits is a year, not a track number
+  ["Nineteen Ninety Nine (1999)", "", "Nineteen Ninety Nine (1999)"],
+  ["No number here", "", "No number here"],
+  ["", "", ""],
+]) {
+  check(`trackNumberOf(${JSON.stringify(title)})`, trackNumberOf(title), num);
+  check(`titleWithoutNumber(${JSON.stringify(title)})`, titleWithoutNumber(title), rest);
+}
+
 // ---- urlToPath(): drag-and-drop file URL -> local path --------------------
 const urlToPath = load("urlToPath");
 check("urlToPath(file://)", urlToPath("file:///home/me/a.flac"), "/home/me/a.flac");

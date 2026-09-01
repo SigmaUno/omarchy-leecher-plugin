@@ -728,6 +728,20 @@ BarWidget {
         }
         return out;
     }
+    /* retag-library.py stores the track number in the title as a trailing
+     * " (NN)". Split it back out for display so it can sit right-aligned,
+     * without changing what is stored. Requires digits, so a real parenthetical
+     * like "Welcome Home (Sanitarium)" is left alone, and caps at 3 digits so a
+     * year such as "(1999)" is not mistaken for a track number. */
+    function trackNumberOf(title) {
+        var m = /^(.*\S)\s*\((\d{1,3})\)\s*$/.exec(String(title || ""));
+        return m ? m[2] : "";
+    }
+    function titleWithoutNumber(title) {
+        var s = String(title || "");
+        var m = /^(.*\S)\s*\((\d{1,3})\)\s*$/.exec(s);
+        return m ? m[1] : s;
+    }
     function fmt(ms) {
         if (!ms || ms <= 0)
             return "0:00";
@@ -1092,20 +1106,40 @@ BarWidget {
                     spacing: Style.space(2)
                     anchors.verticalCenter: parent.verticalCenter
 
-                    Text {
-                        id: titleText
-                        text: root.title || "No song loaded"
-                        textFormat: Text.PlainText
-                        color: root.bar.foreground
-                        font.family: root.bar.fontFamily
-                        font.pixelSize: Style.font.subtitle
-                        font.bold: true
-                        /* Word-wrap only (never mid-word). Three lines, then the
-                         * third is elided and a "see more" link expands it. */
+                    Item {
                         width: parent.width
-                        wrapMode: Text.WordWrap
-                        maximumLineCount: root.titleExpanded ? 99 : 3
-                        elide: root.titleExpanded ? Text.ElideNone : Text.ElideRight
+                        height: titleText.height
+
+                        Text {
+                            id: nowTrackNumber
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            text: root.trackNumberOf(root.title)
+                            visible: root.hasTrack && text !== ""
+                            textFormat: Text.PlainText
+                            color: Qt.darker(root.bar.foreground, 1.5)
+                            font.family: root.bar.fontFamily
+                            font.pixelSize: Style.font.body
+                        }
+
+                        Text {
+                            id: titleText
+                            anchors.left: parent.left
+                            anchors.top: parent.top
+                            anchors.right: nowTrackNumber.visible ? nowTrackNumber.left : parent.right
+                            anchors.rightMargin: nowTrackNumber.visible ? Style.space(8) : 0
+                            text: root.title ? root.titleWithoutNumber(root.title) : "No song loaded"
+                            textFormat: Text.PlainText
+                            color: root.bar.foreground
+                            font.family: root.bar.fontFamily
+                            font.pixelSize: Style.font.subtitle
+                            font.bold: true
+                            /* Word-wrap only (never mid-word). Three lines, then the
+                             * third is elided and a "see more" link expands it. */
+                            wrapMode: Text.WordWrap
+                            maximumLineCount: root.titleExpanded ? 99 : 3
+                            elide: root.titleExpanded ? Text.ElideNone : Text.ElideRight
+                        }
                     }
 
                     Text {
@@ -2188,15 +2222,37 @@ BarWidget {
                                     spacing: Style.space(1)
                                     width: parent.width - Style.space(24) - Style.space(24) - Style.space(16)
                                         - (root.viewingIncoming ? Style.space(48) : 0)
-                                    Text {
-                                        text: modelData.title
-                                        textFormat: Text.PlainText
-                                        color: root.bar.foreground
-                                        font.family: root.bar.fontFamily
-                                        font.pixelSize: Style.font.bodySmall
-                                        font.bold: isCurrent
-                                        elide: Text.ElideRight
+                                    Item {
                                         width: parent.width
+                                        height: rowTitle.implicitHeight
+
+                                        Text {
+                                            id: rowTrackNumber
+                                            anchors.right: parent.right
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            text: root.trackNumberOf(modelData.title)
+                                            visible: text !== ""
+                                            textFormat: Text.PlainText
+                                            color: Qt.darker(root.bar.foreground, 1.6)
+                                            font.family: root.bar.fontFamily
+                                            font.pixelSize: Style.font.caption
+                                        }
+
+                                        Text {
+                                            id: rowTitle
+                                            anchors.left: parent.left
+                                            anchors.right: rowTrackNumber.visible
+                                                ? rowTrackNumber.left : parent.right
+                                            anchors.rightMargin: rowTrackNumber.visible ? Style.space(6) : 0
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            text: root.titleWithoutNumber(modelData.title)
+                                            textFormat: Text.PlainText
+                                            color: root.bar.foreground
+                                            font.family: root.bar.fontFamily
+                                            font.pixelSize: Style.font.bodySmall
+                                            font.bold: isCurrent
+                                            elide: Text.ElideRight
+                                        }
                                     }
                                     /* Secondary line: "Artist | Album" as one
                                      * flowing string, elided as a whole. */
