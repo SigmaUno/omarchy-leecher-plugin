@@ -1524,7 +1524,7 @@ BarWidget {
                     }
                 }
                 Button {
-                    iconText: "\uf01d"
+                    iconText: "\uf052"
                     foreground: root.bar.foreground
                     width: root.controlButtonSize
                     height: root.controlButtonSize
