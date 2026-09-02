@@ -179,6 +179,35 @@ static void test_autoplay_note_failure(void) {
     CHECK(autoplay_note_failure(&s, 0) == 0);
 }
 
+/* --------------------------------------------- autoplay failure backoff */
+static void test_autoplay_retry_delay(void) {
+    /* An isolated bad track is skipped with no wait: the first two failures in
+     * a row retry at once, so the common case is unchanged. */
+    CHECK(autoplay_retry_delay_ms(0) == 0);
+    CHECK(autoplay_retry_delay_ms(1) == 0);
+    CHECK(autoplay_retry_delay_ms(2) == 0);
+    /* A run of them backs off, doubling. */
+    CHECK(autoplay_retry_delay_ms(3) == 500);
+    CHECK(autoplay_retry_delay_ms(4) == 1000);
+    CHECK(autoplay_retry_delay_ms(5) == 2000);
+    CHECK(autoplay_retry_delay_ms(6) == 4000);
+    CHECK(autoplay_retry_delay_ms(7) == 8000);
+    /* and caps, so a source that comes back is picked up promptly. */
+    CHECK(autoplay_retry_delay_ms(8) == 15000);
+    CHECK(autoplay_retry_delay_ms(9) == 15000);
+    CHECK(autoplay_retry_delay_ms(500) == 15000);
+    /* The whole boot-time outage that prompted this: an unreachable host fails
+     * in milliseconds, so the elapsed time is essentially the sum of the waits.
+     * Ten failures must span tens of seconds, not the five in which autoplay
+     * burned 47 tracks. */
+    {
+        Uint32 total = 0;
+        int i;
+        for (i = 1; i <= 10; i++) total += autoplay_retry_delay_ms(i);
+        CHECK(total >= 45000);
+    }
+}
+
 /* --------------------------------------------------- cover-search parsing */
 static void test_cover_parsing(void) {
     char buf[256];
@@ -1097,6 +1126,7 @@ int main(void) {
         { "control_decode",      test_control_decode },
         { "next_autoplay_index", test_next_autoplay_index },
         { "autoplay_note_failure", test_autoplay_note_failure },
+        { "autoplay_retry_delay", test_autoplay_retry_delay },
         { "cover_parsing",       test_cover_parsing },
         { "play_queue",          test_play_queue },
         { "take_next_index",     test_take_next_index },

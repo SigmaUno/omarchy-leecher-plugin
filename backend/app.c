@@ -148,6 +148,8 @@ typedef struct {
     int autoplay_fail_streak;  /* consecutive autoplay fetches that failed with
                                 * no success in between; a full playlist's worth
                                 * means every source is dead -- stop, don't spin */
+    Uint32 autoplay_retry_at_ms;  /* 0 = none; tick to fire the backed-off retry */
+    size_t autoplay_retry_index;  /* the track that retry will ask for */
     size_t play_queue[64];   /* ad-hoc "play next" order, consumed before library order */
     int play_queue_len;
     /* Cover chooser. The worker only does network I/O and fills its own job;
@@ -2498,6 +2500,7 @@ static void request_play(AppState *s, size_t index) {
     if (count == 0) { snprintf(s->status, sizeof(s->status), "Playlist is empty."); return; }
     /* A user-initiated play (not an autoplay skip) starts a fresh streak. */
     if (!s->autoplay_advancing) s->autoplay_fail_streak = 0;
+    s->autoplay_retry_at_ms = 0;   /* this request supersedes any pending retry */
     s->pending_valid = 0;
     s->immediate_pending = 1;
     s->immediate_index = index;
@@ -2800,11 +2803,48 @@ static int autoplay_note_failure(AppState *s, size_t count) {
     return count > 0 && s->autoplay_fail_streak >= (int)count;
 }
 
+/* How long to wait before the next autoplay attempt, given how many fetches
+ * have failed back-to-back. The first couple retry at once so one broken file
+ * in the middle of a playlist is skipped without an audible stutter; a run of
+ * them backs off instead.
+ *
+ * Without this a source that is merely unreachable -- an SSH host on a VPN that
+ * has not come up yet, the case at boot -- fails in milliseconds, and autoplay
+ * burns the whole playlist end to end before the network appears: 47 tracks
+ * skipped in five seconds, the widget flashing a "Loading ..." per track. The
+ * 15s cap bounds how long playback lags behind a source that has come back. */
+static Uint32 autoplay_retry_delay_ms(int streak) {
+    int shift;
+    if (streak <= 2) return 0;
+    shift = streak - 3;              /* 500ms, 1s, 2s, 4s, 8s, then the cap */
+    if (shift > 5) shift = 5;
+    return (500u << shift) > 15000u ? 15000u : (500u << shift);
+}
+
+/* Queue the next autoplay attempt after a failed fetch, backing off per the
+ * schedule above. A zero delay just plays now, so the common single-bad-track
+ * skip is unchanged. */
+static void schedule_autoplay_retry(AppState *s, size_t index) {
+    Uint32 delay = autoplay_retry_delay_ms(s->autoplay_fail_streak);
+    size_t n;
+    if (delay == 0) { request_play(s, index); return; }
+    s->autoplay_retry_index = index;
+    s->autoplay_retry_at_ms = SDL_GetTicks() + delay;
+    if (!s->autoplay_retry_at_ms) s->autoplay_retry_at_ms = 1;  /* 0 is the "none" sentinel */
+    /* Keep the skip notice but say the retry is coming: without this the widget
+     * holds a stale "Skipped ..." for the whole wait and looks wedged. */
+    n = strlen(s->status);
+    snprintf(s->status + n, sizeof(s->status) - n, " Retrying in %us.",
+             (unsigned)((delay + 999u) / 1000u));
+    write_status(s);
+}
+
 /* Autoplay has cycled the playlist without a single track starting: stop rather
  * than keep hammering dead sources (locally this was a busy loop). */
 static void autoplay_halt_dead_playlist(AppState *s) {
     s->autoplay_advancing = 0;
     s->autoplay_fail_streak = 0;
+    s->autoplay_retry_at_ms = 0;
     s->immediate_pending = 0;
     s->pending_valid = 0;
     s->is_playing = 0;
@@ -2830,6 +2870,7 @@ static void stop_playback(AppState *s) {
     s->stream_eof = 0;
     s->track_ended = 0;
     s->autoplay_advancing = 0;
+    s->autoplay_retry_at_ms = 0;
     if (s->audio_device) {
         SDL_PauseAudioDevice(s->audio_device, 1);
         SDL_ClearQueuedAudio(s->audio_device);
@@ -4307,6 +4348,21 @@ int main(int argc, char **argv) {
         /* Keep SDL's audio queue refilled from the decoder's rolling window. */
         stream_audio(&state);
 
+        /* A backed-off autoplay retry has come due. Dropped rather than fired if
+         * autoplay was switched off while it waited -- the user turning it off
+         * means "stop advancing", pending timer included. */
+        if (state.autoplay_retry_at_ms && !state.immediate_pending && !state.pending_valid &&
+            (Sint32)(SDL_GetTicks() - state.autoplay_retry_at_ms) >= 0) {
+            size_t count = library_handler_track_count(state.play_lib);
+            size_t idx = state.autoplay_retry_index;
+            state.autoplay_retry_at_ms = 0;
+            if (state.autoplay && count > 0) {
+                if (idx >= count) idx = 0;   /* the playlist shrank during the wait */
+                state.autoplay_advancing = 1;
+                request_play(&state, idx);
+            }
+        }
+
         /* Fulfil an immediate track request as soon as its fetch is ready. */
         if (state.immediate_pending) {
             fetch_lock(&state);
@@ -4324,7 +4380,7 @@ int main(int argc, char **argv) {
                         autoplay_halt_dead_playlist(&state);
                     } else {
                         size_t nxt = take_next_index(&state, count, state.immediate_index, 0);
-                        request_play(&state, nxt);
+                        schedule_autoplay_retry(&state, nxt);
                     }
                 } else {
                     announce_fetch_failure(&state, state.play_lib, state.immediate_index, 0);
@@ -4376,7 +4432,7 @@ int main(int argc, char **argv) {
                         autoplay_halt_dead_playlist(&state);
                     } else {
                         size_t nxt = take_next_index(&state, count, idx, 0);
-                        request_play(&state, nxt);
+                        schedule_autoplay_retry(&state, nxt);
                     }
                 }
             }
