@@ -15,7 +15,12 @@ struct DecoderSource {
     sf_count_t frame;
     int opened_partial; /* opened before the transfer completed */
     int refreshed;      /* re-opened once the whole file was present */
+    int flac;           /* the stream is FLAC (see vio_get_filelen) */
 };
+
+/* Length reported for a FLAC stream whose transfer has not finished: far past
+ * any real track, so the download frontier is never mistaken for the end. */
+#define DECODER_UNKNOWN_LENGTH ((sf_count_t)1 << 40)
 
 static void set_error(char *error, size_t error_size, const char *format, ...) {
     va_list arguments;
@@ -23,12 +28,35 @@ static void set_error(char *error, size_t error_size, const char *format, ...) {
     va_start(arguments, format); vsnprintf(error, error_size, format, arguments); va_end(arguments);
 }
 
+long long decoder_flac_offset(StreamBuffer *buffer) {
+    unsigned char h[10];
+    unsigned long long at = 0;
+    /* An ID3v2 tag may precede the stream: 10-byte header, syncsafe size, and
+     * a 10-byte footer when flag 0x10 is set. */
+    if (stream_buffer_read_at(buffer, h, 10, 0) == 10 && !memcmp(h, "ID3", 3)) {
+        at = 10 + (((unsigned long long)(h[6] & 0x7f) << 21) | ((h[7] & 0x7f) << 14) |
+                   ((h[8] & 0x7f) << 7) | (h[9] & 0x7f));
+        if (h[5] & 0x10) at += 10;
+    }
+    if (stream_buffer_read_at(buffer, h, 4, at) != 4 || memcmp(h, "fLaC", 4)) return -1;
+    return (long long)at;
+}
+
+static int stream_is_flac(StreamBuffer *buffer) { return decoder_flac_offset(buffer) >= 0; }
+
 static sf_count_t vio_get_filelen(void *userdata) {
     DecoderSource *d = userdata;
-    /* The bytes present so far.  While still transferring this is short of the
-     * real length, but FLAC (the only format opened before completion) takes
-     * its sample count from STREAMINFO, not the file size, and a read past the
-     * frontier blocks in vio_read until the data arrives. */
+    /* libsndfile caches this at open, and its FLAC EOF test is `tell ==
+     * filelength`.  Handing it the bytes present so far therefore ended a
+     * partially downloaded FLAC at the prebuffer frontier: it reads in 8 KiB
+     * steps from offset 0, and the 1 MiB prebuffer (arriving in 64 KiB pipe
+     * reads) is usually a multiple of that, so playback stopped ~2.5s in on a
+     * 24/96 track.  FLAC takes its sample count from STREAMINFO, not the file
+     * size, and a read past the frontier blocks in vio_read until the data
+     * arrives, so report a length that cannot be reached until the transfer
+     * completes (decoder_refresh then re-opens on the true length).  Other
+     * formats are only opened complete; they get the real size. */
+    if (d->flac && !stream_buffer_is_complete(d->buffer)) return DECODER_UNKNOWN_LENGTH;
     return (sf_count_t)stream_buffer_size(d->buffer);
 }
 
@@ -99,6 +127,7 @@ int decoder_open(StreamBuffer *buffer, DecoderSource **src, char *error, size_t 
     d = calloc(1, sizeof(*d));
     if (!d) { set_error(error, error_size, "out of memory"); return -1; }
     d->buffer = buffer;
+    d->flac = stream_is_flac(buffer);
     d->file = sf_open_virtual(&io, SFM_READ, &d->info, d);
     if (!d->file) {
         if (stream_buffer_is_failed(buffer)) {

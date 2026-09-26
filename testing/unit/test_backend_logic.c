@@ -8,6 +8,7 @@
 #undef main
 
 #include <assert.h>
+#include <sndfile.h>
 
 static int failures = 0;
 static int checks = 0;
@@ -67,24 +68,24 @@ static void test_json_escape(void) {
     }
 }
 
-/* ------------------------------------------------------------- ssh_name_valid */
+/* ------------------------------------------------------------- valid_ssh_name */
 static void test_ssh_name_valid(void) {
-    CHECK(ssh_name_valid("user", 0) == 1);
-    CHECK(ssh_name_valid("user.name-1_2", 0) == 1);
-    CHECK(ssh_name_valid("192.168.1.10", 0) == 1);
-    CHECK(ssh_name_valid("", 0) == 0);
-    CHECK(ssh_name_valid("user name", 0) == 0);
-    CHECK(ssh_name_valid("user;rm -rf", 0) == 0);
-    CHECK(ssh_name_valid("$(whoami)", 0) == 0);
-    CHECK(ssh_name_valid("a/../b", 0) == 0);
-    CHECK(ssh_name_valid("host:22", 0) == 0);       /* colon rejected unless allowed */
-    CHECK(ssh_name_valid("host:22", 1) == 1);
-    CHECK(ssh_name_valid("a`id`b", 0) == 0);
-    CHECK(ssh_name_valid("a\nb", 0) == 0);
-    CHECK(ssh_name_valid("a b", 1) == 0);           /* space still rejected with colon allowed */
-    CHECK(ssh_name_valid("-flag", 0) == 1);         /* leading dash is allowed by the charset */
-    CHECK(ssh_name_valid("user@host", 0) == 0);     /* '@' not in the safe set */
-    CHECK(ssh_name_valid(NULL, 0) == 0);
+    CHECK(valid_ssh_name("user", 0) == 1);
+    CHECK(valid_ssh_name("user.name-1_2", 0) == 1);
+    CHECK(valid_ssh_name("192.168.1.10", 0) == 1);
+    CHECK(valid_ssh_name("", 0) == 0);
+    CHECK(valid_ssh_name("user name", 0) == 0);
+    CHECK(valid_ssh_name("user;rm -rf", 0) == 0);
+    CHECK(valid_ssh_name("$(whoami)", 0) == 0);
+    CHECK(valid_ssh_name("a/../b", 0) == 0);
+    CHECK(valid_ssh_name("host:22", 0) == 0);       /* colon rejected unless allowed */
+    CHECK(valid_ssh_name("host:22", 1) == 1);
+    CHECK(valid_ssh_name("a`id`b", 0) == 0);
+    CHECK(valid_ssh_name("a\nb", 0) == 0);
+    CHECK(valid_ssh_name("a b", 1) == 0);           /* space still rejected with colon allowed */
+    CHECK(valid_ssh_name("-flag", 0) == 1);         /* leading dash is allowed by the charset */
+    CHECK(valid_ssh_name("user@host", 0) == 0);     /* '@' not in the safe set */
+    CHECK(valid_ssh_name(NULL, 0) == 0);
 }
 
 /* ---------------------------------------------------------- shell_quote_words */
@@ -440,6 +441,159 @@ static void test_decoder(void) {
     CHECK(left == 2000);
     decoder_close(d);
     free(wav);
+}
+
+/* Encodes `frames` of stereo 44.1 kHz noise (so it barely compresses) as FLAC
+ * and returns the file bytes. */
+static unsigned char *make_flac(int frames, size_t *out_len) {
+    char path[] = "/tmp/leecher-flac-XXXXXX";
+    int fd = mkstemp(path);
+    SF_INFO info = { .samplerate = 44100, .channels = 2, .format = SF_FORMAT_FLAC | SF_FORMAT_PCM_16 };
+    SNDFILE *f;
+    short *pcm = malloc((size_t)frames * 2 * sizeof(short));
+    unsigned int seed = 12345;
+    unsigned char *bytes;
+    struct stat st;
+    FILE *in;
+    assert(fd >= 0 && pcm);
+    close(fd);
+    for (int i = 0; i < frames * 2; i++) { seed = seed * 1103515245u + 12345u; pcm[i] = (short)(seed >> 16); }
+    f = sf_open(path, SFM_WRITE, &info);
+    assert(f);
+    assert(sf_writef_short(f, pcm, frames) == frames);
+    sf_close(f);
+    free(pcm);
+    assert(stat(path, &st) == 0);
+    bytes = malloc((size_t)st.st_size);
+    in = fopen(path, "rb");
+    assert(bytes && in && fread(bytes, 1, (size_t)st.st_size, in) == (size_t)st.st_size);
+    fclose(in);
+    unlink(path);
+    *out_len = (size_t)st.st_size;
+    return bytes;
+}
+
+struct flac_tail { StreamBuffer *sb; const unsigned char *data; size_t len; };
+static void *flac_tail_feeder(void *arg) {
+    struct flac_tail *t = arg;
+    usleep(20000);                   /* let the decoder run up to the frontier */
+    stream_buffer_append(t->sb, t->data, t->len);
+    stream_buffer_set_complete(t->sb);
+    return NULL;
+}
+
+/* In-memory libsndfile virtual IO that records the offset reached by every
+ * read, to find where a decode's reads land. */
+struct mem_io {
+    const unsigned char *data; sf_count_t len, pos;
+    sf_count_t ends[4096]; size_t n_ends;
+};
+static sf_count_t mem_len(void *u) { return ((struct mem_io *)u)->len; }
+static sf_count_t mem_tell(void *u) { return ((struct mem_io *)u)->pos; }
+static sf_count_t mem_seek(sf_count_t off, int whence, void *u) {
+    struct mem_io *m = u;
+    m->pos = (whence == SEEK_SET ? 0 : whence == SEEK_CUR ? m->pos : m->len) + off;
+    return m->pos;
+}
+static sf_count_t mem_read(void *ptr, sf_count_t count, void *u) {
+    struct mem_io *m = u;
+    if (count > m->len - m->pos) count = m->len - m->pos;
+    if (count < 0) count = 0;
+    memcpy(ptr, m->data + m->pos, (size_t)count);
+    m->pos += count;
+    if (m->n_ends < sizeof(m->ends) / sizeof(m->ends[0])) m->ends[m->n_ends++] = m->pos;
+    return count;
+}
+
+/* A FLAC opened from a partial download must play to the end.  libsndfile's
+ * FLAC EOF test is `tell == filelength`, so reporting the bytes-so-far as the
+ * length ended playback whenever a read landed exactly on the frontier --
+ * which the real 1 MiB prebuffer did on some tracks, since libFLAC reads in
+ * 8 KiB steps.  Recreate that exactly: find where a full decode's reads land,
+ * cut the "download" at one of those offsets, and require every frame. */
+static void test_decoder_partial_flac(void) {
+    const int frames = 44100 * 4;
+    size_t len, prefix = 0;
+    unsigned char *flac = make_flac(frames, &len);
+    struct mem_io *m = calloc(1, sizeof(*m));
+    SF_VIRTUAL_IO io = { mem_len, mem_seek, mem_read, NULL, mem_tell };
+    SF_INFO info = {0};
+    SNDFILE *f;
+    short out[4096 * 2];
+    assert(m);
+    m->data = flac; m->len = (sf_count_t)len;
+    f = sf_open_virtual(&io, SFM_READ, &info, m);
+    CHECK(f != NULL);
+    if (f) {
+        size_t opened = m->n_ends;
+        while (sf_readf_short(f, out, 4096) > 0) {}
+        sf_close(f);
+        /* A read boundary a little into the audio, past the header. */
+        for (size_t i = opened; i < m->n_ends && !prefix; i++)
+            if (m->ends[i] >= 16384 && (size_t)m->ends[i] < len / 2) prefix = (size_t)m->ends[i];
+    }
+    free(m);
+    CHECK(prefix > 0);
+    if (prefix) {
+        StreamBuffer *sb = stream_buffer_create(0);
+        DecoderSource *d = NULL;
+        char err[256] = {0};
+        long long n, total = 0;
+        struct flac_tail tail = { sb, flac + prefix, len - prefix };
+        pthread_t th;
+
+        stream_buffer_append(sb, flac, prefix);
+        CHECK(decoder_flac_offset(sb) == 0);
+        CHECK(decoder_open(sb, &d, err, sizeof(err)) == 1);
+        if (d) {
+            CHECK(decoder_total_frames(d) == frames);
+            CHECK(pthread_create(&th, NULL, flac_tail_feeder, &tail) == 0);
+            while ((n = decoder_read_frames(d, out, 4096)) > 0) total += n;
+            pthread_join(th, NULL);
+            CHECK(total == frames);          /* was: stopped at the prefix */
+            decoder_close(d);
+        } else {
+            stream_buffer_destroy(sb);
+        }
+    }
+    free(flac);
+}
+
+/* Embedded art comes straight out of the FLAC metadata blocks, front cover
+ * preferred over an earlier picture of another type. */
+static void test_flac_stream_cover(void) {
+    static const unsigned char other[] = "OTHER-ART", front[] = "FRONT-ART";
+    unsigned char buf[512], *p = buf;
+    char dir[] = "/tmp/leecher-cover-XXXXXX", got[64] = {0};
+    StreamBuffer *sb = stream_buffer_create(0);
+    FILE *f;
+    assert(mkdtemp(dir));
+    snprintf(cover_file, sizeof(cover_file), "%s/cover.jpg", dir);
+
+    memcpy(p, "fLaC", 4); p += 4;
+    *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 34;            /* STREAMINFO, not last */
+    memset(p, 0, 34); p += 34;
+    for (int pic = 0; pic < 2; pic++) {
+        const unsigned char *data = pic ? front : other;
+        size_t dlen = 9, blen = 4 + 4 + 10 + 4 + 0 + 16 + 4 + dlen;
+        *p++ = (unsigned char)(6 | (pic ? 0x80 : 0));   /* PICTURE; the second is last */
+        *p++ = 0; *p++ = 0; *p++ = (unsigned char)blen;
+        *p++ = 0; *p++ = 0; *p++ = 0; *p++ = (unsigned char)(pic ? 3 : 4);
+        *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 10; memcpy(p, "image/jpeg", 10); p += 10;
+        memset(p, 0, 4 + 16); p += 4 + 16;              /* empty description, w/h/depth/colors */
+        *p++ = 0; *p++ = 0; *p++ = 0; *p++ = (unsigned char)dlen;
+        memcpy(p, data, dlen); p += dlen;
+    }
+    stream_buffer_append(sb, buf, (size_t)(p - buf));
+    stream_buffer_set_complete(sb);
+    CHECK(flac_stream_cover(sb, 0) == 1);
+    f = fopen(cover_file, "rb");
+    CHECK(f && fread(got, 1, sizeof(got) - 1, f) == 9);
+    if (f) fclose(f);
+    CHECK_STR(got, "FRONT-ART");
+    unlink(cover_file);
+    rmdir(dir);
+    stream_buffer_destroy(sb);
 }
 
 /* ------------------------------------------------------------- resume state */
@@ -1121,7 +1275,7 @@ static void test_cover_job_survives_remove(void) {
 int main(void) {
     struct { const char *name; void (*fn)(void); } tests[] = {
         { "json_escape",         test_json_escape },
-        { "ssh_name_valid",      test_ssh_name_valid },
+        { "valid_ssh_name",      test_ssh_name_valid },
         { "shell_quote_words",   test_shell_quote_words },
         { "control_decode",      test_control_decode },
         { "next_autoplay_index", test_next_autoplay_index },
@@ -1133,6 +1287,8 @@ int main(void) {
         { "next_encoded_token",  test_next_encoded_token },
         { "stream_buffer",       test_stream_buffer },
         { "decoder",             test_decoder },
+        { "decoder_partial_flac", test_decoder_partial_flac },
+        { "flac_stream_cover",   test_flac_stream_cover },
         { "library_handler",     test_library_handler },
         { "library_json_edge_cases", test_library_json_edge_cases },
         { "write_resume",        test_write_resume },

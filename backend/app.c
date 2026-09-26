@@ -23,6 +23,7 @@
 #include <limits.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,9 +47,9 @@ typedef int (*MusicRipperRemoteFn)(const LibrarySource *source, MusicRipperWrite
 
 typedef enum { SOURCE_LOCAL, SOURCE_SSH, SOURCE_HTTPS, SOURCE_NETWORK } SourceMethod;
 
-/* How much of a remote file to pull when looking for embedded art. Cover art
- * sits in the header metadata, so this is generously past it while keeping the
- * transfer to a couple of seconds instead of the whole track. */
+/* How much of a non-FLAC track to hand ffmpeg when looking for embedded art.
+ * Cover art sits in the header metadata (ID3v2 APIC, MP4 covr near the front
+ * of a faststart file), so this is generously past it. */
 #define COVER_PREFIX_BYTES 4000000
 
 /* One hit from the cover-art search (iTunes Search API: anonymous, no key). */
@@ -1679,17 +1680,6 @@ static char *shell_quote_words(const char *value) {
     return out;
 }
 
-/* Accepts only safe SSH username/IP characters (prevents shell injection). */
-static int ssh_name_valid(const char *value, int allow_colon) {
-    const unsigned char *p = (const unsigned char *)value;
-    if (!p || !*p) return 0;
-    for (; *p; p++) {
-        if (!isalnum(*p) && *p != '.' && *p != '-' && *p != '_' &&
-            !(allow_colon && *p == ':')) return 0;
-    }
-    return 1;
-}
-
 /* Runs `cmd` via /bin/sh -c in its own process group, bounded by timeout_ms.
  * Returns the child's exit status (or -1 on setup failure / timeout / cancel).
  * The process group kill on timeout ensures any grandchildren (ssh, ffmpeg,
@@ -1752,70 +1742,103 @@ static void run_ffmpeg_cover(const char *input, char *out, size_t out_size, int 
         snprintf(out, out_size, "%s", cover_file);
 }
 
-/* Extracts embedded album art from any supported source kind into the per-user
- * cover file using ffmpeg, and writes its path into `out` (cleared when there
- * is no embedded art). Local files and HTTPS URLs are passed straight to
- * ffmpeg; SSH/network files are streamed over ssh to ffmpeg's stdin so only
- * the tiny cover frame is transferred, not the whole track.  `cancel` (may be
- * NULL) is polled so a long ffmpeg/ssh run aborts promptly when a fetch is
- * cancelled, instead of stalling the worker (and the main loop that joins it)
- * for the full timeout. */
-static void extract_source_cover(const LibrarySource *source, char *out, size_t out_size,
+/* Writes `size` bytes to `path` (0600, truncating). Returns 1 on success. */
+static int write_whole_file(const char *path, const unsigned char *data, size_t size) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int ok;
+    if (fd < 0) return 0;
+    ok = 1;
+    while (ok && size) {
+        ssize_t n = write(fd, data, size);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) ok = 0;
+        else { data += n; size -= (size_t)n; }
+    }
+    if (close(fd) != 0) ok = 0;
+    return ok;
+}
+
+/* Reads a big-endian 32-bit value. */
+static uint32_t be32(const unsigned char *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+/* Pulls the embedded picture straight out of a FLAC stream's metadata blocks
+ * into the cover scratch file, preferring the front cover. Needs only the
+ * metadata (tens of KB), which arrives long before the playback prebuffer.
+ * Returns 1 when a picture was written. */
+static int flac_stream_cover(StreamBuffer *sb, long long flac_at) {
+    unsigned long long pos = (unsigned long long)flac_at + 4;
+    int written = 0;
+    for (int guard = 0; guard < 1024; guard++) {
+        unsigned char h[4];
+        if (stream_buffer_read_at(sb, h, 4, pos) != 4) break;
+        int last = h[0] & 0x80, type = h[0] & 0x7f;
+        size_t len = ((size_t)h[1] << 16) | ((size_t)h[2] << 8) | h[3];
+        pos += 4;
+        if (type == 6 && len >= 32) {   /* PICTURE */
+            unsigned char *b = malloc(len);
+            if (b && stream_buffer_read_at(sb, b, len, pos) == (long long)len) {
+                uint32_t kind = be32(b);
+                size_t at = 4, mime = be32(b + at), desc, data;
+                at += 4 + mime;
+                if (at + 4 <= len) {
+                    desc = be32(b + at);
+                    at += 4 + desc + 16;          /* description, then w/h/depth/colors */
+                    if (desc < len && at + 4 <= len) {
+                        data = be32(b + at);
+                        at += 4;
+                        if (data && data <= len - at && (!written || kind == 3) &&
+                            write_whole_file(cover_file, b + at, data))
+                            written = kind == 3 ? 2 : 1;
+                    }
+                }
+            }
+            free(b);
+            if (written == 2) break;              /* the front cover: done */
+        }
+        pos += len;
+        if (last) break;
+    }
+    return written != 0;
+}
+
+/* Extracts embedded album art from the track's own transfer (`sb`) into the
+ * per-user cover file, writing its path into `out` (cleared when there is no
+ * embedded art). This reuses the bytes already on their way for playback:
+ * the old path opened a second ssh (a fresh handshake when no master was up)
+ * and pulled a separate 4 MB prefix *before* the audio transfer started,
+ * which on a relayed link held every remote track back 2-3 seconds. FLAC is
+ * parsed directly from its metadata; anything else waits for a bounded
+ * prefix -- those formats wait for the whole file before decoding anyway --
+ * and hands it to ffmpeg locally. */
+static void extract_stream_cover(StreamBuffer *sb, char *out, size_t out_size,
                                  const atomic_int *cancel) {
+    struct stat st;
+    long long flac_at, have;
+    char probe[IPC_PATH_MAX + 16], *qprobe;
+    unsigned char *prefix;
     out[0] = '\0';
-    if (!source) return;
-    switch (source->kind) {
-    case LIBRARY_SOURCE_LOCAL: {
-        if (!source->path || !source->path[0]) return;
-        char *q = shell_quote_words(source->path);
-        if (q) { run_ffmpeg_cover(q, out, out_size, 10000, cancel); free(q); }
-        break;
+    unlink(cover_file);
+    flac_at = decoder_flac_offset(sb);
+    if (flac_at >= 0) {
+        if (flac_stream_cover(sb, flac_at)) snprintf(out, out_size, "%s", cover_file);
+        return;
     }
-    case LIBRARY_SOURCE_HTTPS: {
-        if (!source->url || strncasecmp(source->url, "https://", 8) != 0) return;
-        char *q = shell_quote_words(source->url);
-        if (q) { run_ffmpeg_cover(q, out, out_size, 15000, cancel); free(q); }
-        break;
+    have = stream_buffer_wait_prebuffer(sb, COVER_PREFIX_BYTES);
+    if (have <= 0 || (cancel && atomic_load_explicit(cancel, memory_order_relaxed))) return;
+    if (have > COVER_PREFIX_BYTES) have = COVER_PREFIX_BYTES;
+    prefix = malloc((size_t)have);
+    if (!prefix) return;
+    ipc_path(probe, sizeof(probe), "cover-probe.bin");
+    if (stream_buffer_read_at(sb, prefix, (size_t)have, 0) == have &&
+        write_whole_file(probe, prefix, (size_t)have) && (qprobe = shell_quote_words(probe)) != NULL) {
+        run_ffmpeg_cover(qprobe, out, out_size, 10000, cancel);
+        free(qprobe);
     }
-    case LIBRARY_SOURCE_SSH:
-    case LIBRARY_SOURCE_NETWORK: {
-        if (!source->path || !source->path[0]) return;
-        if (!source->username || !source->username[0]) return;
-        if (!source->ip || !source->ip[0]) return;
-        if (!ssh_name_valid(source->username, 0) || !ssh_name_valid(source->ip, 1)) return;
-        char *qpath = shell_quote_words(source->path);
-        if (!qpath) return;
-        /* Read only the head of the remote file, not all of it: cover art lives
-         * in the metadata before the audio (FLAC PICTURE block, ID3v2 APIC), so
-         * a bounded prefix carries it. `cat` of a 94 MB FLAC took over 30s and
-         * never finished inside the timeout below, which is why remote tracks
-         * never showed embedded art; a 4 MB prefix takes ~2.5s and yields the
-         * byte-identical image. */
-        char *remote_cmd = malloc(strlen("head -c 4000000 -- ") + strlen(qpath) + 1);
-        if (!remote_cmd) { free(qpath); return; }
-        sprintf(remote_cmd, "head -c %d -- %s", COVER_PREFIX_BYTES, qpath);
-        free(qpath);
-        char *qcmd = shell_quote_words(remote_cmd);
-        free(remote_cmd);
-        if (!qcmd) return;
-        char command[3600];
-        char *qcover = shell_quote_words(cover_file);
-        if (!qcover) { free(qcmd); return; }
-        int wrote = snprintf(command, sizeof(command),
-                     "ssh -F /dev/null" SSH_HARDENING_OPTS_STR "%s -- %s@%s %s 2>/dev/null | ffmpeg -v error -y -i - -an -map 0:v:0 -c:v copy -frames:v 1 %s 2>/dev/null",
-                     ssh_opts_str(), source->username, source->ip, qcmd, qcover);
-        free(qcmd);
-        free(qcover);
-        if (wrote >= (int)sizeof(command))
-            return;
-        struct stat st;
-        if (run_command_timeout(command, 20000, cancel) == 0 && stat(cover_file, &st) == 0 && st.st_size > 0)
-            snprintf(out, out_size, "%s", cover_file);
-        break;
-    }
-    default:
-        break;
-    }
+    free(prefix);
+    unlink(probe);
+    if (out[0] && (stat(cover_file, &st) != 0 || st.st_size == 0)) out[0] = '\0';
 }
 
 /* ---- User-chosen cover art --------------------------------------------- */
@@ -2165,25 +2188,8 @@ static void *fetch_worker(void *arg) {
         /* A cover the user chose beats whatever is embedded in the audio, and
          * is referenced where it already lives: it belongs to the library
          * directory and must outlive this (and every later) playback. */
-        if (track.cover && track.cover[0] && access(track.cover, R_OK) == 0) {
+        if (track.cover && track.cover[0] && access(track.cover, R_OK) == 0)
             snprintf(save_cover, sizeof(save_cover), "%s", track.cover);
-        } else {
-        for (size_t ci = 0; ci < track.source_count && save_cover[0] == '\0'; ci++) {
-            extract_source_cover(&track.sources[ci], save_cover, sizeof(save_cover), &s->fetch_cancel);
-        }
-        if (save_cover[0]) {
-            char unique[420];
-            const char *const dir = ipc_dir;
-            /* Drop prior covers: the directory stays at one committed cover,
-             * and the file name gains a fresh nonce so a later track that
-             * shares this index cannot alias (and show stale art for) it. */
-            remove_cover_files();
-            unsigned long nonce = ++cover_nonce;
-            snprintf(unique, sizeof(unique), "%s/cover-%zu-%lu.jpg", dir, job->index, nonce);
-            rename(save_cover, unique);
-            snprintf(save_cover, sizeof(save_cover), "%s", unique);
-        }
-        }
         const LibrarySource *chosen = NULL;
         for (size_t ci = 0; ci < track.source_count; ci++) {
             if (source_usable(&track.sources[ci])) { chosen = &track.sources[ci]; break; }
@@ -2215,6 +2221,24 @@ static void *fetch_worker(void *arg) {
             }
         }
         library_handler_track_destroy(&track);
+    }
+
+    /* Embedded art comes out of the transfer already under way (see
+     * extract_stream_cover), so it no longer delays the audio. */
+    if (published && !s->fetch_cancel && !save_cover[0]) {
+        extract_stream_cover(job->sb, save_cover, sizeof(save_cover), &s->fetch_cancel);
+        if (save_cover[0]) {
+            char unique[420];
+            const char *const dir = ipc_dir;
+            /* Drop prior covers: the directory stays at one committed cover,
+             * and the file name gains a fresh nonce so a later track that
+             * shares this index cannot alias (and show stale art for) it. */
+            remove_cover_files();
+            unsigned long nonce = ++cover_nonce;
+            snprintf(unique, sizeof(unique), "%s/cover-%zu-%lu.jpg", dir, job->index, nonce);
+            rename(save_cover, unique);
+            snprintf(save_cover, sizeof(save_cover), "%s", unique);
+        }
     }
 
     if (published && !s->fetch_cancel) {

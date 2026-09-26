@@ -23,6 +23,10 @@ typedef long long DecoderFrameCount;
  * has been joined before closing. */
 int decoder_open(StreamBuffer *buffer, DecoderSource **src, char *error, size_t error_size);
 
+/* Byte offset of the "fLaC" marker in `buffer` (past any leading ID3v2 tag),
+ * or -1 when the stream is not FLAC.  Blocks until those header bytes arrive. */
+long long decoder_flac_offset(StreamBuffer *buffer);
+
 /* Reads up to `frame_count` interleaved frames into `out`.  Returns the number
  * of frames read (0 at end of stream), or -1 on error. */
 long long decoder_read_frames(DecoderSource *src, short *out, long long frame_count);

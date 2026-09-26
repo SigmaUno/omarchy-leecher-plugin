@@ -2,14 +2,21 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* ControlPersist keeps the master alive this many seconds after the last
- * channel closes, so back-to-back tracks from one host reuse it. */
-#define SSH_CONTROL_PERSIST "30"
+ * channel closes, so back-to-back tracks from one host reuse it.  A track's
+ * transfer finishes well before the track does, so this has to outlast the
+ * rest of a long track: at 30s the master was always gone by the next one,
+ * which then paid a full TCP + key exchange + auth (~1s over a relayed
+ * Tailscale link) before its first byte.  ssh_opts_cleanup() closes the
+ * masters at shutdown, so a long persist does not leave them behind. */
+#define SSH_CONTROL_PERSIST "600"
 
 static char control_dir[256];
 static char control_path_opt[320];   /* "ControlPath=<dir>/cm-%C" */
@@ -53,6 +60,22 @@ const char *ssh_opts_str(void) {
     return enabled ? opts_string : "";
 }
 
+/* Ask the master behind control socket `path` to exit.  Unlinking the socket
+ * alone would leave the master running until ControlPersist ran out. */
+static void stop_master(const char *path) {
+    char opt[600];
+    pid_t pid;
+    if (snprintf(opt, sizeof(opt), "ControlPath=%s", path) >= (int)sizeof(opt)) return;
+    pid = fork();
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) { dup2(devnull, STDIN_FILENO); dup2(devnull, STDOUT_FILENO); dup2(devnull, STDERR_FILENO); }
+        execlp("ssh", "ssh", "-F", "/dev/null", "-o", opt, "-O", "exit", "leecher-master", (char *)NULL);
+        _exit(127);
+    }
+    if (pid > 0) waitpid(pid, NULL, 0);
+}
+
 void ssh_opts_cleanup(void) {
     DIR *d;
     struct dirent *ent;
@@ -62,8 +85,10 @@ void ssh_opts_cleanup(void) {
         while ((ent = readdir(d))) {
             char path[512];
             if (ent->d_name[0] == '.') continue;
-            if (snprintf(path, sizeof(path), "%s/%s", control_dir, ent->d_name) < (int)sizeof(path))
+            if (snprintf(path, sizeof(path), "%s/%s", control_dir, ent->d_name) < (int)sizeof(path)) {
+                stop_master(path);
                 unlink(path);
+            }
         }
         closedir(d);
     }
