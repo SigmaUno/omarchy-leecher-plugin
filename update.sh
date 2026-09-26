@@ -1,51 +1,82 @@
 #!/bin/sh
 set -eu
 
-# Update an installed Leecher plugin to the latest main.
+# Update an installed Leecher plugin to one exact, reviewed commit.
 #
 # Editing this checkout does not change the running plugin: the backend runs
 # from a copy in $XDG_DATA_HOME/leecher-media, and the widget is a copy under
 # $XDG_CONFIG_HOME/omarchy/plugins/<plugin id>/. This script closes that gap --
-# it pulls main, rebuilds and reinstalls the backend (install-backend.sh), then
-# redeploys the widget, which install-backend.sh does not do.
+# it checks out the requested commit, rebuilds and reinstalls the backend
+# (install-backend.sh), then redeploys the widget, which install-backend.sh
+# does not do.
 #
-# Usage: sh update.sh [--no-pull] [--no-restart]
+# Usage: sh update.sh --rev <40-character commit SHA> [--no-restart]
+#        sh update.sh --no-pull [--no-restart]
+#   --rev SHA     fetch that exact commit, verify it is on the remote's main,
+#                 and deploy it from a detached checkout
 #   --no-pull     deploy the working tree as-is, without touching git
 #   --no-restart  do not restart the omarchy shell (the widget then keeps
 #                 running the old QML until the shell is next restarted)
+#
+# There is deliberately no "update to the latest main": the installer builds
+# and runs whatever it is handed, so a moving branch would execute code nobody
+# pinned. Pick the commit you mean to run (e.g. the one a review approved).
 
 do_pull=1
 do_restart=1
+rev=
+want_rev=0
 for argument in "$@"; do
+    if [ "$want_rev" -eq 1 ]; then rev=$argument; want_rev=0; continue; fi
     case $argument in
+        --rev) want_rev=1 ;;
+        --rev=*) rev=${argument#--rev=} ;;
         --no-pull) do_pull=0 ;;
         --no-restart) do_restart=0 ;;
-        -h|--help) sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) printf 'Unknown option: %s\n' "$argument" >&2; exit 64 ;;
     esac
 done
+if [ "$want_rev" -eq 1 ]; then
+    printf -- '--rev needs a commit SHA.\n' >&2
+    exit 64
+fi
+if [ "$do_pull" -eq 0 ] && [ -n "$rev" ]; then
+    printf -- '--rev and --no-pull are mutually exclusive.\n' >&2
+    exit 64
+fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
 cd "$script_dir"
 
-# ---- pull main ------------------------------------------------------------
+# ---- check out the pinned commit ------------------------------------------
 if [ "$do_pull" -eq 1 ]; then
-    command -v git >/dev/null 2>&1 || { printf 'git is required to pull.\n' >&2; exit 1; }
+    if [ -z "$rev" ]; then
+        printf 'Refusing to update without a pinned commit.\n' >&2
+        printf 'Re-run with --rev <full 40-character SHA>, or --no-pull to deploy this checkout as-is.\n' >&2
+        exit 64
+    fi
+    # Exactly 40 hex digits: an abbreviated SHA, a branch or a tag could each
+    # resolve to something other than what was reviewed.
+    rev=$(printf '%s' "$rev" | tr 'A-F' 'a-f')
+    case $rev in
+        *[!0-9a-f]*|'') printf 'Not a full commit SHA: %s\n' "$rev" >&2; exit 64 ;;
+    esac
+    if [ "${#rev}" -ne 40 ]; then
+        printf 'Not a full 40-character commit SHA: %s\n' "$rev" >&2
+        exit 64
+    fi
+
+    command -v git >/dev/null 2>&1 || { printf 'git is required to update.\n' >&2; exit 1; }
     git rev-parse --git-dir >/dev/null 2>&1 || {
         printf '%s is not a git checkout; use --no-pull.\n' "$script_dir" >&2
         exit 1
     }
     if [ -n "$(git status --porcelain)" ]; then
-        printf 'Refusing to pull: the checkout has uncommitted changes.\n' >&2
+        printf 'Refusing to update: the checkout has uncommitted changes.\n' >&2
         printf 'Commit or stash them, or re-run with --no-pull.\n' >&2
         exit 1
-    fi
-
-    branch=$(git rev-parse --abbrev-ref HEAD)
-    if [ "$branch" != "main" ]; then
-        printf 'Switching from %s to main (tree is clean, so nothing is lost).\n' "$branch"
-        git checkout main
     fi
 
     # main may have no upstream configured, and the remote is not necessarily
@@ -63,8 +94,29 @@ if [ "$do_pull" -eq 1 ]; then
         fi
     fi
 
-    printf 'Pulling main from %s...\n' "$remote"
-    git pull --ff-only "$remote" main
+    printf 'Fetching main from %s...\n' "$remote"
+    git fetch --no-tags "$remote" "+refs/heads/main:refs/remotes/$remote/main"
+    if ! git cat-file -e "$rev^{commit}" 2>/dev/null; then
+        git fetch --no-tags "$remote" "$rev" 2>/dev/null || true
+    fi
+    if [ "$(git cat-file -t "$rev" 2>/dev/null)" != commit ]; then
+        printf 'Commit %s was not found on %s.\n' "$rev" "$remote" >&2
+        exit 1
+    fi
+    # A host can serve a commit by SHA that no branch of this repository holds
+    # (GitHub does, for commits pushed to forks), so require it on main.
+    if ! git merge-base --is-ancestor "$rev" "refs/remotes/$remote/main"; then
+        printf 'Commit %s is not on %s/main; refusing to deploy it.\n' "$rev" "$remote" >&2
+        exit 1
+    fi
+
+    printf 'Checking out %s (detached)...\n' "$rev"
+    git -c advice.detachedHead=false checkout --quiet --detach "$rev"
+    head=$(git rev-parse HEAD)
+    if [ "$head" != "$rev" ] || [ -n "$(git status --porcelain)" ]; then
+        printf 'Checkout did not land cleanly on %s (HEAD is %s).\n' "$rev" "$head" >&2
+        exit 1
+    fi
 fi
 
 # ---- backend --------------------------------------------------------------
@@ -115,4 +167,8 @@ if command -v systemctl >/dev/null 2>&1; then
         exit 1
     fi
 fi
-printf 'Leecher is up to date.\n'
+if [ "$do_pull" -eq 1 ]; then
+    printf 'Leecher is running commit %s.\n' "$rev"
+else
+    printf 'Leecher is running this working tree.\n'
+fi

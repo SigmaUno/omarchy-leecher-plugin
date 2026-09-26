@@ -42,17 +42,22 @@ require `sudo`.
 ## Update
 
 ```sh
-./update.sh
+./update.sh --rev <full 40-character commit SHA>
 ```
 
-Pulls `main`, rebuilds and reinstalls the backend, redeploys the widget, and
-restarts the shell so the new QML is loaded. Editing this checkout on its own
-changes nothing about the running plugin: the backend runs from a copy in
-`$XDG_DATA_HOME/leecher-media` and the widget from a copy in
-`$XDG_CONFIG_HOME/omarchy/plugins/leecher.media/`.
+Fetches that exact commit, checks that it is on the remote's `main`, checks it
+out detached, then rebuilds and reinstalls the backend, redeploys the widget,
+and restarts the shell so the new QML is loaded. The installer builds and runs
+what it is given, so there is deliberately no "latest `main`" mode: pass the
+commit you reviewed. Abbreviated SHAs, branch names and tags are refused.
 
-Pass `--no-pull` to deploy the working tree as-is, or `--no-restart` to leave
-the shell running. The pull is refused if the checkout has uncommitted changes.
+Editing this checkout on its own changes nothing about the running plugin: the
+backend runs from a copy in `$XDG_DATA_HOME/leecher-media` and the widget from
+a copy in `$XDG_CONFIG_HOME/omarchy/plugins/leecher.media/`.
+
+Pass `--no-pull` (instead of `--rev`) to deploy the working tree as-is, or
+`--no-restart` to leave the shell running. `--rev` is refused if the checkout
+has uncommitted changes.
 
 ## Use
 
