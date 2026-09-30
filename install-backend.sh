@@ -32,11 +32,14 @@ fi
 # Build in a private scratch copy, never in the checkout. backend/app and
 # backend/library-handler are git-ignored, so a stale or planted binary there
 # keeps `git status` clean and (with a newer mtime) makes make skip compiling
-# it. The scratch copy holds source files only and is built with `make -B`, so
+# it. (backend/library/ is runtime playlist data the backend writes when run
+# from the checkout; it is never a build input and is not copied.) The scratch
+# copy holds source files only and is built with `make -B`, so
 # every installed binary is compiled here from the sources that were checked.
 if git -C "$script_dir" rev-parse --git-dir >/dev/null 2>&1; then
     stray=$(git -C "$script_dir" ls-files --others --ignored --exclude-standard -- backend \
-        | grep -v -x -e backend/app -e backend/library-handler || true)
+        | grep -v -x -e backend/app -e backend/library-handler \
+        | grep -v '^backend/library/' || true)
     if [ -n "$stray" ]; then
         printf 'Refusing to build: unexpected ignored files under backend/:\n%s\n' "$stray" >&2
         exit 1
@@ -44,7 +47,7 @@ if git -C "$script_dir" rev-parse --git-dir >/dev/null 2>&1; then
 fi
 build_dir=$(mktemp -d "${TMPDIR:-/tmp}/leecher-build.XXXXXXXX")
 trap 'rm -rf "$build_dir"' EXIT HUP INT TERM
-(cd "$script_dir/backend" && tar -cf - --exclude=./app --exclude=./library-handler .) \
+(cd "$script_dir/backend" && tar -cf - --exclude=./app --exclude=./library-handler --exclude=./library .) \
     | tar -xf - -C "$build_dir"
 rm -f "$build_dir/app" "$build_dir/library-handler"
 
