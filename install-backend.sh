@@ -29,13 +29,34 @@ if ! pkg-config --exists sdl2 sndfile; then
     exit 1
 fi
 
+# Build in a private scratch copy, never in the checkout. backend/app and
+# backend/library-handler are git-ignored, so a stale or planted binary there
+# keeps `git status` clean and (with a newer mtime) makes make skip compiling
+# it. The scratch copy holds source files only and is built with `make -B`, so
+# every installed binary is compiled here from the sources that were checked.
+if git -C "$script_dir" rev-parse --git-dir >/dev/null 2>&1; then
+    stray=$(git -C "$script_dir" ls-files --others --ignored --exclude-standard -- backend \
+        | grep -v -x -e backend/app -e backend/library-handler || true)
+    if [ -n "$stray" ]; then
+        printf 'Refusing to build: unexpected ignored files under backend/:\n%s\n' "$stray" >&2
+        exit 1
+    fi
+fi
+build_dir=$(mktemp -d "${TMPDIR:-/tmp}/leecher-build.XXXXXXXX")
+trap 'rm -rf "$build_dir"' EXIT HUP INT TERM
+(cd "$script_dir/backend" && tar -cf - --exclude=./app --exclude=./library-handler .) \
+    | tar -xf - -C "$build_dir"
+rm -f "$build_dir/app" "$build_dir/library-handler"
+
 printf '%s\n' 'Building Leecher backend...'
-make -C "$script_dir/backend" app library-handler
+make -B -C "$build_dir" app library-handler
 
 printf 'Installing backend to %s\n' "$install_dir"
 install -d "$install_dir" "$unit_dir"
-install -m 0755 "$script_dir/backend/app" "$install_dir/app"
-install -m 0755 "$script_dir/backend/library-handler" "$install_dir/library-handler"
+install -m 0755 "$build_dir/app" "$install_dir/app"
+install -m 0755 "$build_dir/library-handler" "$install_dir/library-handler"
+rm -rf "$build_dir"
+trap - EXIT HUP INT TERM
 if [ ! -f "$install_dir/library.json" ]; then
     install -m 0644 "$script_dir/backend/library.example.json" "$install_dir/library.json"
     printf 'Created an empty library at %s/library.json\n' "$install_dir"

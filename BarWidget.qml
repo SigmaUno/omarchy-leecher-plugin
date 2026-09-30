@@ -313,6 +313,7 @@ BarWidget {
                     : "transparent"
         }
         Text {
+            textFormat: Text.PlainText
             anchors.centerIn: parent
             text: seg.glyph
             color: seg.active ? Color.accent : seg.idle
@@ -1028,6 +1029,7 @@ BarWidget {
             height: parent.height
 
             Text {
+                textFormat: Text.PlainText
                 id: glyph
                 anchors.centerIn: parent
                 text: root.closed ? "\uf05e" : (root.hasTrack ? root.playIcon : "\uf001")
@@ -1172,6 +1174,7 @@ BarWidget {
                     }
 
                     Text {
+                        textFormat: Text.PlainText
                         id: titleMore
                         visible: titleText.truncated || root.titleExpanded
                         text: root.titleExpanded ? "[see less]" : "[see more]"
@@ -1422,6 +1425,7 @@ BarWidget {
                 spacing: Style.space(8)
 
                 Text {
+                    textFormat: Text.PlainText
                     text: root.fmt(slider.dragging ? slider.liveValue : root.positionMs)
                     color: root.bar.foreground
                     font.family: root.bar.fontFamily
@@ -1453,6 +1457,7 @@ BarWidget {
                 }
 
                 Text {
+                    textFormat: Text.PlainText
                     text: root.fmt(root.durationMs)
                     color: Qt.darker(root.bar.foreground, 1.3)
                     font.family: root.bar.fontFamily
@@ -1676,6 +1681,7 @@ BarWidget {
                         }
 
                         Text {
+                            textFormat: Text.PlainText
                             text: (root.muted ? 0 : root.volume) + "%"
                             color: Qt.darker(root.bar.foreground, 1.3)
                             font.family: root.bar.fontFamily
@@ -1698,6 +1704,7 @@ BarWidget {
                          * to the default. */
 
                         Text {
+                            textFormat: Text.PlainText
                             text: root.outputDevices.length > 0
                                 ? "Output"
                                 : "Output — no devices detected, using system default"
@@ -1792,6 +1799,7 @@ BarWidget {
                         height: Math.max(playlistLabel.implicitHeight, Style.space(24))
 
                         Text {
+                            textFormat: Text.PlainText
                             id: playlistLabel
                             anchors.left: parent.left
                             anchors.verticalCenter: parent.verticalCenter
@@ -1822,6 +1830,7 @@ BarWidget {
                             border.color: Color.accent
 
                             Text {
+                                textFormat: Text.PlainText
                                 id: addPlusText
                                 anchors.centerIn: parent
                                 visible: !root.addingPlaylist
@@ -2021,6 +2030,7 @@ BarWidget {
                             spacing: Style.space(6)
 
                             Text {
+                                textFormat: Text.PlainText
                                 text: "Edit track info"
                                 color: root.bar.foreground
                                 font.family: root.bar.fontFamily
@@ -2031,6 +2041,7 @@ BarWidget {
                                 width: parent.width
                                 spacing: Style.space(4)
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: "Title"
                                     color: Qt.darker(root.bar.foreground, 1.3)
                                     font.family: root.bar.fontFamily
@@ -2048,6 +2059,7 @@ BarWidget {
                                 width: parent.width
                                 spacing: Style.space(4)
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: "Artist"
                                     color: Qt.darker(root.bar.foreground, 1.3)
                                     font.family: root.bar.fontFamily
@@ -2065,6 +2077,7 @@ BarWidget {
                                 width: parent.width
                                 spacing: Style.space(4)
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: "Album"
                                     color: Qt.darker(root.bar.foreground, 1.3)
                                     font.family: root.bar.fontFamily
@@ -2115,6 +2128,7 @@ BarWidget {
                         implicitHeight: visible ? clearQueueBtn.height : 0
 
                         Text {
+                            textFormat: Text.PlainText
                             anchors.left: parent.left
                             anchors.verticalCenter: parent.verticalCenter
                             text: "Up next (" + root.queue.length + ")"
@@ -2237,6 +2251,7 @@ BarWidget {
                                 z: 2
 
                                 Text {
+                                    textFormat: Text.PlainText
                                     readonly property int queuePos: root.viewingPlayingList ? root.queuePosition(modelData.index) : 0
                                     width: Style.space(24)
                                     text: queuePos > 0 ? "▸" + queuePos : String(modelData.index + 1)
@@ -2308,6 +2323,7 @@ BarWidget {
                                     height: parent.height
                                     visible: root.viewingIncoming
                                     Text {
+                                        textFormat: Text.PlainText
                                         anchors.centerIn: parent
                                         text: "\uf067"
                                         color: Color.accent
@@ -2327,6 +2343,7 @@ BarWidget {
                                     height: parent.height
                                     visible: root.viewingIncoming
                                     Text {
+                                        textFormat: Text.PlainText
                                         anchors.centerIn: parent
                                         text: "\uf00d"
                                         color: Qt.rgba(0.85, 0.35, 0.35, 1)
@@ -2344,6 +2361,7 @@ BarWidget {
                                     width: Style.space(24)
                                     height: parent.height
                                     Text {
+                                        textFormat: Text.PlainText
                                         anchors.centerIn: parent
                                         text: "\uf141"
                                         color: rowHover.hovered ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.5)
@@ -2380,6 +2398,7 @@ BarWidget {
                     }
 
                     Text {
+                        textFormat: Text.PlainText
                         width: parent.width
                         visible: root.tracks.length > 0 && root.filteredTracks.length === 0 && !root.editVisible
                         text: "No tracks match “" + root.librarySearch.trim() + "”"
@@ -2406,6 +2425,7 @@ BarWidget {
                             onClicked: root.addVisible = !root.addVisible
                         }
                         Text {
+                            textFormat: Text.PlainText
                             text: "Add source"
                             anchors.verticalCenter: parent.verticalCenter
                             color: Qt.darker(root.bar.foreground, 1.3)
@@ -2468,6 +2488,7 @@ BarWidget {
                                     border.width: Math.max(1, Style.space(1))
                                     border.color: root.addScan ? Color.accent : Qt.darker(root.bar.foreground, 1.4)
                                     Text {
+                                        textFormat: Text.PlainText
                                         anchors.centerIn: parent
                                         visible: root.addScan
                                         text: "\uf00c"
@@ -2477,6 +2498,7 @@ BarWidget {
                                     }
                                 }
                                 Text {
+                                    textFormat: Text.PlainText
                                     anchors.left: scanBox.right
                                     anchors.leftMargin: Style.space(6)
                                     anchors.verticalCenter: parent.verticalCenter
@@ -2497,6 +2519,7 @@ BarWidget {
                                 visible: root.addType === "local"
 
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: root.addScan ? "Folder on this machine" : "Path on this machine"
                                     color: root.bar.foreground
                                     font.family: root.bar.fontFamily
@@ -2522,6 +2545,7 @@ BarWidget {
                                 visible: root.addType === "ssh" || root.addType === "network"
 
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: root.addType === "ssh" ? "SSH user" : "Network user"
                                     color: root.bar.foreground
                                     font.family: root.bar.fontFamily
@@ -2537,6 +2561,7 @@ BarWidget {
                                     onAccepted: root.submitAdd()
                                 }
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: "Host or IP"
                                     color: root.bar.foreground
                                     font.family: root.bar.fontFamily
@@ -2552,6 +2577,7 @@ BarWidget {
                                     onAccepted: root.submitAdd()
                                 }
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: "Remote path"
                                     color: root.bar.foreground
                                     font.family: root.bar.fontFamily
@@ -2577,6 +2603,7 @@ BarWidget {
                                 visible: root.addType === "https"
 
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: "https:// URL"
                                     color: root.bar.foreground
                                     font.family: root.bar.fontFamily
@@ -2594,6 +2621,7 @@ BarWidget {
                             }
 
                             Text {
+                                textFormat: Text.PlainText
                                 text: root.addScan
                                     ? ("Every audio file in the folder is staged in \"INCOMING >> " +
                                        root.scanTargetPlaylist() + " <<\" for you to accept or decline.")
